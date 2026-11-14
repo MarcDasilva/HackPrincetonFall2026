@@ -1,0 +1,92 @@
+{
+  "schema_version": "1",
+  "study_id": "real_with_needs_001",
+  "parent_study_id": null,
+  "mode": "personalized",
+  "evaluation_mode": "real",
+  "development_fixture_label": "Development request. The thresholds are fictional examples, not a person's results.",
+  "start": {
+    "initiated_by": "user",
+    "action": "start_study"
+  },
+  "hearing_profile": {
+    "profile_id": "entered_test_example",
+    "source": "user_entered_test_results",
+    "target_ear": "right",
+    "tested_on": null,
+    "original_report_ref": null,
+    "measurements": [
+      {
+        "ear": "right",
+        "frequency_hz": 250,
+        "threshold_db_hl": 15,
+        "measurement_type": "air_conduction",
+        "status": "measured"
+      },
+      {
+        "ear": "right",
+        "frequency_hz": 500,
+        "threshold_db_hl": 20,
+        "measurement_type": "air_conduction",
+        "status": "measured"
+      },
+      {
+        "ear": "right",
+        "frequency_hz": 1000,
+        "threshold_db_hl": 30,
+        "measurement_type": "air_conduction",
+        "status": "measured"
+      },
+      {
+        "ear": "right",
+        "frequency_hz": 2000,
+        "threshold_db_hl": 45,
+        "measurement_type": "air_conduction",
+        "status": "measured"
+      },
+      {
+        "ear": "right",
+        "frequency_hz": 4000,
+        "threshold_db_hl": 55,
+        "measurement_type": "air_conduction",
+        "status": "measured"
+      },
+      {
+        "ear": "right",
+        "frequency_hz": 6000,
+        "threshold_db_hl": 55,
+        "measurement_type": "air_conduction",
+        "status": "measured"
+      }
+    ],
+    "user_notes": ""
+  },
+  "anatomy": {
+    "ear_mesh_ref": null,
+    "source": "not_supplied"
+  },
+  "needs_profile": {
+    "activities": [
+      "sports",
+      "busy_restaurants"
+    ],
+    "goals": [
+      "follow_conversation",
+      "hear_coach"
+    ],
+    "priorities": [
+      "speech_clarity",
+      "compact_size"
+    ],
+    "requirements": [
+      "secure_retention"
+    ],
+    "free_text": "I want to hear people during activities."
+  },
+  "budget": {
+    "max_evaluation_cases": 6,
+    "max_parallel_evaluations": 2,
+    "max_research_tool_calls_per_agent": 6,
+    "max_run_seconds": 3600
+  }
+}

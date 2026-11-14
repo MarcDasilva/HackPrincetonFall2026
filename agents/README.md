@@ -184,6 +184,7 @@ evaluate_experiment(spec: dict) -> dict     # or ExperimentResult
 Point the workflow at the real implementation with `HORN_STUDY_REAL_EVALUATOR=package.module:attribute`.
 The attribute can be a module, an object, a class, or a zero-argument factory that provides both functions.
 `tests/fake_real_evaluator.py` is a complete minimal example that takes and returns plain dicts.
+The team's real evaluator is `horn_study.hornsim_evaluator`, described below.
 
 Capabilities declare the geometry families and parameter bounds, baselines, required hearing frequencies and measurement types, scenarios, metrics with units and direction, canal configurations, the calibration convention, seed support, fidelity levels, output assets, and explicitly unsupported requirements.
 See `EvaluatorCapabilities` in `src/horn_study/contracts.py`, or run `horn-study capabilities` for a filled-in example.
@@ -201,6 +202,85 @@ Any other failure is recorded once as a failed case.
 
 The adapter does not normalize levels or rescale outputs.
 The amplitude and calibration convention is defined by the evaluator and named by `calibration_ref`.
+
+### The hornsim evaluator
+
+`horn_study.hornsim_evaluator` connects `evaluation_mode: "real"` to the backend's `hornsim` pipeline (see `../backend/HORNSIM.md`).
+It builds the 3D aid in the configured ear, models its insertion gain with the 1D acoustic model, applies that gain to the speech clips, and scores them with HASPI v2 using the supplied audiogram.
+
+hornsim needs torch and pyclarity, which this environment does not install.
+Every numerical step therefore runs in the backend's own interpreter through `bridges/hornsim_bridge.py`, one short process per step, with JSON on stdin and stdout.
+The bridge calls hornsim's functions and adds no numerics of its own.
+
+Set it up once:
+
+```bash
+git submodule update --init                    # from the repository root
+cd backend
+uv venv -p 3.12 .venv && uv pip install -p .venv -r requirements.txt
+```
+
+The photo pipeline and its weights are not needed.
+If there is no ear mesh from a photo yet, write AudioEar's average ear as a stand-in:
+
+```bash
+echo '{"out": "data/template_ear/ear.ply", "height_mm": 62, "side": "right"}' \
+  | PYTHONPATH=. .venv/bin/python ../agents/bridges/hornsim_bridge.py template-ear
+```
+
+That mesh is a template, not anyone's ear.
+A provenance note is saved beside it and repeated in the capabilities and in every result.
+
+Then set these in `agents/.env`:
+
+| Variable | Meaning |
+| --- | --- |
+| `HORN_STUDY_REAL_EVALUATOR` | `horn_study.hornsim_evaluator` |
+| `HORNSIM_BACKEND_DIR` | The repository's `backend/` directory. Required. |
+| `HORNSIM_EAR_MESH` | The patient's ear mesh in mm, in AudioEar's 2,800-vertex topology (`ear.ply` from `earrecon`, or the template). Required. |
+| `HORNSIM_WORK_DIR` | Where patient contexts and built aids are kept and reused. Required. |
+| `HORNSIM_PYTHON` | The backend interpreter. Defaults to `<backend>/.venv/bin/python`. |
+| `HORNSIM_EAR_HEIGHT_MM` | Optional. Rescales the mesh to this ear height. Unset means the mesh is used at its own size. |
+| `HORNSIM_BRIDGE_TIMEOUT_SECONDS` | Optional. Time allowed per bridge step. Defaults to 1800. |
+
+Relative paths are resolved from the directory the command runs in.
+A missing or wrong value stops the run with exit code `3` and names every variable that needs attention.
+
+Run a real study:
+
+```bash
+uv run horn-study capabilities --evaluation-mode real
+uv run horn-study validate examples/requests/real_with_needs.json
+uv run horn-study run examples/requests/real_with_needs.json
+```
+
+What it declares, all read from the installed backend each time a study starts:
+
+- One geometry family, `spiral_exponential_horn`, with the parameters and bounds of `AidDesign` in `backend/app/main.py`.
+  The vent minimum is raised from 0 to 0.1 mm because `hornsim.aid` cannot build a vent of exactly 0.
+- One baseline, `unaided`: a flat 0 dB response sent through the same clips, levels, and HASPI call as the designs.
+- Scenarios for each clip type (clean speech, speech in babble) at each presentation level in `hornsim/defaults.yaml`.
+- Metrics: `haspi_v2_mean`, `haspi_v2_worst_canal`, `haspi_v2_improvement_over_unaided`, four insertion gain band averages, and `bore_length_mm`.
+- Required thresholds at 250, 500, 1000, 2000, 4000, and 6000 Hz, the six frequencies HASPI v2 uses.
+  pyclarity would interpolate a missing one, so a request without all six is rejected instead.
+  The placeholder audiogram in `defaults.yaml` is never used.
+- No seeds.
+  hornsim fixes HASPI's internal noise with one seed so that scores repeat.
+- `evaluator_version` is `hornsim-<commit>`, the last commit that touched `backend/hornsim`.
+
+What to expect when it runs:
+
+- The patient context is built once per ear mesh and audiogram (about one minute) and each design once per set of design numbers (about two minutes), however many scenarios or threads ask for it.
+  Both are kept in `HORNSIM_WORK_DIR` and reused by later studies.
+- Scoring one scenario takes 5 to 20 seconds.
+- A design that cannot be routed in the ear comes back as `status: "failed"` with `error.code: "geometry_does_not_fit"`, never as a score.
+- A design that hornsim builds with its vent overlapping the bore (`vent_wall_to_bore_mm` below 0 in `design.json`) comes back as `status: "failed"` with `error.code: "vent_intersects_bore"`.
+  The acoustic model assumes separate channels, so a score would describe a different object.
+- Results carry references to `design.json`, `aid.glb`, `aid_in_ear.glb`, `aid_print.stl`, `acoustics.json`, and `references.json`, plus hornsim's own per-clip scores and its unaided and ceiling references.
+- The bridge process does not inherit model or tracing keys.
+
+`tests/test_hornsim_evaluator.py` covers the adapter with the bridge stubbed.
+Its last test runs the real pipeline and is skipped unless `HORNSIM_BACKEND_DIR`, `HORNSIM_EAR_MESH`, and `HORNSIM_WORK_DIR` are set.
 
 ### The development fixture
 
@@ -254,6 +334,7 @@ Tests drive the real workflow with a scripted stand-in model and offline sources
 | Retries repeat the identical case and are bounded | `test_runner.py`, `test_transient_failures_retry_only_the_identical_case` |
 | Failed cases cannot help a design win, and no winner is forced | `test_a_design_with_a_failed_case_cannot_win`, `test_no_winner_is_forced_when_every_design_fails` |
 | Reported numbers are the evaluator's numbers | `test_reported_numbers_are_the_evaluators_numbers` |
+| The real evaluator never fills in a threshold, builds each design once, and reports a misfit as a failure | `test_hornsim_evaluator.py` |
 | No path from results back to planning or evaluation | `test_nothing_leads_from_results_back_to_planning_or_evaluation` |
 | A follow-up runs nothing until requested, and keeps the parent record | `test_a_suggested_follow_up_causes_no_evaluation_until_requested`, `test_a_follow_up_is_a_new_study_and_the_parent_record_is_kept` |
 | The trace shows branches, planning, evaluation attempts, and the report | `test_the_trace_exposes_branches_planning_evaluation_and_report` |
@@ -268,6 +349,8 @@ Tests drive the real workflow with a scripted stand-in model and offline sources
 | `research.py` | The three investigators, their tools, budget, and evidence ledger |
 | `planner.py` | Coordinator prompt, plan validation, deterministic expansion, freezing |
 | `evaluator_adapter.py` | Evaluator protocol, real-evaluator loader, labeled development fixture |
+| `hornsim_evaluator.py` | The real evaluator: capabilities and results from the backend's hornsim pipeline |
+| `bridges/hornsim_bridge.py` | Runs hornsim steps in the backend interpreter. Not part of the package. |
 | `runner.py` | Bounded execution, identical retries, result checks, evaluation cache |
 | `reporting.py` | Aggregation, selection rule, needs outcomes, interpretation, report |
 | `workflow.py` | LangGraph wiring, state machine, artifacts, terminal handling |
