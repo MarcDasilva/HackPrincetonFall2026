@@ -282,3 +282,56 @@ def test_a_study_without_collector_dials_keeps_the_models_collector(tmp_path: Pa
     record, sent = _run(tmp_path, _selected(), {"collector": cone})
     assert sent[0]["collector"] == cone
     assert record["study_collector"] is None
+
+
+def test_a_piece_over_the_studys_size_limit_is_sent_back_and_reported(tmp_path: Path) -> None:
+    """Shaping can make a collector stand out further than the tested one. The study's limit still holds."""
+    selected = _earpiece_selected()
+    study = tmp_path / "s1"
+    study.mkdir()
+    results = {
+        "study_id": "s1",
+        "selected_candidate_id": "E1",
+        "selected_candidate": selected,
+        "plan": {
+            "selection_rule": {"constraints": [{"metric": "protrusion_mm", "bound": "max", "value": 20.0}]}
+        },
+        "report": {
+            "candidates": [{"candidate_id": "E1", "metrics": [{"name": "protrusion_mm", "mean": 17.1}]}]
+        },
+    }
+    (study / "results.json").write_text(json.dumps(results))
+    heights = iter([24.0, 19.0, 19.0, 19.0])
+
+    def builder(patient_dir: Path, params: dict[str, Any], design_id: str) -> dict[str, Any]:
+        geometry = {
+            "canal_stem_mm": 0.0,
+            "collector": True,
+            "collector_mouth_mm2": 450.0,
+            "proud_of_concha_mm": next(heights),
+        }
+        return {"ok": True, "checks": {"bore_wall_mm": 2.0}, "geometry": geometry}
+
+    replies: list[str] = []
+
+    def respond(messages: list[Any], bound: list[str]) -> AIMessage:
+        step = _tool_results(messages)
+        if step:
+            replies.append(str(messages[-1].content))
+        if step == 0:
+            return call("build_earpiece", {**SHAPING, "aim_yaw_deg": 100}, "c1")
+        if step == 1:
+            return call("finish", {"design_id": "s1-e1", "explanation": "x"}, "c2")
+        if step == 2:
+            return call("build_earpiece", {**SHAPING, "aim_yaw_deg": 100}, "c3")
+        return call("finish", {"design_id": "s1-e2", "explanation": "within the limit"}, "c4")
+
+    record = produce_earpiece(
+        study, tmp_path, ScriptedChatModel(responder=respond), build=builder, dials=BUILDER_DIALS
+    )
+
+    assert "stands out 24 mm, over the study's limit of 20 mm" in replies[0]
+    assert replies[1].startswith("Rejected: s1-e1 differs from the design the study tested")
+    assert record["chosen"]["design_id"] == "s1-e2"
+    assert record["departures_from_study"] == []
+    assert record["size_mm"] == {"stood_out_in_study": 17.1, "study_limit": 20.0, "built": 19.0}
