@@ -1,7 +1,7 @@
 # horn-study: research and experiment-planning agents
 
 This package is the agent workstream for the passive acoustic hearing device project.
-It takes a profile with existing hearing-test results and optional needs, researches the question in three parallel branches, forms hypotheses, freezes one finite experiment plan, sends that plan to the team's evaluator, explains the returned results, and stops.
+It takes a profile with existing hearing-test results and optional needs, researches the question in four parallel branches, forms hypotheses, freezes one finite experiment plan, sends that plan to the team's evaluator, explains the returned results, and stops.
 
 The product starts after hearing testing.
 Users supply their existing results.
@@ -38,9 +38,11 @@ flowchart TD
     I --> H["hearing_research"]
     I --> U["use_context_research"]
     I --> A["acoustic_design_research"]
+    I --> M["evaluation_method_research"]
     H --> S["synthesize_evidence"]
     U --> S
     A --> S
+    M --> S
     S --> P["plan_experiments (coordinator)"]
     P --> V["validate_and_freeze_plan"]
     V -- "validation errors, before freezing" --> P
@@ -56,10 +58,27 @@ No edge leads from evaluation or interpretation back to planning.
 
 | Phase | Who | Can do | Cannot do |
 | --- | --- | --- | --- |
-| Research | Three Deep Agents, run concurrently by LangGraph | Search literature, read sources, record findings, read saved source text | Run the evaluator, write files, run shell commands, spawn subagents |
+| Research | Four Deep Agents, run concurrently by LangGraph | Search literature, read sources, record findings, read saved source text | Run the evaluator, write files, run shell commands, spawn subagents |
 | Planning | Coordinator model with no tools | Propose hypotheses, candidates, scenarios, and a selection rule | Freeze its own plan, skip the coverage the evaluator requires, or relax the per-scenario rule. Code validates the plan against capabilities and budget. |
 | Evaluation | Bounded runner (code) | Evaluate each frozen spec, retry the identical spec after a transient failure | Change a spec, add a case, turn a failure into a number |
 | Interpretation | Model with no tools | Explain the computed comparison, judge hypotheses, suggest follow-ups | Change scores or the selection, run anything |
+
+### The four investigators
+
+Each investigator owns one question, gets the same starting package, and has its own budget of search and read calls.
+They are defined in `INVESTIGATORS` in `research.py`, and everything else (graph nodes, prompts, the order in `research.json`) is derived from that list.
+
+| Investigator | Finding IDs | Question |
+| --- | --- | --- |
+| `hearing_research` | `hearing-F1`, ... | Given the supplied test results and the evaluator's declared model, what should the study investigate? |
+| `use_context_research` | `context-F1`, ... | What scenarios and tradeoffs follow from this user's activities and priorities? |
+| `acoustic_design_research` | `design-F1`, ... | Which supported geometries and parameter variations are worth investigating? |
+| `evaluation_method_research` | `method-F1`, ... | How far can the evaluator's metrics and model be trusted for this comparison, and how large must a difference between designs be to mean something? |
+
+The first three decide what to test.
+The fourth exists because a study ends in a comparison of modeled numbers, and none of the first three is asked what those numbers can show.
+Its findings reach the coordinator, which words each hypothesis's `supports_if` and `contradicts_if` conditions, and the interpreter, which writes the report's limitations.
+It cannot change the selection rule or its tolerance, which stay with code and the evaluator's declared `resolution`.
 
 ### What code decides, not a model
 
@@ -156,6 +175,9 @@ Each study appends to `events.jsonl`, one JSON object per line, in strict `seque
   "replay": false
 }
 ```
+
+`component` is the part of the system that emitted the event.
+During research it is one of `hearing_research`, `use_context_research`, `acoustic_design_research`, or `evaluation_method_research`.
 
 Event types: `study.started`, `study.state_changed`, `research.agent_started`, `research.source_read`, `research.finding_added`, `research.agent_completed`, `research.agent_failed`, `hypothesis.created`, `plan.revision_requested`, `plan.frozen`, `experiment.started`, `experiment.retried`, `experiment.completed`, `experiment.failed`, `report.completed`, `study.completed`, `study.failed`, `study.cancelled`.
 
@@ -355,7 +377,7 @@ It requires at least two scenarios in every study, one tagged `quiet` and one ta
 Set `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` (plus `LANGSMITH_PROJECT`, and `LANGSMITH_ENDPOINT` outside the US region).
 Each study is one root trace named `study <study_id>`, with these children:
 
-- `hearing_research`, `use_context_research`, `acoustic_design_research`: each agent run with its model calls and tool calls.
+- `hearing_research`, `use_context_research`, `acoustic_design_research`, `evaluation_method_research`: each agent run with its model calls and tool calls.
 - `synthesize_evidence`, `plan_experiments` (the `study_coordinator` run), `validate_and_freeze_plan`.
 - `evaluate_batch`: one `evaluate_experiment` run per attempt, tagged with `experiment_id`, `candidate_id`, `spec_hash`, `plan_hash`, `attempt`, and `evaluator_version`.
 - `interpret_results`: the `results_interpreter` run.
@@ -400,7 +422,8 @@ Tests drive the real workflow with a scripted stand-in model and offline sources
 | --- | --- |
 | Missing or unusable results are rejected before anything runs | `test_intake.py`, `test_invalid_input_is_rejected_before_anything_is_saved_or_evaluated` |
 | No silent demo data, other-ear data, or invented thresholds | `test_intake.py` |
-| Three research branches overlap | `test_three_research_branches_overlap_and_return_identifiable_evidence` |
+| Four research branches overlap | `test_four_research_branches_overlap_and_return_identifiable_evidence` |
+| Each investigator owns one distinct question, and the fourth one's evidence reaches the plan and the report | `test_each_investigator_owns_one_distinct_question`, `test_evaluation_method_evidence_reaches_the_plan_and_the_report` |
 | Findings need a read source and a verbatim passage | `test_research.py` |
 | Investigators and the interpreter cannot reach the evaluator | `test_investigators_hold_evidence_tools_only`, `test_the_interpreter_cannot_change_the_selection_or_run_anything` |
 | Plans respect capabilities, controls, and budget | `test_planner.py` |
@@ -422,7 +445,7 @@ Tests drive the real workflow with a scripted stand-in model and offline sources
 | `contracts.py` | Typed request, capability, finding, plan, result, report, and state models |
 | `intake.py` | Input validation and normalization against evaluator capabilities |
 | `sources.py` | Literature search, source reading, passage selection, quote verification |
-| `research.py` | The three investigators, their tools, budget, and evidence ledger |
+| `research.py` | The four investigators, their tools, budget, and evidence ledger |
 | `planner.py` | Coordinator prompt, plan validation, deterministic expansion, freezing |
 | `evaluator_adapter.py` | Evaluator protocol, real-evaluator loader, labeled development fixture |
 | `hornsim_evaluator.py` | The real evaluator: capabilities and results from the backend's hornsim pipeline |

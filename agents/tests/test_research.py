@@ -8,7 +8,7 @@ import pytest
 from helpers import PASSAGES, FakeReader, FakeSearch
 
 from horn_study.events import EventBus
-from horn_study.research import INVESTIGATORS, ResearchLedger, ResearchSession
+from horn_study.research import INVESTIGATORS, ResearchLedger, ResearchSession, investigator_prompt
 from horn_study.sources import (
     SearchHit,
     SourceUnavailable,
@@ -274,3 +274,35 @@ async def test_only_one_finding_per_investigator_may_rest_on_a_non_scholarly_sou
         "scholarly",
         "scholarly",
     ]
+
+
+def test_each_investigator_owns_one_distinct_question():
+    assert [spec.name for spec in INVESTIGATORS] == [
+        "hearing_research",
+        "use_context_research",
+        "acoustic_design_research",
+        "evaluation_method_research",
+    ]
+    for field in ("name", "title", "finding_prefix", "question", "covers", "required_output"):
+        values = [getattr(spec, field) for spec in INVESTIGATORS]
+        assert len(set(values)) == len(values), field
+    assert INVESTIGATORS[3].finding_prefix == "method"
+
+
+def test_only_the_method_investigator_is_asked_for_the_limits_of_the_model():
+    by_name = {spec.name: spec for spec in INVESTIGATORS}
+    assert "model_limitations" in by_name["evaluation_method_research"].required_output
+    for name in ("hearing_research", "use_context_research", "acoustic_design_research"):
+        assert "limitations" not in by_name[name].required_output
+
+
+@pytest.mark.parametrize("spec", INVESTIGATORS, ids=lambda spec: spec.name)
+def test_an_investigator_is_told_its_own_question_and_what_the_others_cover(spec):
+    prompt = investigator_prompt(spec, budget=6)
+    assert f"You are the {spec.title} " in prompt
+    assert f"Your question: {spec.question}" in prompt
+    assert spec.required_output in prompt
+    assert "You have 6 search and read calls in total." in prompt
+    for other in INVESTIGATORS:
+        assert (other.covers in prompt) == (other.name != spec.name)
+    assert "{" not in prompt

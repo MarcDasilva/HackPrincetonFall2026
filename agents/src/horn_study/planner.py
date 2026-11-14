@@ -37,7 +37,7 @@ from horn_study.contracts import (
     StudyPlan,
 )
 from horn_study.intake import normalize_token, user_needs
-from horn_study.research import render_package
+from horn_study.research import INVESTIGATORS, listed, render_package
 
 _ID = re.compile(ID_PATTERN)
 
@@ -117,10 +117,10 @@ class PlanDraft(BaseModel):
     future_work: list[str]
 
 
-COORDINATOR_PROMPT = """\
+_COORDINATOR_PROMPT = """\
 You are the study coordinator for a study of a passive, battery-free hearing device: a \
-printed horn whose geometry shapes its acoustic response. Three investigators have researched \
-the hearing profile, the use context, and the acoustic design space. Your job is to turn their \
+printed horn whose geometry shapes its acoustic response. Investigators working in parallel \
+have each researched one question: {topics}. Your job is to turn their \
 findings into one coherent, executable study: hypotheses, controls, candidate designs, fixed \
 comparison settings, and the reason for each choice.
 
@@ -181,6 +181,8 @@ them, and do not describe a diagnosis.
 If the plan comes back with validation errors, correct exactly those problems and resubmit \
 the complete plan.\
 """
+
+COORDINATOR_PROMPT = _COORDINATOR_PROMPT.format(topics=listed([spec.covers for spec in INVESTIGATORS]))
 
 
 def coordinator_brief(package: StartingPackage, research: ResearchRecord) -> str:
