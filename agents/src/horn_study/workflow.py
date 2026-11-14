@@ -1,6 +1,6 @@
 """The bounded study workflow.
 
-    create study -> the research branches in parallel -> synthesize evidence
+    create study -> three research branches in parallel -> synthesize evidence
     -> plan -> validate and freeze -> evaluate the fixed batch -> interpret -> done
 
 The only cycle is between planning and validation, and it closes before the
@@ -203,7 +203,7 @@ def build_graph(
         if all(branch.status == "failed" for branch in branches):
             raise StudyFailed(
                 "research_failed",
-                f"All {len(branches)} research branches failed, so there is no evidence to plan from.",
+                "All three research branches failed, so there is no evidence to plan from.",
                 [f"{b.investigator}: {b.error}" for b in branches],
             )
         if not research.findings:

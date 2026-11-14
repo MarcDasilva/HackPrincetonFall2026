@@ -9,8 +9,7 @@ from pydantic import ValidationError
 from horn_study.contracts import EvaluatorCapabilities
 from horn_study.evaluator_adapter import DevelopmentFixtureEvaluator
 from horn_study.intake import parse_request, validate_request
-from horn_study.planner import COORDINATOR_PROMPT, PlanDraft, build_plan, freeze_plan
-from horn_study.research import INVESTIGATORS
+from horn_study.planner import PlanDraft, build_plan, freeze_plan
 
 CAPS = DevelopmentFixtureEvaluator().get_evaluator_capabilities()
 FINDINGS = frozenset({"hearing-F1", "context-F1", "design-F1"})
@@ -312,11 +311,3 @@ def test_an_informational_metric_cannot_rank_designs_or_stand_for_a_need_without
     plan, errors = check_neutral(unconstrained)
     assert plan is None
     assert any("only through a selection constraint" in e for e in errors)
-
-
-def test_the_coordinator_is_told_what_every_investigator_researched():
-    assert len(INVESTIGATORS) == 4
-    for spec in INVESTIGATORS:
-        assert spec.covers in COORDINATOR_PROMPT
-    assert "Three investigators" not in COORDINATOR_PROMPT
-    assert "{" not in COORDINATOR_PROMPT

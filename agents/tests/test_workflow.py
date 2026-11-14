@@ -122,34 +122,20 @@ async def test_invalid_input_is_rejected_before_anything_is_saved_or_evaluated(t
 # --------------------------------------------------------------------------
 
 
-async def test_four_research_branches_overlap_and_return_identifiable_evidence(tmp_path):
+async def test_three_research_branches_overlap_and_return_identifiable_evidence(tmp_path):
     harness = Harness(tmp_path)
     outcome = await run_study(make_request(), harness.deps)
     history = outcome.events.history
 
     started = [e.sequence for e in history if e.type == "research.agent_started"]
     finished = [e.sequence for e in history if e.type == "research.agent_completed"]
-    assert len(started) == len(finished) == 4
+    assert len(started) == len(finished) == 3
     assert max(started) < min(finished)
-    assert harness.research_model.log.max_active == 4
+    assert harness.research_model.log.max_active == 3
 
     research = load(outcome, "research.json")
-    assert [b["investigator"] for b in research["branches"]] == [
-        "hearing_research",
-        "use_context_research",
-        "acoustic_design_research",
-        "evaluation_method_research",
-    ]
-    assert list(RESEARCH_NODES) == [b["investigator"] for b in research["branches"]]
-    assert {f["finding_id"] for f in research["findings"]} == {
-        "hearing-F1",
-        "context-F1",
-        "design-F1",
-        "method-F1",
-    }
-    assert {f["investigator"]: f["finding_id"] for f in research["findings"]}[
-        "evaluation_method_research"
-    ] == "method-F1"
+    assert [b["investigator"] for b in research["branches"]] == list(RESEARCH_NODES)
+    assert {f["finding_id"] for f in research["findings"]} == {"hearing-F1", "context-F1", "design-F1"}
     sources = {s["source_id"]: s for s in research["sources"]}
     for finding in research["findings"]:
         source = sources[finding["source_id"]]
@@ -198,9 +184,9 @@ async def test_the_report_states_how_much_of_the_evidence_is_scholarly(tmp_path)
     outcome = await run_study(make_request(), Harness(tmp_path, research=cites_documentation).deps)
     report = outcome.report
     assert report is not None
-    assert report.findings_by_source_tier == {"scholarly": 3, "technical_documentation": 1}
+    assert report.findings_by_source_tier == {"scholarly": 2, "technical_documentation": 1}
     assert any(
-        text.startswith("3 of 4 research findings rest on scholarly literature.")
+        text.startswith("2 of 3 research findings rest on scholarly literature.")
         for text in report.limitations
     )
     research = load(outcome, "research.json")
@@ -210,7 +196,7 @@ async def test_the_report_states_how_much_of_the_evidence_is_scholarly(tmp_path)
 
     all_scholarly = await run_study(make_request("all_papers"), Harness(tmp_path).deps)
     assert all_scholarly.report is not None
-    assert all_scholarly.report.findings_by_source_tier == {"scholarly": 4}
+    assert all_scholarly.report.findings_by_source_tier == {"scholarly": 3}
     assert not any("rest on scholarly literature" in text for text in all_scholarly.report.limitations)
 
 
@@ -250,7 +236,7 @@ async def test_an_investigator_cannot_reach_tools_outside_its_allowlist(tmp_path
     assert outcome.state is StudyState.COMPLETED
     assert set(refusals) == set(forbidden)
     assert all("not available to this investigator" in text for text in refusals.values())
-    assert len(load(outcome, "research.json")["findings"]) == 4
+    assert len(load(outcome, "research.json")["findings"]) == 3
 
 
 async def test_an_investigator_can_search_the_full_text_of_a_source_it_read(tmp_path):
@@ -307,54 +293,6 @@ async def test_a_failed_branch_is_reported_and_the_study_continues_on_the_rest(t
     failed = first(outcome, "research.agent_failed")
     assert failed.component == "use_context_research"
     assert any("use context research branch ended as 'failed'" in text for text in outcome.report.limitations)
-
-
-async def test_evaluation_method_evidence_reaches_the_plan_and_the_report(tmp_path):
-    briefs: dict[str, str] = {}
-
-    def coordinator(messages, bound):
-        briefs.setdefault("coordinator", str(messages[1].content))
-        return coordinator_responder(draft)(messages, bound)
-
-    def interpreter(messages, bound):
-        briefs.setdefault("interpreter", str(messages[1].content))
-        return call("ReportNarrative", narrative(), "report-1")
-
-    draft = valid_draft()
-    draft["hypotheses"][0]["supporting_finding_ids"] = ["design-F1", "method-F1"]
-    harness = Harness(tmp_path, coordinator=coordinator, interpreter=interpreter)
-    outcome = await run_study(make_request(), harness.deps)
-
-    assert outcome.state is StudyState.COMPLETED
-    given = json.loads(briefs["coordinator"].split("Research results:\n\n")[1].rsplit("\n\nDesign", 1)[0])
-    reports = {entry["investigator"]: entry for entry in given["investigators"]}
-    assert reports["evaluation_method_research"]["status"] == "completed"
-    assert (
-        reports["evaluation_method_research"]["report"]["summary"] == "evaluation_method_research finished."
-    )
-    assert "method-F1" in {finding["finding_id"] for finding in given["findings"]}
-
-    (hypothesis,) = load(outcome, "plan.json")["hypotheses"]
-    assert hypothesis["supporting_finding_ids"] == ["design-F1", "method-F1"]
-    created = first(outcome, "hypothesis.created")
-    assert "method-F1" in created.finding_ids
-
-    read = json.loads(briefs["interpreter"].split("Study results:\n\n")[1])
-    assert "method-F1" in {finding["finding_id"] for finding in read["findings"]}
-
-
-async def test_every_branch_failing_stops_the_study_and_says_how_many(tmp_path):
-    def all_fail(messages, bound):
-        raise RuntimeError("provider unavailable")
-
-    harness = Harness(tmp_path, research=all_fail)
-    outcome = await run_study(make_request(), harness.deps)
-
-    assert outcome.state is StudyState.FAILED
-    assert outcome.failure["kind"] == "research_failed"
-    assert outcome.failure["message"].startswith("All 4 research branches failed")
-    assert [detail.split(":")[0] for detail in outcome.failure["details"]] == list(RESEARCH_NODES)
-    assert harness.evaluator.calls == []
 
 
 async def test_no_evidence_means_no_plan_and_no_evaluation(tmp_path):
@@ -1161,8 +1099,6 @@ async def test_the_trace_exposes_branches_planning_evaluation_and_report(tmp_pat
 
     assert "hearing_research_agent" in names(children["hearing_research"])
     assert "search_literature" in names(children["hearing_research"])
-    assert "evaluation_method_research_agent" in names(children["evaluation_method_research"])
-    assert "record_finding" in names(children["evaluation_method_research"])
     assert "study_coordinator" in names(children[NODE_PLAN])
     assert "results_interpreter" in names(children[NODE_INTERPRET])
 

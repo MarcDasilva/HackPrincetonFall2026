@@ -1,4 +1,4 @@
-"""The parallel research investigators.
+"""The three parallel research investigators.
 
 Each investigator is a Deep Agent with evidence tools only. It can search,
 read sources, and record findings whose quoted passage is verified against the
@@ -78,7 +78,8 @@ INVESTIGATORS: tuple[InvestigatorSpec, ...] = (
         covers="what the supplied hearing results imply for the study",
         required_output=(
             "evidence, target outcomes (for example which frequency region matters most for "
-            "this profile), candidate hypotheses, and suggested comparisons"
+            "this profile), limitations of the auditory model, candidate hypotheses, and "
+            "suggested comparisons"
         ),
     ),
     InvestigatorSpec(
@@ -104,26 +105,6 @@ INVESTIGATORS: tuple[InvestigatorSpec, ...] = (
             "within the evaluator's bounds, and capability constraints"
         ),
     ),
-    # The study's conclusion is a comparison of modeled numbers, so one investigator asks what
-    # those numbers can and cannot show. The others research what to test, not how far to trust it.
-    InvestigatorSpec(
-        name="evaluation_method_research",
-        title="evaluation-method investigator",
-        finding_prefix="method",
-        question=(
-            "How far can the evaluator's metrics and model be trusted for this comparison, and "
-            "how large must a difference between designs be to mean something?"
-        ),
-        covers="how far the evaluator's metrics and model can be trusted",
-        required_output=(
-            "evidence on what the evaluator's metrics measure and the conditions they were "
-            "validated under, the smallest difference between designs that is worth acting on, "
-            "the model simplifications most likely to change which design looks best "
-            "(model_limitations), supported scenarios or comparisons that would expose them, and "
-            "what this means for how each hypothesis's supporting and contradicting outcomes "
-            "should be worded"
-        ),
-    ),
 )
 
 _SYSTEM_PROMPT = """\
@@ -134,8 +115,8 @@ study should test.
 
 Your question: {question}
 
-The other investigators are working at the same time on {others}. Stay on your own question. \
-A coordinator will combine every investigator's report into one fixed experiment plan, so the most \
+Two other investigators are working at the same time on {others}. Stay on your own question. \
+A coordinator will combine all three reports into one fixed experiment plan, so the most \
 useful thing you can give it is evidence it can act on: findings tied to sources, and \
 suggestions expressed in terms the evaluator supports.
 
@@ -558,25 +539,6 @@ class ResearchSession:
         return [search_literature, read_source, record_finding]
 
 
-def listed(items: list[str]) -> str:
-    """Join phrases that may contain commas into one readable list."""
-    if len(items) < 3:
-        return " and ".join(items)
-    return "; ".join(items[:-1]) + "; and " + items[-1]
-
-
-def investigator_prompt(spec: InvestigatorSpec, *, budget: int) -> str:
-    """The system prompt of one investigator: its own question, and what the others cover."""
-    return _SYSTEM_PROMPT.format(
-        title=spec.title,
-        question=spec.question,
-        others=listed([other.covers for other in INVESTIGATORS if other.name != spec.name]),
-        budget=budget,
-        max_other=MAX_NON_SCHOLARLY_FINDINGS,
-        required_output=spec.required_output,
-    )
-
-
 def render_package(package: StartingPackage) -> str:
     return json.dumps(package.model_dump(mode="json"), indent=1, ensure_ascii=False)
 
@@ -609,6 +571,7 @@ async def run_investigator(
     tools = session.tools()
     allowed = frozenset({t.name for t in tools} | set(_FILE_TOOLS) | {InvestigatorOutput.__name__})
     model_calls = 3 * budget + MAX_FINDINGS_PER_INVESTIGATOR + 10
+    others = " and ".join(other.covers for other in INVESTIGATORS if other.name != spec.name)
 
     events.emit(
         "research.agent_started",
@@ -620,7 +583,14 @@ async def run_investigator(
         agent = create_deep_agent(
             model=model,
             tools=tools,
-            system_prompt=investigator_prompt(spec, budget=budget),
+            system_prompt=_SYSTEM_PROMPT.format(
+                title=spec.title,
+                question=spec.question,
+                others=others,
+                budget=budget,
+                max_other=MAX_NON_SCHOLARLY_FINDINGS,
+                required_output=spec.required_output,
+            ),
             middleware=[
                 FilesystemMiddleware(tools=list(_FILE_TOOLS)),
                 ModelRetryMiddleware(max_retries=2, on_failure="error"),

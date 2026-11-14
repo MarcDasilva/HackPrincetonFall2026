@@ -82,7 +82,6 @@ PAPER_TEXT = (
     "The acoustic path length of a horn shifts the frequency region where its response peaks.\n"
     "Listeners with elevated high-frequency thresholds depend on audibility between 2 and 4 kHz.\n"
     "Competing talkers reduce the audibility margin available in everyday listening situations.\n"
-    "A difference between two conditions matters only when it exceeds the test-retest variability.\n"
     + "Filler sentence so that the document is long enough to be treated as readable text. "
     * 6
 )
@@ -90,19 +89,16 @@ PASSAGES = {
     "hearing_research": "Listeners with elevated high-frequency thresholds depend on audibility between 2 and 4 kHz.",
     "use_context_research": "Competing talkers reduce the audibility margin available in everyday listening situations.",
     "acoustic_design_research": "The acoustic path length of a horn shifts the frequency region where its response peaks.",
-    "evaluation_method_research": "A difference between two conditions matters only when it exceeds the test-retest variability.",
 }
 PREFIX = {
     "hearing_research": "hearing",
     "use_context_research": "context",
     "acoustic_design_research": "design",
-    "evaluation_method_research": "method",
 }
 TITLES = {
     "hearing research investigator": "hearing_research",
     "use-context investigator": "use_context_research",
     "acoustic-design investigator": "acoustic_design_research",
-    "evaluation-method investigator": "evaluation_method_research",
 }
 
 
