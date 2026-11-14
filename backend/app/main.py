@@ -23,11 +23,12 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
-from . import jobs
+from . import jobs, sim_api
 from .settings import settings
 
 app = FastAPI(title="Horn aid API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_methods=["*"], allow_headers=["*"])
+app.include_router(sim_api.router)
 
 ID_RE = re.compile(r"^[a-f0-9]{12}$")
 FILES = {

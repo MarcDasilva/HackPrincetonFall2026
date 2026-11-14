@@ -51,7 +51,12 @@ def load_ear_params(patient_dir):
 
 
 def family_boxes(ear_params, patient_dir):
-    """{family: [box, ...]}, box = {design key: (lo, hi)} in acoustics.insertion_gain's keys.
+    """{family: [box, ...]}, box = {design key: (lo, hi)} in acoustics.insertion_gain's keys."""
+    return {"coil": [dict(ew.design_bounds(ear_params))], "earpiece": earpiece_boxes(ear_params, patient_dir)}
+
+
+def earpiece_boxes(ear_params, patient_dir):
+    """The in-concha earpiece family's boxes (needs only ear_params["canal_diameter_mm"]).
 
     Earpiece: bore length and the largest mouth exist only as earpiece.build geometry, so two probe builds
     (stem, and no stem with the widest throat) are run into a throwaway folder. Same rules the acoustics
@@ -76,7 +81,7 @@ def family_boxes(ear_params, patient_dir):
                           "flare_mid1": (0.0, D["flare_mid1"]), "flare_mid2": (D["flare_mid1"], D["flare_mid2"]),
                           "vent_count": (0, 0), "vent_diameter_mm": (0.8, 0.8), "vent_length_mm": (0.0, 0.0)})
     # vent_length 0 is inert: vent_count 0 removes the vent branch (acoustics._aid)
-    return {"coil": [dict(ew.design_bounds(ear_params))], "earpiece": boxes}
+    return boxes
 
 
 def _sample(box, n, rng):

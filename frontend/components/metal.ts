@@ -6,6 +6,6 @@ if (typeof WebGL2RenderingContext !== "undefined" && typeof OffscreenCanvas !== 
   const getExtension = WebGL2RenderingContext.prototype.getExtension;
   WebGL2RenderingContext.prototype.getExtension = function (this: WebGL2RenderingContext, name: string) {
     if (name === "WEBGL_lose_context" && this.canvas instanceof OffscreenCanvas) return null;
-    return getExtension.call(this, name);
+    return (getExtension as (this: WebGL2RenderingContext, n: string) => unknown).call(this, name);
   } as typeof getExtension;
 }
