@@ -193,7 +193,6 @@ DESCRIBED: dict[str, Any] = {
             "canal_diameter_mm": 7.5,
         },
         "whole_canal_is_sample_plus_mm": 9.0,
-        "probe_seconds": 5.4,
     },
 }
 
@@ -1563,3 +1562,100 @@ def test_the_real_backend_scores_the_control_the_default_and_a_wide_design():
     for asset in design.assets:
         assert Path(asset.ref).is_file(), asset.ref
     assert control.evaluation_config["audiogram_db_hl"] == {str(f): float(t) for f, t in THRESHOLDS.items()}
+
+
+@pytest.mark.skipif(
+    not _BACKEND_CONFIGURED,
+    reason=f"set {BACKEND_DIR_ENV}, {EAR_MESH_ENV}, and {WORK_DIR_ENV} to run the real hornsim pipeline",
+)
+def test_the_real_backend_builds_and_scores_earpieces_and_reports_what_the_ear_cannot_hold():
+    """A few minutes on first run: each earpiece builds in seconds, each scored scenario takes about half a minute."""
+    evaluator = evaluator_for("real", env={REAL_EVALUATOR_ENV: "horn_study.hornsim_evaluator"})
+    capabilities = evaluator.get_evaluator_capabilities()
+    family = capabilities.family(EARPIECE_FAMILY_ID)
+    assert family is not None, capabilities.model_dump(mode="json")["earpiece"]
+    bounds = {p.name: (p.minimum, p.maximum) for p in family.parameters}
+    limits = capabilities.model_dump(mode="json")["earpiece"]["ear_limits"]
+    # The faceplate mouth is bounded by this ear, well inside the builder's own 1500 mm^2.
+    assert bounds["mouth_mm2"][1] == limits["mouth_mm2"] < 1500
+    assert bounds["throat_mm2"][0] > 0
+    declared = {m.name for m in capabilities.metrics}
+
+    scenario = "speech_in_babble_65_db_spl"
+    control_spec = make_spec("unaided", scenario, baseline=True)
+    default_spec = earpiece_spec("earpiece_default", scenario)
+    wide_open = {
+        "throat_mm2": bounds["throat_mm2"][1],
+        "mouth_mm2": min(300.0, bounds["mouth_mm2"][1]),
+        "canal_stem_mm": 0.0,
+        COLLECTOR_REACH: 10.0,
+        COLLECTOR_MOUTH: 450.0,
+    }
+    collector_spec = earpiece_spec("earpiece_collector", scenario, parameters=wide_open)
+    control = evaluator.evaluate_experiment(control_spec)
+    default = evaluator.evaluate_experiment(default_spec)
+    collector = evaluator.evaluate_experiment(collector_spec)
+
+    for spec, result in ((control_spec, control), (default_spec, default), (collector_spec, collector)):
+        assert check_result(spec, result, capabilities) == []
+        assert result.status == "completed", result.error
+        assert {m.name for m in result.metrics} == declared
+    control_values = {m.name: m.value for m in control.metrics}
+    default_values = {m.name: m.value for m in default.metrics}
+    collector_values = {m.name: m.value for m in collector.metrics}
+    for values in (default_values, collector_values):
+        assert 0 <= values["haspi_v2_worst_canal"] <= values["haspi_v2_mean"] <= 1
+        assert values["haspi_v2_improvement_over_unaided"] == pytest.approx(
+            values["haspi_v2_mean"] - control_values["haspi_v2_mean"]
+        )
+        assert values["bore_length_mm"] > 0
+    # The collector stands further out of the ear, and its wider throat and opening pass more of 2 to 8 kHz.
+    assert collector_values["protrusion_mm"] > default_values["protrusion_mm"] > 0
+    for band in ("insertion_gain_2000_4000_hz_db", "insertion_gain_4000_8000_hz_db"):
+        assert collector_values[band] > default_values[band]
+
+    # What was scored is what was built: the builder's own report and area profile.
+    for result in (default, collector):
+        saved = result.model_dump(mode="json")
+        assert saved["design"]["checks"]["watertight"] is True
+        assert result.evaluation_config["acoustic_door"] == "profile"
+        files = {asset.kind: Path(asset.ref) for asset in result.assets}
+        for kind in (
+            "design_json",
+            "earpiece_print_stl",
+            "earpiece_glb",
+            "earpiece_in_ear_glb",
+            "acoustics_json",
+        ):
+            assert files[kind].is_file(), files[kind]
+        report = json.loads(files["design_json"].read_text())
+        model_input = json.loads(files["acoustics_json"].read_text())["model_input"]
+        geometry = report["geometry"]
+        assert saved["design"]["geometry"] == geometry
+        # Mouth (or collector rim) first, throat last, and the stem added as a tube at the throat area.
+        assert model_input["s_mm"][0] == 0
+        assert model_input["area_mm2"][0] == pytest.approx(geometry["collector_mouth_mm2"], abs=0.05)
+        assert model_input["area_mm2"][-1] == geometry["throat_mm2"]
+        built_length = report["area_profile_mm2"][-1][0]
+        assert model_input["s_mm"][-1] == pytest.approx(built_length + geometry["canal_stem_mm"])
+        assert model_input["tip_length_mm"] == geometry["canal_stem_mm"]
+        assert model_input["ear_params"]["opening_area_mm2"] > 0
+    collector_geometry = collector.model_dump(mode="json")["design"]["geometry"]
+    assert collector_geometry["collector"] is True
+    assert collector_geometry["collector_mouth_mm2"] == pytest.approx(450.0, abs=1.0)
+    assert collector_values["protrusion_mm"] == collector_geometry["proud_of_concha_mm"]
+
+    # In the builder's range, but more than this ear holds: a failed case with the builder's reason.
+    too_wide = {**EARPIECE_DEFAULT, "throat_mm2": 30.0, "mouth_mm2": bounds["mouth_mm2"][1] + 150.0}
+    rejected_spec = earpiece_spec("too_wide", scenario, parameters=too_wide)
+    rejected = evaluator.evaluate_experiment(rejected_spec)
+    assert check_result(rejected_spec, rejected, capabilities) == []
+    assert rejected.status == "failed"
+    assert rejected.metrics == ()
+    assert rejected.error is not None
+    assert rejected.error.code == "geometry_does_not_fit"
+    assert "mouth_fit: the mouth is larger than this concha's opening allows" in rejected.error.message
+    if limits["throat_with_stem_mm2"] is not None and limits["throat_with_stem_mm2"] < 30.0:
+        assert "stem_throat: the throat does not fit inside the canal stem" in rejected.error.message
+    checks = {reason["check"] for reason in rejected.model_dump(mode="json")["build_reasons"]}
+    assert "mouth_fit" in checks
