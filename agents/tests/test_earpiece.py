@@ -147,3 +147,138 @@ def test_the_model_sees_each_build_it_made(tmp_path: Path) -> None:
         dials=DIALS,
     )
     assert seen[0][1]["type"] == "image"
+
+
+# --------------------------------------------------------------------------
+# Everything the study evaluated is carried over unchanged
+# --------------------------------------------------------------------------
+
+BUILDER_DIALS = {
+    "aim_yaw_deg": {"min": 0, "max": 180, "default": 60},
+    "canal_stem_mm": {"min": 0, "max": 8, "default": 5.0},
+    "flare_mid1": {"min": 0, "max": 1, "default": 0.15},
+    "flare_mid2": {"min": 0, "max": 1, "default": 0.45},
+}
+COLLECTOR = {
+    "throat_mm2": 27.0,
+    "mouth_mm2": 200.0,
+    "canal_stem_mm": 0.0,
+    "collector_reach_mm": 18.0,
+    "collector_mouth_mm2": 450.0,
+}
+
+
+def _earpiece_selected(**parameters: float) -> dict[str, Any]:
+    return {"candidate_id": "E1", "kind": "design", "parameters": {**COLLECTOR, **parameters}}
+
+
+def _opening(collector: dict[str, Any]) -> float:
+    radii = collector["sections"][-1]
+    return 3.141592653589793 * sum(r * r for r in radii) / len(radii)
+
+
+def _reach(collector: dict[str, Any]) -> float:
+    return sum(v * v for v in collector["spine"][-1]) ** 0.5
+
+
+def _run(
+    tmp_path: Path, selected: dict[str, Any], shaping: dict[str, Any], geometry: dict[str, Any] | None = None
+):
+    sent: list[dict[str, Any]] = []
+
+    def builder(patient_dir: Path, params: dict[str, Any], design_id: str) -> dict[str, Any]:
+        sent.append(params)
+        built = {
+            "throat_mm2": params["throat_mm2"],
+            "mouth_mm2": params["mouth_mm2"],
+            "canal_stem_mm": params.get("canal_stem_mm"),
+            "collector": bool(params.get("collector")),
+            "collector_mouth_mm2": _opening(params["collector"]) if params.get("collector") else None,
+        }
+        return {"ok": True, "checks": {"bore_wall_mm": 2.0}, "geometry": {**built, **(geometry or {})}}
+
+    def respond(messages: list[Any], bound: list[str]) -> AIMessage:
+        if _tool_results(messages) == 0:
+            return call("build_earpiece", {**SHAPING, "aim_yaw_deg": 100, **shaping}, "c1")
+        return call("finish", {"design_id": "s1-e1", "explanation": "x"}, "c2")
+
+    record = produce_earpiece(
+        _study(tmp_path, selected),
+        tmp_path,
+        ScriptedChatModel(responder=respond),
+        build=builder,
+        dials=BUILDER_DIALS,
+    )
+    return record, sent
+
+
+def test_the_stem_flare_and_collector_size_come_from_the_study_not_the_model(tmp_path: Path) -> None:
+    """The model asks for a stem, its own flare, and a small scoop. The study chose none of those."""
+    scoop = {
+        "spine": [[4, 0, 2], [8, 1, 6]],
+        "sections": [[6] * 12, [10, 10, 10, 9, 8, 7, 6, 7, 8, 9, 10, 10]],
+    }
+    record, sent = _run(
+        tmp_path, _earpiece_selected(), {"canal_stem_mm": 5, "flare_mid1": 0.9, "collector": scoop}
+    )
+
+    for params in sent:  # the chosen build and its S and L sizes
+        assert params["canal_stem_mm"] == 0.0
+        assert (params["flare_mid1"], params["flare_mid2"]) == (0.15, 0.45)
+        assert (params["throat_mm2"], params["mouth_mm2"]) == (27.0, 200.0)
+        assert _reach(params["collector"]) == pytest.approx(18.0, abs=0.01)
+        assert _opening(params["collector"]) == pytest.approx(450.0, rel=0.002)
+        assert len(params["collector"]["spine"]) == 1
+    built = sent[0]["collector"]
+    # The model's direction and rim outline survive: same lean toward the front, front lip larger than the back.
+    out, up, front = built["spine"][0]
+    assert (up / out, front / out) == pytest.approx((1 / 8, 6 / 8), abs=0.001)
+    assert built["sections"][0][0] > built["sections"][0][6]
+    assert record["departures_from_study"] == []
+    assert record["study_collector"] == {"reach_mm": 18.0, "opening_mm2": 450.0}
+    assert record["locked"]["canal_stem_mm"] == 0.0
+
+
+def test_a_flush_selection_is_never_given_a_collector(tmp_path: Path) -> None:
+    cone = {"spine": [[10, 0, 0]], "sections": [[12] * 12]}
+    record, sent = _run(
+        tmp_path, _earpiece_selected(collector_reach_mm=0.0, collector_mouth_mm2=0.0), {"collector": cone}
+    )
+    assert all(params["collector"] is None for params in sent)
+    assert record["departures_from_study"] == []
+
+
+def test_a_selected_collector_is_built_even_when_the_model_omits_it(tmp_path: Path) -> None:
+    record, sent = _run(tmp_path, _earpiece_selected(), {"hood_mm": 3})
+    assert sent[0]["collector"]["spine"] == [[18.0, 0.0, 0.0]]
+    assert _opening(sent[0]["collector"]) == pytest.approx(450.0, rel=0.002)
+    assert sent[0]["hood_mm"] == 0.0
+    assert record["departures_from_study"] == []
+
+
+def test_a_collector_cannot_be_laid_flat_against_the_head(tmp_path: Path) -> None:
+    sideways = {"spine": [[0, 0, 12]], "sections": [[9] * 12]}
+    _, sent = _run(tmp_path, _earpiece_selected(), {"collector": sideways})
+    out, _, front = sent[0]["collector"]["spine"][0]
+    assert out == pytest.approx(9.0, abs=0.01)
+    assert _reach(sent[0]["collector"]) == pytest.approx(18.0, abs=0.01)
+    assert front > 0
+
+
+def test_a_build_that_differs_from_the_study_is_reported(tmp_path: Path) -> None:
+    record, _ = _run(
+        tmp_path, _earpiece_selected(), {}, geometry={"canal_stem_mm": 5.0, "collector_mouth_mm2": 256.0}
+    )
+    assert record["departures_from_study"] == [
+        "canal_stem_mm: built 5 mm, study evaluated 0 mm",
+        "collector opening: built 256 mm^2, study evaluated 450 mm^2",
+    ]
+    assert record["builds"][0]["departures_from_study"] == record["departures_from_study"]
+
+
+def test_a_study_without_collector_dials_keeps_the_models_collector(tmp_path: Path) -> None:
+    """A spiral-horn study says nothing about a collector, so the old behaviour holds for it."""
+    cone = {"spine": [[10, 0, 0]], "sections": [[12] * 12]}
+    record, sent = _run(tmp_path, _selected(), {"collector": cone})
+    assert sent[0]["collector"] == cone
+    assert record["study_collector"] is None
