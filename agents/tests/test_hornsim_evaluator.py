@@ -21,10 +21,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from helpers import Harness, coordinator_responder, make_request, valid_draft
+from helpers import Harness, coordinator_responder, make_request, need, valid_draft
 
 import horn_study.hornsim_evaluator as hornsim_evaluator
+from horn_study import earpiece as final_step
 from horn_study.contracts import (
+    EvaluatorCapabilities,
     EvaluatorHearingInput,
     ExperimentSpec,
     HearingMeasurement,
@@ -54,6 +56,7 @@ from horn_study.hornsim_evaluator import (
     process_runner,
 )
 from horn_study.intake import InputRejected, parse_request, validate_request
+from horn_study.planner import PlanDraft, build_plan
 from horn_study.runner import check_result
 from horn_study.workflow import run_study
 
@@ -222,7 +225,7 @@ class FakeBridge:
     def __call__(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             self.calls.append((command, copy.deepcopy(payload)))
-        return getattr(self, f"_{command}")(payload)
+        return getattr(self, f"_{command.replace('-', '_')}")(payload)
 
     def _describe(self, payload: dict[str, Any]) -> dict[str, Any]:
         described = {**copy.deepcopy(DESCRIBED), "version": self.version, "earpiece": self.earpiece}
@@ -782,6 +785,356 @@ def test_a_backend_that_changed_under_a_frozen_plan_is_caught_by_the_runner(tmp_
 
 
 # --------------------------------------------------------------------------
+# The in-concha earpiece family
+# --------------------------------------------------------------------------
+
+
+def test_the_earpiece_family_is_declared_with_the_builders_dials_and_this_ears_limits(tmp_path):
+    evaluator, _ = make_evaluator(tmp_path)
+    capabilities = as_contract(evaluator).get_evaluator_capabilities()
+
+    assert [f.family_id for f in capabilities.geometry_families] == [FAMILY_ID, EARPIECE_FAMILY_ID]
+    family = capabilities.family(EARPIECE_FAMILY_ID)
+    assert family is not None
+    assert {p.name: (p.minimum, p.maximum, p.unit) for p in family.parameters} == {
+        # The builder's own range.
+        "throat_mm2": (7, 60, "mm^2"),
+        # The builder allows 1500. This ear's faceplate holds 304.76, declared rounded down.
+        "mouth_mm2": (20, 304.7, "mm^2"),
+        "canal_stem_mm": (0, 8, "mm"),
+        # The builder's reach limit, and the area of its largest section radius (30 mm).
+        COLLECTOR_REACH: (0, 35, "mm"),
+        COLLECTOR_MOUTH: (0, 2827.4, "mm^2"),
+    }
+    described = {p.name: p.description for p in family.parameters}
+    assert "at most 27.3 with a stem" in described["throat_mm2"]
+    assert "Builder default 150" in described["mouth_mm2"]
+    assert "means no collector" in described[COLLECTOR_MOUTH]
+
+    # The family says how a collector is asked for, which door scores it, and what the model misses.
+    for phrase in (
+        "one straight section",
+        "Both 0 means no collector",
+        "What a study cannot ask for",
+        "hood_mm 0",
+        "profile door of hornsim.acoustics",
+        "canal sample plus 9 mm",
+        "What the model does not see",
+        "direction a collector faces",
+        "failed case with the builder's reasons",
+    ):
+        assert phrase in family.description, phrase
+
+    notes = " ".join(capabilities.planning_notes)
+    assert "the only family that can have an opening larger than the concha opening" in notes
+    assert "Model prediction, not a measured fact" in notes
+    assert "at most 304.7 mm^2" in notes
+    assert "protrusion_mm" in notes
+
+    # Outer size now varies and is reported, so a size preference is no longer out of reach.
+    assert "compact_size" not in {u.requirement for u in capabilities.unsupported_requirements}
+    assert capabilities.metric("protrusion_mm").direction == "informational"
+    assert {"earpiece_print_stl", "earpiece_glb", "design_json"} <= set(capabilities.output_assets)
+
+    dumped = capabilities.model_dump(mode="json")
+    assert dumped["earpiece"]["ear_limits"] == {
+        "mouth_mm2": 304.7,
+        "throat_mm2": 60.0,
+        "canal_stem_mm": 8.0,
+        "throat_with_stem_mm2": 27.3,
+    }
+    assert dumped["earpiece"]["fixed_dials"]["tab_mm"] == 4.0
+    assert "throat_mm2" not in dumped["earpiece"]["fixed_dials"]
+
+
+def test_the_ears_limits_follow_what_the_probe_builds_found(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    assert bridge.earpiece is not None
+    # An ear where only the variant with a stem built: no wide throat, and a smaller opening.
+    bridge.earpiece["boxes"] = [
+        {"throat_mm2": [7.0, 21.24], "mouth_mm2": [20.0, 188.09], "canal_stem_mm": [0.0, 8.0]}
+    ]
+    capabilities = as_contract(evaluator).get_evaluator_capabilities()
+    family = capabilities.family(EARPIECE_FAMILY_ID)
+    assert family is not None
+    bounds = {p.name: (p.minimum, p.maximum) for p in family.parameters}
+    assert bounds["throat_mm2"] == (7, 21.2)
+    assert bounds["mouth_mm2"] == (20, 188)
+    described = {p.name: p.description for p in family.parameters}
+    assert "the throat can be at most 21.2." in described["throat_mm2"]
+    assert "That default is more than this ear holds." in described["throat_mm2"]
+
+
+@pytest.mark.parametrize(
+    ("earpiece", "reason"),
+    [
+        (None, None),
+        (
+            {"available": False, "reason": "ModuleNotFoundError: No module named 'hornsim.earpiece'"},
+            "hornsim.earpiece",
+        ),
+        ({**DESCRIBED["earpiece"], "boxes": []}, "Neither probe build"),
+    ],
+)
+def test_without_a_usable_earpiece_builder_only_the_spiral_family_is_declared(tmp_path, earpiece, reason):
+    evaluator, bridge = make_evaluator(tmp_path)
+    bridge.earpiece = earpiece
+    contract = as_contract(evaluator)
+    capabilities = contract.get_evaluator_capabilities()
+
+    assert [f.family_id for f in capabilities.geometry_families] == [FAMILY_ID]
+    assert "compact_size" in {u.requirement for u in capabilities.unsupported_requirements}
+    assert "concha_horn_earpiece" not in " ".join(capabilities.planning_notes)
+    saved = capabilities.model_dump(mode="json")["earpiece"]
+    assert saved["available"] is False or saved["boxes"] == []
+    if reason is not None:
+        assert reason in saved["reason"]
+
+    result = contract.evaluate_experiment(earpiece_spec())
+    assert result.status == "unsupported"
+    assert result.error is not None
+    assert result.error.code == "unsupported_family"
+    assert bridge.count("build-earpiece") == 0
+
+
+def test_an_earpiece_result_passes_the_runner_checks(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    contract = as_contract(evaluator)
+    capabilities = contract.get_evaluator_capabilities()
+    spec = earpiece_spec()
+    result = contract.evaluate_experiment(spec)
+
+    assert check_result(spec, result, capabilities) == []
+    assert result.status == "completed", result.error
+    assert {m.name: m.unit for m in result.metrics} == {m.name: m.unit for m in capabilities.metrics}
+    values = {m.name: m.value for m in result.metrics}
+    assert values["haspi_v2_mean"] == 0.5625
+    assert values["haspi_v2_improvement_over_unaided"] == 0.0625
+    assert values["insertion_gain_2000_4000_hz_db"] == 0.4
+    # The builder's own numbers: the flare inside the seat, and how far the print stands proud.
+    assert values["bore_length_mm"] == 8.9
+    assert values["protrusion_mm"] == 5.9
+
+    # With no collector asked for, the builder is sent its three dials and nothing else.
+    (sent,) = bridge.payloads("build-earpiece")
+    assert sent["parameters"] == {"throat_mm2": 27.0, "mouth_mm2": 150.0, "canal_stem_mm": 5.0}
+    assert sent["work_dir"] == str(tmp_path / "work")
+    assert bridge.count("build") == 0
+    # The score step is pointed at the folder that build made.
+    assert bridge.payloads("score")[0]["candidate_dir"] == result.evaluation_config["candidate_dir"]
+
+    kinds = {a.kind: a.ref for a in result.assets}
+    assert kinds["design_json"].endswith("/aid/earpiece/design.json")
+    assert kinds["earpiece_print_stl"].endswith("/aid/earpiece/earpiece_print.stl")
+    assert kinds["earpiece_in_ear_glb"].endswith("/aid/earpiece/earpiece_in_ear.glb")
+    assert kinds["acoustics_json"].endswith("/aid/earpiece/acoustics.json")
+    assert kinds["references_json"].endswith("/references.json")
+    assert result.evaluation_config["family_id"] == EARPIECE_FAMILY_ID
+    assert result.evaluation_config["acoustic_door"] == "profile"
+    saved = result.model_dump(mode="json")
+    assert saved["design"]["checks"] == {"bore_wall_mm": 1.41, "watertight": True}
+    assert saved["design"]["geometry"]["mouth_mm2_max"] == 320.8
+    assert saved["build_seconds"] == 3.0
+
+
+def test_the_collector_dials_become_the_builders_collector(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    contract = as_contract(evaluator)
+    capabilities = contract.get_evaluator_capabilities()
+    spec = earpiece_spec("collector", parameters=EARPIECE_COLLECTOR)
+    result = contract.evaluate_experiment(spec)
+
+    assert check_result(spec, result, capabilities) == []
+    assert result.status == "completed", result.error
+    (sent,) = bridge.payloads("build-earpiece")
+    collector = sent["parameters"].pop("collector")
+    assert sent["parameters"] == {"throat_mm2": 60.0, "mouth_mm2": 300.0, "canal_stem_mm": 0.0}
+    # One spine point straight out from the mouth centre, and twelve equal radii: a round rim.
+    assert collector["spine"] == [[10.0, 0.0, 0.0]]
+    (section,) = collector["sections"]
+    assert len(section) == 12
+    assert len(set(section)) == 1
+    assert math.pi * section[0] ** 2 == pytest.approx(450.0)
+    # The reported parameters stay the study's own, and the collector shows in how far it protrudes.
+    assert result.parameters == EARPIECE_COLLECTOR
+    assert {m.name: m.value for m in result.metrics}["protrusion_mm"] == 15.9
+    assert result.model_dump(mode="json")["design"]["geometry"]["collector"] is True
+
+
+@pytest.mark.parametrize(
+    ("change", "code"),
+    [
+        # Outside what hornsim.earpiece accepts on any ear.
+        ({"throat_mm2": 70.0}, "out_of_bounds"),
+        ({"throat_mm2": 5.0}, "out_of_bounds"),
+        ({"mouth_mm2": 2000.0}, "out_of_bounds"),
+        ({"canal_stem_mm": 9.0}, "out_of_bounds"),
+        ({COLLECTOR_REACH: 40.0, COLLECTOR_MOUTH: 450.0}, "out_of_bounds"),
+        ({COLLECTOR_REACH: 10.0, COLLECTOR_MOUTH: 3000.0}, "out_of_bounds"),
+        ({"mouth_mm2": 25.0}, "out_of_bounds"),  # not larger than the throat
+        # Half a collector.
+        ({COLLECTOR_REACH: 10.0}, "bad_parameter"),
+        ({COLLECTOR_MOUTH: 450.0}, "bad_parameter"),
+        # A dial of the other family, and a missing one.
+        ({"vent_diameter_mm": 0.8}, "bad_parameter"),
+        ({COLLECTOR_REACH: None}, "bad_parameter"),
+    ],
+)
+def test_earpiece_specs_the_builder_could_never_take_are_unsupported(tmp_path, change, code):
+    evaluator, bridge = make_evaluator(tmp_path)
+    parameters = {name: value for name, value in {**EARPIECE_DEFAULT, **change}.items() if value is not None}
+    result = as_contract(evaluator).evaluate_experiment(earpiece_spec(parameters=parameters))
+
+    assert result.status == "unsupported"
+    assert result.error is not None
+    assert result.error.code == code
+    assert result.metrics == ()
+    assert bridge.count("build-earpiece") == 0
+
+
+def test_each_earpiece_is_built_once_across_scenarios_and_threads(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path, FakeBridge(build_delay=0.05))
+    contract = as_contract(evaluator)
+    capabilities = contract.get_evaluator_capabilities()
+    scenarios = [s.scenario_id for s in capabilities.scenarios]
+    specs = [make_spec("unaided", s, baseline=True) for s in scenarios]
+    specs += [make_spec("default_horn", s) for s in scenarios]
+    specs += [earpiece_spec("earpiece_default", s) for s in scenarios]
+    specs += [earpiece_spec("collector", s, parameters=EARPIECE_COLLECTOR) for s in scenarios]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(contract.evaluate_experiment, specs))
+
+    assert all(
+        check_result(spec, result, capabilities) == [] for spec, result in zip(specs, results, strict=True)
+    )
+    assert [r.status for r in results] == ["completed"] * 24
+    assert bridge.count("context") == 1
+    assert bridge.count("build") == 1
+    assert bridge.count("build-earpiece") == 2
+    assert bridge.count("score") == 24
+    # Every scenario of a candidate was scored on that candidate's one build.
+    folders: dict[str, set[Any]] = {}
+    for result in results:
+        folders.setdefault(result.candidate_id, set()).add(result.evaluation_config.get("candidate_dir"))
+    assert all(len(found) == 1 for found in folders.values())
+    assert len({next(iter(found)) for found in folders.values()}) == 4
+    protrusion = {r.candidate_id: {m.name: m.value for m in r.metrics}["protrusion_mm"] for r in results}
+    assert protrusion == {"unaided": 0, "default_horn": 2.3, "earpiece_default": 5.9, "collector": 15.9}
+
+
+def test_the_same_numbers_in_another_family_are_another_build(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    contract = as_contract(evaluator)
+    contract.evaluate_experiment(earpiece_spec())
+    contract.evaluate_experiment(earpiece_spec("again", "speech_in_babble_65_db_spl"))
+    contract.evaluate_experiment(
+        earpiece_spec("no_stem", parameters={**EARPIECE_DEFAULT, "canal_stem_mm": 0.0})
+    )
+    assert bridge.count("build-earpiece") == 2
+    assert bridge.count("build") == 0
+
+
+@pytest.mark.parametrize(
+    ("parameters", "reasons", "expected"),
+    [
+        # Inside the builder's range, beyond what this ear's faceplate holds.
+        (
+            {**EARPIECE_DEFAULT, "mouth_mm2": 400.0},
+            [MOUTH_FIT],
+            "mouth_fit: the mouth is larger than this concha's opening allows "
+            "(move mouth_mm2 -; max_ok_mm2 304.8; or rim_conformity +)",
+        ),
+        (
+            {**EARPIECE_DEFAULT, "throat_mm2": 30.0, "mouth_mm2": 151.0},
+            [STEM_THROAT],
+            "stem_throat: the throat does not fit inside the canal stem (move throat_mm2 -; max_ok_mm2 27.3; "
+            "or canal_stem_mm 0 (no stem: the piece then relies on its fit alone))",
+        ),
+        (
+            {**EARPIECE_COLLECTOR, "mouth_mm2": 299.0, COLLECTOR_REACH: 30.0},
+            [
+                {
+                    "check": "collector_reach",
+                    "message": "the collector reaches too far from the ear",
+                    "value_mm": 36.2,
+                    "limit_mm": 35.0,
+                    "move": {"dial": "collector", "direction": "shorten the spine or shrink the sections"},
+                },
+                {"check": "collector_clearance", "message": "the collector touches the ear on its back side"},
+            ],
+            "collector_reach: the collector reaches too far from the ear (move collector shorten the spine or "
+            "shrink the sections; value_mm 36.2; limit_mm 35); collector_clearance: the collector touches "
+            "the ear on its back side",
+        ),
+    ],
+)
+def test_an_earpiece_the_builder_rejects_is_a_failed_case_with_its_reasons(
+    tmp_path, parameters, reasons, expected
+):
+    evaluator, bridge = make_evaluator(tmp_path)
+    bridge.earpiece_rejections[parameters["mouth_mm2"]] = reasons
+    contract = as_contract(evaluator)
+    capabilities = contract.get_evaluator_capabilities()
+
+    results = []
+    for scenario in ("clean_speech_65_db_spl", "speech_in_babble_65_db_spl"):
+        spec = earpiece_spec("rejected", scenario, parameters=parameters)
+        result = contract.evaluate_experiment(spec)
+        assert check_result(spec, result, capabilities) == []
+        results.append(result)
+
+    for result in results:
+        assert result.status == "failed"
+        assert result.metrics == ()
+        assert result.error is not None
+        assert result.error.code == "geometry_does_not_fit"
+        assert result.error.message == f"This design cannot be built in this ear: {expected}."
+        assert not result.error.transient
+        # The builder's reasons are kept as it gave them, for whoever plans the next study.
+        assert result.model_dump(mode="json")["build_reasons"] == reasons
+    assert bridge.count("build-earpiece") == 1
+    assert bridge.count("score") == 0
+
+
+def test_values_the_earpiece_builder_refuses_are_unsupported_not_failed(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    tiny = {**EARPIECE_COLLECTOR, COLLECTOR_MOUTH: 2.0}
+    bridge.earpiece_rejections[tiny["mouth_mm2"]] = [
+        {"check": "params", "message": "each section is 12 inner radii in mm, each within 1..30"}
+    ]
+    contract = as_contract(evaluator)
+    spec = earpiece_spec("tiny_rim", parameters=tiny)
+    result = contract.evaluate_experiment(spec)
+
+    assert check_result(spec, result, contract.get_evaluator_capabilities()) == []
+    assert result.status == "unsupported"
+    assert result.error is not None
+    assert result.error.code == "bad_parameter"
+    assert "each within 1..30" in result.error.message
+    assert result.metrics == ()
+    assert bridge.count("score") == 0
+
+
+def test_an_earpiece_build_that_crashes_is_a_failed_case_and_is_not_repeated(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    bridge.crashes.add(200.0)
+    contract = as_contract(evaluator)
+    spec = earpiece_spec("crashing", parameters={**EARPIECE_DEFAULT, "mouth_mm2": 200.0})
+    first = contract.evaluate_experiment(spec)
+    second = contract.evaluate_experiment(spec)
+
+    assert first.status == second.status == "failed"
+    assert first.error is not None
+    assert first.error.code == "build_failed"
+    assert "hornsim build-earpiece step failed" in first.error.message
+    assert "boom" in first.error.message
+    assert first.metrics == ()
+    assert bridge.count("build-earpiece") == 1
+    assert bridge.count("score") == 0
+
+
+# --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
 
@@ -934,6 +1287,173 @@ async def test_a_study_runs_end_to_end_on_the_hornsim_evaluator(tmp_path):
     saved = json.loads((outcome.directory / "experiment_results.json").read_text())
     assert all(record["outcome"] == "completed" for record in saved["records"])
     assert saved["records"][-1]["result"]["design"]["printable_solid_watertight"] is True
+
+
+def both_families_draft() -> dict[str, Any]:
+    def candidate(candidate_id: str, family: str, values: dict[str, float], label: str) -> dict[str, Any]:
+        return {
+            "candidate_id": candidate_id,
+            "kind": "design",
+            "family_id": family,
+            "baseline_id": "",
+            "parameters": [{"name": name, "value": value, "choice": ""} for name, value in values.items()],
+            "label": label,
+            "rationale": "Compare a flush mouth with a collector, next to the coiled aid.",
+        }
+
+    draft = valid_draft(needs=False)
+    draft["hypotheses"][0].update(
+        candidate_ids=["earpiece_flush", "earpiece_collector"],
+        metric="haspi_v2_mean",
+        varied_parameter=COLLECTOR_MOUTH,
+    )
+    draft["candidates"] = [
+        draft["candidates"][0],
+        candidate("wide_funnel", FAMILY_ID, WIDE_DESIGN, "Coiled aid, wide funnel"),
+        candidate("earpiece_flush", EARPIECE_FAMILY_ID, EARPIECE_DEFAULT, "Earpiece, flush mouth"),
+        candidate("earpiece_collector", EARPIECE_FAMILY_ID, EARPIECE_COLLECTOR, "Earpiece with a collector"),
+    ]
+    draft["scenario_ids"] = [
+        "clean_speech_50_db_spl",
+        "clean_speech_80_db_spl",
+        "speech_in_babble_50_db_spl",
+        "speech_in_babble_80_db_spl",
+    ]
+    draft["selection"] = {
+        "primary_metric": "haspi_v2_mean",
+        "reference_candidate_id": "unaided",
+        "tie_breaker_metrics": ["haspi_v2_worst_canal"],
+        "constraints": [{"metric": "protrusion_mm", "bound": "max", "value": 20}],
+    }
+    return draft
+
+
+def both_families_request(**overrides: Any) -> dict[str, Any]:
+    budget = {
+        "max_evaluation_cases": 16,
+        "max_parallel_evaluations": 4,
+        "max_research_tool_calls_per_agent": 6,
+    }
+    return hornsim_request(THRESHOLDS, budget=budget, **overrides)
+
+
+def plan_of(draft: dict[str, Any], capabilities: EvaluatorCapabilities, request: dict[str, Any]):
+    package = validate_request(parse_request(request), capabilities)
+    findings = frozenset({"hearing-F1", "context-F1", "design-F1"})
+    return build_plan(PlanDraft.model_validate(draft), package, findings, plan_version=1)
+
+
+def test_a_plan_with_candidates_from_both_families_is_valid(tmp_path):
+    evaluator, _ = make_evaluator(tmp_path)
+    capabilities = as_contract(evaluator).get_evaluator_capabilities()
+
+    plan, errors = plan_of(both_families_draft(), capabilities, both_families_request())
+    assert errors == []
+    assert plan is not None
+    assert {c.candidate_id: c.family_id for c in plan.candidates} == {
+        "unaided": None,
+        "wide_funnel": FAMILY_ID,
+        "earpiece_flush": EARPIECE_FAMILY_ID,
+        "earpiece_collector": EARPIECE_FAMILY_ID,
+    }
+    assert len(plan.experiments) == 16
+    by_family = {e.family_id for e in plan.experiments}
+    assert by_family == {None, FAMILY_ID, EARPIECE_FAMILY_ID}
+    collector_spec = next(e for e in plan.experiments if e.candidate_id == "earpiece_collector")
+    assert collector_spec.parameters == EARPIECE_COLLECTOR
+    assert [c.metric for c in plan.selection_rule.constraints] == ["protrusion_mm"]
+
+    # A faceplate mouth beyond what this ear holds is caught before anything is frozen.
+    too_wide = both_families_draft()
+    too_wide["candidates"][2]["parameters"][1]["value"] = 450.0
+    _, errors = plan_of(too_wide, capabilities, both_families_request())
+    assert any("mouth_mm2=450 is above the maximum 304.7 mm^2" in error for error in errors)
+
+    # A dial of one family is not a dial of the other.
+    mixed = both_families_draft()
+    mixed["candidates"][1]["parameters"].append({"name": COLLECTOR_REACH, "value": 10.0, "choice": ""})
+    _, errors = plan_of(mixed, capabilities, both_families_request())
+    assert any(f"'{COLLECTOR_REACH}' is not a parameter of family '{FAMILY_ID}'" in error for error in errors)
+
+
+def test_a_size_preference_can_be_planned_as_a_limit_on_protrusion(tmp_path):
+    evaluator, _ = make_evaluator(tmp_path)
+    capabilities = as_contract(evaluator).get_evaluator_capabilities()
+    request = both_families_request(
+        needs_profile={
+            "activities": [],
+            "goals": [],
+            "priorities": ["compact_size"],
+            "requirements": [],
+            "free_text": "",
+        }
+    )
+    draft = both_families_draft()
+    draft["hypotheses"][0]["user_goals"] = []
+    draft["needs_coverage"] = [need("compact_size", metric_names=["protrusion_mm"])]
+    plan, errors = plan_of(draft, capabilities, request)
+    assert errors == []
+    assert plan is not None
+
+    # Without the limit an informational metric cannot stand for the need.
+    draft["selection"]["constraints"] = []
+    _, errors = plan_of(draft, capabilities, request)
+    assert any("'protrusion_mm' is informational" in error for error in errors)
+
+
+async def test_a_study_with_both_families_completes_and_can_select_an_earpiece(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path, FakeBridge(build_delay=0.02))
+    harness = Harness(
+        tmp_path / "studies",
+        evaluator=as_contract(evaluator),
+        coordinator=coordinator_responder(both_families_draft()),
+    )
+    outcome = await run_study(both_families_request(), harness.deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    assert bridge.count("context") == 1
+    assert bridge.count("build") == 1
+    assert bridge.count("build-earpiece") == 2
+    assert bridge.count("score") == 16  # 4 candidates x 4 scenarios
+    report = outcome.report
+    assert report is not None
+    assert report.experiments_completed == 16
+    # The stub scores the collector best, and at 15.9 mm it is inside the 20 mm limit.
+    assert report.selection.reason_code == "selected"
+    assert report.selected_candidate_id == "earpiece_collector"
+    ranked = {c.candidate_id: (c.eligible, c.rank) for c in report.candidates if c.kind == "design"}
+    assert ranked == {"earpiece_collector": (True, 1), "wide_funnel": (True, 2), "earpiece_flush": (True, 3)}
+
+    saved = json.loads((outcome.directory / "results.json").read_text())
+    selected = saved["selected_candidate"]
+    assert selected["family_id"] == EARPIECE_FAMILY_ID
+    assert selected["parameters"] == EARPIECE_COLLECTOR
+    # The names the final step (`horn-study earpiece`) locks: the throat and the faceplate mouth.
+    assert final_step.locked_params(selected["parameters"]) == {"throat_mm2": 60.0, "mouth_mm2": 300.0}
+    records = json.loads((outcome.directory / "experiment_results.json").read_text())["records"]
+    assert all(record["outcome"] == "completed" for record in records)
+    built = [r["result"]["design"]["family"] for r in records if "earpiece" in r["result"]["candidate_id"]]
+    assert built == ["concha_horn_earpiece"] * 8
+
+
+async def test_an_earpiece_that_protrudes_past_the_plans_limit_is_not_selected(tmp_path):
+    evaluator, _ = make_evaluator(tmp_path)
+    draft = both_families_draft()
+    draft["selection"]["constraints"] = [{"metric": "protrusion_mm", "bound": "max", "value": 8}]
+    harness = Harness(
+        tmp_path / "studies", evaluator=as_contract(evaluator), coordinator=coordinator_responder(draft)
+    )
+    outcome = await run_study(both_families_request(), harness.deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    report = outcome.report
+    assert report is not None
+    collector = next(c for c in report.candidates if c.candidate_id == "earpiece_collector")
+    assert not collector.eligible
+    assert any(
+        "protrusion_mm mean 15.9 exceeds the limit 8" in reason for reason in collector.ineligibility_reasons
+    )
+    assert report.selected_candidate_id == "wide_funnel"
 
 
 # --------------------------------------------------------------------------
