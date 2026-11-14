@@ -131,6 +131,31 @@ def square_crop(img, mask, pad_frac):
     return img_p[sy:sy + side, sx:sx + side], mask_p[sy:sy + side, sx:sx + side]
 
 
+def _canonical(m, shape):
+    """PCA shape coefficients -> vertices in AudioEar's canonical frame (+x lateral, +y up, -z forward
+    for a right ear), centred, in model units. Returns (verts, faces)."""
+    verts = (m["Mean"][:, 0] + m["Eigenvectors"] @ (shape * m["EigenValues"])).reshape(-1, 3)
+    faces = np.asarray(m["Trilist"], dtype=np.int64)
+    if faces.min() == 1:
+        faces = faces - 1
+    verts = verts - (verts.min(0) + verts.max(0)) / 2      # same canonicalisation as AudioEar utils
+    verts[:, 0] *= -1
+    verts[:, 2] *= -1
+    return verts, faces
+
+
+def mean_ear(out, height_mm=62.0):
+    """The PCA model's average right ear, scaled to `height_mm`. A stand-in when no photo has been
+    reconstructed yet; it is NOT anyone's ear. Writes <out>/ear.ply and returns its path."""
+    m = pickle.load(open(os.path.join(AUDIOEAR_DIR, "data", "UHM_models", "ear_model.pkl"), "rb"))
+    verts, faces = _canonical(m, np.zeros(len(m["EigenValues"])))
+    verts = verts * (height_mm / np.ptp(verts[:, 1]))
+    os.makedirs(out, exist_ok=True)
+    path = os.path.join(out, "ear.ply")
+    trimesh.Trimesh(verts, faces, process=False).export(path)
+    return path
+
+
 def reconstruct(photo, out, box, left=False, height_mm=62.0, pad=0.15, mask_path=None, log=print):
     """Photo -> ear mesh in `out`. `box` = [x0, y0, x1, y1] around the ear in full-resolution pixels.
 
@@ -170,13 +195,7 @@ def reconstruct(photo, out, box, left=False, height_mm=62.0, pad=0.15, mask_path
             pos, _, shape = enc(t, feats)
         pos, shape = pos[0].cpu().numpy(), shape[0].cpu().numpy()
 
-    verts = (m["Mean"][:, 0] + m["Eigenvectors"] @ (shape * m["EigenValues"])).reshape(-1, 3)
-    faces = np.asarray(m["Trilist"], dtype=np.int64)
-    if faces.min() == 1:
-        faces = faces - 1
-    verts = verts - (verts.min(0) + verts.max(0)) / 2      # same canonicalisation as AudioEar utils
-    verts[:, 0] *= -1
-    verts[:, 2] *= -1
+    verts, faces = _canonical(m, shape)
 
     # posed verts -> pixels (pytorch3d look_at_view_transform(10, 0, pi/2) + orthographic camera)
     f = pos[5]
