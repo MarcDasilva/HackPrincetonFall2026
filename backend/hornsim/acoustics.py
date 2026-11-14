@@ -1008,10 +1008,13 @@ def insertion_gain(x, ear_params, canal, freqs_hz, theta_deg=0, settings=None):
     theta_deg is accepted and ignored: both paths share the source, so the direction of the sound cancels in
     insertion gain (no mouth offset from the canal opening is modelled). It only changes open_ear_gain.
 
-    DEFAULT PHYSICS: the unified model, not marc-sim's. Numbers differ from marc-sim's acoustics.py, mostly
-    below 1 kHz (the eardrum now has compliance: sealed designs move by several dB there) and by a shift of
-    about 2.6 % in every resonance frequency (air at 35 C, not 20 C). Pass settings=LEGACY_MARC_SIM to get
-    the old numbers back.
+    DEFAULT PHYSICS: the unified model, not marc-sim's, so the numbers differ from marc-sim's acoustics.py.
+    Nearly all of it is the eardrum, which now has compliance and mass instead of being a pure resistance:
+      narrow vented coil (1 -> 22 mm2)   +6 to +11 dB below 500 Hz (up to 14 dB near 330 Hz), +2 dB at
+                                         0.5-1 kHz, about -1 dB in every band above 1 kHz
+      wide sealed earpiece (27 -> 150)   under +0.6 dB below 1 kHz, +1.7 dB at 1-2 kHz, -0.6 dB above
+    Air at 35 C instead of 20 C moves every resonance up 2.6 % (within 0.5 dB per band); exact wall losses
+    and slicing change less than 0.05 dB. Pass settings=LEGACY_MARC_SIM to get the old numbers back.
     """
     w = _omega(freqs_hz)
     st = _settings(settings)
