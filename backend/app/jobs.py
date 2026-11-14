@@ -15,6 +15,9 @@ from concurrent.futures import ThreadPoolExecutor
 from .settings import settings
 
 _pool = ThreadPoolExecutor(max_workers=settings.workers)
+# stage=sim jobs (~8 s: ear + ear world + canals) get their own lane, so a patient waiting for /sim is
+# never stuck behind someone's full pipeline (references, waves, aid: minutes)
+_fast = ThreadPoolExecutor(max_workers=2)
 _write_lock = threading.Lock()
 
 STEPS = ["ear", "context", "waves", "aid", "acoustics", "score"]
@@ -105,7 +108,17 @@ def run_full(pid, request):
                                "ear_height_mm": request["ear_height_mm"], "side": request["side"],
                                "audiogram_db_hl": {int(k): float(v) for k, v in request["audiogram_db_hl"].items()}})
         cfg["ear_world"]["landmarks_xlsx"] = er.LANDMARKS_XLSX
-        ctx = context.build(cfg, os.path.join(d, "context"), log=log)
+        sim_only = request.get("stage") == "sim"
+
+        def sim_ready():      # /sim and the earpiece builder need only this much
+            _update(pid, results={**read_job(pid).get("results", {}), "sim_ready": True})
+            log("ready for the scene grid (/sim)" + ("; the rest of the pipeline runs on request (POST .../complete)" if sim_only
+                                                     else "; speech references continue in the background"))
+        ctx = context.build(cfg, os.path.join(d, "context"), log=log, on_ready=sim_ready, stop_when_ready=sim_only)
+        if sim_only:          # the scene grid has what it needs; the rest runs on request (POST .../complete)
+            _update(pid, results={**read_job(pid).get("results", {}), "context": {"ear_world": ctx["ear_world"], "partial": True}},
+                    status="done", step=None, stage="sim", finished_at=time.time())
+            return
         refs = [{k: r[k] for k in ("clip", "level_db_spl", "unaided", "ceiling", "ceiling_from", "headroom", "use_in_reward")}
                 for r in ctx["references_data"]]
         job = read_job(pid)
@@ -163,8 +176,8 @@ def run_aid(pid, overrides):
         _update(pid, status="error", error=str(e))
 
 
-def submit(fn, *args):
-    _pool.submit(fn, *args)
+def submit(fn, *args, fast=False):
+    (_fast if fast else _pool).submit(fn, *args)
 
 
 def resume_interrupted():
@@ -178,6 +191,6 @@ def resume_interrupted():
             continue
         job.update(status="queued", step=None, log=job.get("log", []) + [f"{time.strftime('%H:%M:%S')} re-queued after a server restart"])
         write_job(pid, job)
-        submit(run_full, pid, job["request"])
+        submit(run_full, pid, job["request"], fast=job["request"].get("stage") == "sim")
         out.append(pid)
     return out

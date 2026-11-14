@@ -2,7 +2,8 @@
 
     uvicorn app.main:app --host 0.0.0.0 --port 8000      (run from backend/)
 
-POST /api/patients            photo + box + side + ear height + audiogram -> starts the pipeline
+POST /api/patients            photo + box + side + ear height + audiogram [+ stage] -> starts the pipeline
+POST /api/patients/{id}/complete   finish the pipeline for a patient started with stage=sim
 GET  /api/patients/{id}       status, step, log and results
 POST /api/patients/{id}/aid   rebuild the aid with new design numbers
 GET  /api/patients/{id}/files/{name}   generated files (meshes, images, STL, JSON)
@@ -73,9 +74,12 @@ async def create_patient(
     side: str = Form("right"),
     ear_height_mm: float = Form(62.0),
     audiogram: str = Form("", description='JSON {"250": 15, ...} dB HL; blank = example audiogram'),
+    stage: str = Form("full", description='"full" = whole pipeline; "sim" = stop once the scene grid can use the ear (~15 s)'),
 ):
     if side not in ("right", "left"):
         raise HTTPException(422, "side must be right or left")
+    if stage not in ("full", "sim"):
+        raise HTTPException(422, "stage must be full or sim")
     if not 40 <= ear_height_mm <= 90:
         raise HTTPException(422, "ear height should be 40-90 mm")
     try:
@@ -107,9 +111,24 @@ async def create_patient(
     os.makedirs(d)
     img.save(os.path.join(d, "photo.jpg"), quality=95)
     request = {"box": b, "side": side, "ear_height_mm": ear_height_mm, "audiogram_db_hl": ag,
-               "audiogram_is_example": not audiogram.strip()}
+               "audiogram_is_example": not audiogram.strip(), "stage": stage}
     jobs.write_job(pid, {"id": pid, "status": "queued", "step": None, "created_at": time.time(),
                          "request": request, "results": {}, "log": []})
+    jobs.submit(jobs.run_full, pid, request, fast=stage == "sim")
+    return {"id": pid, "status_url": f"/api/patients/{pid}"}
+
+
+@app.post("/api/patients/{pid}/complete", status_code=202)
+def complete_patient(pid: str):
+    """Run the rest of the pipeline (references, waves, aid) for a patient started with stage=sim."""
+    _check_id(pid)
+    job = jobs.read_job(pid)
+    if job["status"] in ("queued", "running"):
+        raise HTTPException(409, "this patient is still being processed")
+    if job.get("request", {}).get("stage", "full") != "sim" and job["status"] == "done":
+        raise HTTPException(409, "this patient already ran the full pipeline")
+    request = {**job["request"], "stage": "full"}
+    jobs.write_job(pid, {**job, "status": "queued", "step": None, "stage": "full", "request": request})
     jobs.submit(jobs.run_full, pid, request)
     return {"id": pid, "status_url": f"/api/patients/{pid}"}
 

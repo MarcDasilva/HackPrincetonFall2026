@@ -2,7 +2,7 @@
 // Photos from the dashboard chat -> what /sim needs: a patient record per ear (POST /api/patients runs
 // the ear pipeline) and a head shape from a front photo (face landmarks found in the browser, fitted by
 // POST /api/sim/head_shapes; the face photo itself is never uploaded).
-import { createHeadShape, type HeadShapeFit } from "../sim/lib/api";
+import { measureHead, type HeadShapeFit } from "../sim/lib/api";
 import { detectFace, locateEar, type EarLocation } from "../sim/lib/faceShape";
 
 export type PhotoKind = "left" | "right" | "face";
@@ -40,7 +40,7 @@ export async function classifyPhoto(blob: Blob): Promise<{ kind: "face" } | { ki
 export async function fitHead(blob: Blob): Promise<HeadShapeFit> {
   const { img, done } = await toImage(blob);
   try {
-    return await createHeadShape(await detectFace(img));
+    return await measureHead(img);
   } finally {
     done();
   }
@@ -63,6 +63,7 @@ export async function uploadEar(blob: Blob, side: "left" | "right", earBox?: [nu
   fd.append("photo", blob, `${side}-ear.jpg`);
   fd.append("box", box);
   fd.append("side", side);
+  fd.append("stage", "sim");          // only what the scene grid needs; the rest of the pipeline can run later
   const r = await fetch("/api/patients", { method: "POST", body: fd });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.detail ? String(j.detail) : `upload failed (HTTP ${r.status})`);
@@ -75,5 +76,6 @@ export type PatientJob = {
 };
 export const patientStatus = (id: string) => fetch(`/api/patients/${id}`).then((r) => (r.ok ? r.json() as Promise<PatientJob> : Promise.reject(new Error(`HTTP ${r.status}`))));
 
-/** /sim can use an ear once its context step has run (the scene grid needs the ear mesh and canal fit). */
-export const earReadyForSim = (j: PatientJob) => j.status === "done" || !!j.results?.context;
+/** /sim can use an ear once its ear world and canal samples exist (results.sim_ready, ~1 s into the
+ * context step); the speech references the rest of the pipeline uses keep running in the background. */
+export const earReadyForSim = (j: PatientJob) => j.status === "done" || !!j.results?.sim_ready || !!j.results?.context;

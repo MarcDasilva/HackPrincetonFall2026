@@ -4,6 +4,11 @@ coarse wave grid (hornsim.head_grid), and per ear an earpiece designed from the 
 
     POST /api/sim/head_shapes                               face landmarks of a front photo -> fitted head shape
     GET  /api/sim/head?left={pid}&right={pid}[&shape={sid}] head grid + both patients' side and audiogram
+    GET  /api/sim/clips/{name}.wav                          speech / babble clips for listening to a scene
+    GET  /api/sim/scene_vocabulary                          sounds, limits and scene format (for the research step)
+    POST /api/sim/scene_sets                                {source, scenes} -> validated, stored -> id
+    POST /api/sim/scene_sets/suggest                        a needs profile -> suggested scene set (stored)
+    GET  /api/sim/scene_sets/{sid}                          a stored scene set (/sim?scenes=<sid>)
     POST /api/sim/patients/{pid}/design                     {audiogram_db_hl, scenes} -> 202
     GET  /api/sim/patients/{pid}/design                     status, log, result
     GET  /api/sim/patients/{pid}/design/files/{did}/{name}  earpiece mesh / print / preview
@@ -97,12 +102,80 @@ def _patient_info(pid, job):
             "audiogram_is_example": bool(req.get("audiogram_is_example", True))}
 
 
+# ---------------------------------------------------------------- scene sets (hornsim.scene_spec)
+
+def _scene_set_path(sid):
+    return os.path.join(settings.data_dir, "scene_sets", f"{sid}.json")
+
+
+def _store_scene_set(s):
+    sid = secrets.token_hex(6)
+    os.makedirs(os.path.dirname(_scene_set_path(sid)), exist_ok=True)
+    json.dump({**s, "id": sid, "created_at": time.time()}, open(_scene_set_path(sid), "w"), indent=1)
+    return {"id": sid, **s}
+
+
+@router.get("/scene_vocabulary")
+def scene_vocabulary():
+    from hornsim import scene_spec
+    return scene_spec.vocabulary()
+
+
+@router.post("/scene_sets", status_code=201)
+def create_scene_set(body: dict):
+    """A scene set built by the research step (or anyone): validated against the vocabulary, stored."""
+    from hornsim import scene_spec
+    try:
+        s = scene_spec.validate_scene_set(body)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return {**_store_scene_set(s), "scenarios": scene_spec.as_scenarios(s)}
+
+
+class NeedsBody(BaseModel):
+    activities: list[str] = Field(default_factory=list, max_length=40)
+    goals: list[str] = Field(default_factory=list, max_length=40)
+    priorities: list[str] = Field(default_factory=list, max_length=40)
+    requirements: list[str] = Field(default_factory=list, max_length=40)
+    free_text: str = Field("", max_length=4000)
+    max_scenes: int = Field(9, ge=1, le=16)
+
+
+@router.post("/scene_sets/suggest", status_code=201)
+def suggest_scene_set(body: NeedsBody):
+    """A first scene set from a needs profile (the agents' NeedsProfile fields), stored like any other."""
+    from hornsim import scene_spec
+    s = scene_spec.suggest_scenes(body.model_dump(exclude={"max_scenes"}), body.max_scenes)
+    return {**_store_scene_set(s), "scenarios": scene_spec.as_scenarios(s)}
+
+
+@router.get("/scene_sets/{sid}")
+def get_scene_set(sid: str):
+    if not ID_RE.match(sid) or not os.path.exists(_scene_set_path(sid)):
+        raise HTTPException(404, "scene set not found")
+    return json.load(open(_scene_set_path(sid)))
+
+
+CLIP_RE = re.compile(r"^(clean_[1-3]|babble_[1-4]_noise)\.wav$")
+CLIP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "speech")
+
+
+@router.get("/clips/{name}")
+def get_clip(name: str):
+    """The cached test-speech clips (macOS `say`, hornsim.context) for the scene grid's listen mode."""
+    p = os.path.join(CLIP_DIR, name)
+    if not CLIP_RE.match(name) or not os.path.isfile(p):
+        raise HTTPException(404, "unknown clip")
+    return FileResponse(p, media_type="audio/wav")
+
+
 class HeadShapeRequest(BaseModel):
     """MediaPipe face-landmarker output for one front photo. The photo stays in the browser."""
     landmarks: list[list[float]] = Field(min_length=478, max_length=478)
     image_w: int = Field(gt=0, le=20000)
     image_h: int = Field(gt=0, le=20000)
     yaw_deg: float | None = Field(None, ge=-90, le=90)
+    head_rows: list[list[float]] | None = Field(None, max_length=4000, description="[[y, x_left, x_right], ...] px: hair + face silhouette per row")
 
 
 def _shape_path(sid):
@@ -117,7 +190,9 @@ def create_head_shape(body: HeadShapeRequest):
     if any(len(p) < 2 for p in body.landmarks):
         raise HTTPException(422, "each landmark needs x and y")
     try:
-        shape, report = head_shape.fit(body.landmarks, body.image_w, body.image_h, body.yaw_deg)
+        if body.head_rows and any(len(r) != 3 for r in body.head_rows):
+            raise ValueError("each head row is [y, x_left, x_right]")
+        shape, report = head_shape.fit(body.landmarks, body.image_w, body.image_h, body.yaw_deg, body.head_rows)
     except ValueError as e:
         raise HTTPException(422, str(e))
     sid = secrets.token_hex(6)

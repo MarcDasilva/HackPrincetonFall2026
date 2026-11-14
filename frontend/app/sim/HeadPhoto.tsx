@@ -3,8 +3,7 @@
 // points go to the backend, which fits the head (hornsim/head_shape.py) and returns its outline so
 // the person can check it against the photo before the simulation uses it.
 import { useEffect, useRef, useState } from "react";
-import { createHeadShape, type HeadShapeFit } from "./lib/api";
-import { detectFace } from "./lib/faceShape";
+import { measureHead, type HeadShapeFit } from "./lib/api";
 import styles from "./sim.module.css";
 
 type Props = { onUse: (id: string) => void; onCancel?: () => void; required?: boolean };
@@ -28,9 +27,8 @@ export default function HeadPhoto({ onUse, onCancel, required }: Props) {
   const onLoad = async () => {
     const el = img.current!;
     try {
-      const face = await detectFace(el);
       setState("fitting");
-      setFit(await createHeadShape(face));
+      setFit(await measureHead(el));
       setState("done");
     } catch (e) {
       setError((e as Error).message);
@@ -49,6 +47,11 @@ export default function HeadPhoto({ onUse, onCancel, required }: Props) {
     const lw = Math.max(2, c.width / 300);
     const path = (pts: number[][], close: boolean) => { g.beginPath(); pts.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); if (close) g.closePath(); };
     g.lineWidth = lw;
+    if (fit.overlay.hair_outline_px) {           // what the segmenter saw: hair + face skin
+      g.strokeStyle = "rgba(230,232,235,0.55)";
+      path(fit.overlay.hair_outline_px, true);
+      g.stroke();
+    }
     g.strokeStyle = "#3987e5";
     g.setLineDash([lw * 3, lw * 2]);
     path(fit.overlay.silhouette_px, true);
@@ -93,12 +96,14 @@ export default function HeadPhoto({ onUse, onCancel, required }: Props) {
             <span><i style={{ background: "#d95926", borderRadius: "50%" }} /> face outline (measured)</span>
             <span><i className={styles.dash} style={{ borderTopColor: "#3987e5" }} /> head used in the simulation</span>
             <span><i className={styles.lineKey} style={{ borderTopColor: "#199e70" }} /> ear-canal height</span>
+            {fit!.overlay.hair_outline_px && <span><i className={styles.lineKey} style={{ borderTopColor: "rgba(230,232,235,0.55)" }} /> hair + face outline</span>}
           </div>
           <table className={styles.table}>
             <tbody>
-              <tr><td>Head breadth</td><td>{m.breadth_mm.toFixed(0)} mm</td><td className={styles.note}>cheekbones {m.bizygomatic_mm.toFixed(0)} mm × 1.09</td></tr>
+              <tr><td>Head breadth</td><td>{m.breadth_mm.toFixed(0)} mm</td><td className={styles.note}>{m.sources?.breadth ?? `cheekbones ${m.bizygomatic_mm.toFixed(0)} mm × 1.09`}</td></tr>
               <tr><td>Head length</td><td>{m.length_mm.toFixed(0)} mm</td><td className={styles.note}>assumed: adult length/breadth ratio</td></tr>
-              <tr><td>Chin to crown</td><td>{(m.crown_mm - m.chin_mm).toFixed(0)} mm</td><td className={styles.note}>crown assumed (hidden by hair)</td></tr>
+              <tr><td>Chin to crown</td><td>{(m.crown_mm - m.chin_mm).toFixed(0)} mm</td><td className={styles.note}>{m.sources?.crown ?? "crown assumed (hidden by hair)"}</td></tr>
+              {m.vault_exponent !== undefined && <tr><td>Top of head</td><td>n = {m.vault_exponent.toFixed(2)}</td><td className={styles.note}>{m.sources?.vault ?? ""} (2 = dome, higher = flatter top)</td></tr>}
               <tr><td>Eye spacing</td><td>{m.ipd_mm.toFixed(0)} mm</td><td className={styles.note}>scale check (adults ~54–74)</td></tr>
               {m.yaw_deg !== null && <tr><td>Turned</td><td>{Math.abs(m.yaw_deg).toFixed(0)}°</td><td className={styles.note}>best under 12°</td></tr>}
             </tbody>

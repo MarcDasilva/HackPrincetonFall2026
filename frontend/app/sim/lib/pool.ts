@@ -6,11 +6,12 @@ import type { HeadGrid, Side } from "./fdtd";
 import type { JobOut } from "./fdtd.worker";
 
 export type EarSpectra = Record<Side, number[]>;
+export type RunResult = { spectrum: EarSpectra; tf: import("./binaural").EarTF };
 
 type Job = {
   id: number; owner: string; az: number; el: number;
   onFrame?: (step: number, slice: Float32Array) => void;
-  resolve: (spectrum: EarSpectra) => void; reject: (e: Error) => void;
+  resolve: (r: RunResult) => void; reject: (e: Error) => void;
 };
 
 export class SimPool {
@@ -39,7 +40,7 @@ export class SimPool {
   subscribe(fn: () => void) { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; }
   private emit() { this.listeners.forEach((f) => f()); }
 
-  run(owner: string, az: number, el: number, onFrame?: Job["onFrame"]): Promise<EarSpectra> {
+  run(owner: string, az: number, el: number, onFrame?: Job["onFrame"]): Promise<RunResult> {
     return new Promise((resolve, reject) => {
       this.queue.push({ id: this.nextId++, owner, az, el, onFrame, resolve, reject });
       this.pump();
@@ -68,7 +69,7 @@ export class SimPool {
     if (m.type === "frame") { j.onFrame?.(m.step, m.slice); return; }
     this.running.delete(w);
     this.idle.push(w);
-    if (m.type === "done") j.resolve(m.spectrum);
+    if (m.type === "done") j.resolve({ spectrum: m.spectrum, tf: m.tf });
     else if (m.type === "error") j.reject(new Error(m.message));
     this.pump();
   }
