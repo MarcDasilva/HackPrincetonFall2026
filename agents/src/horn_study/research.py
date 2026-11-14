@@ -33,6 +33,7 @@ from horn_study.contracts import (
     InvestigatorOutput,
     ResearchFinding,
     SourceRecord,
+    SourceTier,
     StartingPackage,
 )
 from horn_study.events import EventBus
@@ -42,6 +43,7 @@ from horn_study.sources import (
     Search,
     SearchHit,
     SourceUnavailable,
+    classify_source,
     passage_in_text,
     select_passages,
 )
@@ -214,7 +216,9 @@ class ResearchLedger:
         record = next(r for r in self._records if r.source_id == source_id)
         return record, self._text[source_id]
 
-    def add_source(self, fetched: FetchedSource, investigator: InvestigatorName) -> SourceRecord:
+    def add_source(
+        self, fetched: FetchedSource, investigator: InvestigatorName, tier: SourceTier = "other"
+    ) -> SourceRecord:
         """Register a read source. Two branches reading the same URL share one record."""
         known = self.lookup(fetched.url) or self.lookup(fetched.final_url)
         if known is not None:
@@ -229,6 +233,7 @@ class ResearchLedger:
             content_sha256=hashlib.sha256(fetched.text.encode("utf-8")).hexdigest(),
             char_count=len(fetched.text),
             first_read_by=investigator,
+            tier=tier,
         )
         self._records.append(record)
         self._text[record.source_id] = fetched.text
@@ -331,12 +336,18 @@ class ResearchSession:
         hit = self._abstracts.get(url.rstrip("/"))
         if len(fetched.title.strip()) < 8:
             fetched = replace(fetched, title=hit.title if hit else url)
-        record = self._ledger.add_source(fetched, self.spec.name)
+        tier = classify_source(url, from_literature_search=hit is not None)
+        record = self._ledger.add_source(fetched, self.spec.name, tier)
         self._events.emit(
             "research.source_read",
             f"Read: {record.title[:120]}",
             component=self.spec.name,
-            data={"source_id": record.source_id, "url": record.url, "content_type": record.content_type},
+            data={
+                "source_id": record.source_id,
+                "url": record.url,
+                "content_type": record.content_type,
+                "tier": record.tier,
+            },
         )
         path = f"/sources/{record.source_id}.txt"
         note = (
@@ -392,6 +403,7 @@ class ResearchSession:
             source_id=record.source_id,
             source_url=record.url,
             source_title=record.title,
+            source_tier=record.tier,
             claim=claim.strip(),
             evidence_passage=" ".join(evidence_passage.split()),
             applicability=applicability.strip(),
@@ -405,7 +417,12 @@ class ResearchSession:
             finding.claim[:240],
             component=self.spec.name,
             finding_ids=[finding.finding_id],
-            data={"source_id": record.source_id, "source_url": record.url, "source_title": record.title},
+            data={
+                "source_id": record.source_id,
+                "source_url": record.url,
+                "source_title": record.title,
+                "source_tier": record.tier,
+            },
         )
         return f"Recorded as {finding.finding_id}."
 

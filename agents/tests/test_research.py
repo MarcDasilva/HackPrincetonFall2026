@@ -13,6 +13,7 @@ from horn_study.sources import (
     SearchHit,
     SourceUnavailable,
     check_url_allowed,
+    classify_source,
     extract_html_text,
     passage_in_text,
     select_passages,
@@ -198,3 +199,39 @@ def test_only_public_http_sources_can_be_read(blocked):
 
 def test_public_sources_are_allowed():
     check_url_allowed("https://pmc.ncbi.nlm.nih.gov/articles/PMC5970796/")
+
+
+@pytest.mark.parametrize(
+    ("url", "from_search", "expected"),
+    [
+        ("https://en.wikipedia.org/wiki/Horn_(acoustic)", False, "tertiary"),
+        ("https://en.wikipedia.org/wiki/Horn_(acoustic)", True, "tertiary"),
+        ("https://www.britannica.com/science/ear", False, "tertiary"),
+        ("https://pmc.ncbi.nlm.nih.gov/articles/PMC5970796/", False, "scholarly"),
+        ("https://doi.org/10.1121/1.395867", False, "scholarly"),
+        ("https://www.nature.com/articles/s41598-020-77042-w.pdf", False, "scholarly"),
+        ("https://some-university.example.edu/paper.pdf", True, "scholarly"),
+        ("https://github.com/claritychallenge/clarity", False, "technical_documentation"),
+        (
+            "https://raw.githubusercontent.com/claritychallenge/clarity/main/x.py",
+            False,
+            "technical_documentation",
+        ),
+        ("https://pypi.org/project/brucezilany/", False, "technical_documentation"),
+        ("https://some-blog.example.com/horns", False, "other"),
+        ("https://notwikipedia.org.example.com/x", False, "other"),
+    ],
+)
+def test_sources_are_classified_by_what_they_are(url, from_search, expected):
+    assert classify_source(url, from_literature_search=from_search) == expected
+
+
+async def test_a_read_source_and_its_findings_carry_the_tier():
+    s, events = session()
+    await s.search_literature("a")
+    await s.read_source(URL, "horn")
+    s.record_finding(source=URL, evidence_passage=PASSAGES["hearing_research"], **FINDING)
+    (source,) = s._ledger.sources
+    (finding,) = s._ledger.findings
+    assert source.tier == finding.source_tier == "scholarly"
+    assert [e.data["tier"] for e in events.history if e.type == "research.source_read"] == ["scholarly"]
