@@ -1,0 +1,7 @@
+body { margin: 0; font-family: system-ui, sans-serif; }
+
+/* metal-fx paints a solid #272727 (dark) / #fff (light) on its wrapper, which fills the ring's centre — !important because the library injects its CSS at runtime. */
+.metal-fx-root,
+.metal-fx-root[data-theme] {
+  background: transparent !important;
+}

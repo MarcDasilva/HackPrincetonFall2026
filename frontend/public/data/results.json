@@ -1,0 +1,137 @@
+{
+  "ear": {
+    "mesh": "ear.glb",
+    "audiogram": [
+      [
+        250,
+        15
+      ],
+      [
+        500,
+        20
+      ],
+      [
+        1000,
+        30
+      ],
+      [
+        2000,
+        45
+      ],
+      [
+        4000,
+        55
+      ]
+    ],
+    "canal_band": {
+      "volume_cc": [
+        0.5,
+        0.9
+      ],
+      "samples": 32
+    },
+    "cohc": 0.3,
+    "cihc": 0.6
+  },
+  "reference_neurogram": "ref.png",
+  "unaided": {
+    "neurogram": "ng_unaided.png",
+    "audio": "aud_unaided.wav"
+  },
+  "experiments": [
+    {
+      "id": 1,
+      "mesh": "horn_001.glb",
+      "params": {
+        "throat_mm2": 1.2,
+        "mouth_mm2": 20.4,
+        "length_mm": 181,
+        "vents": 1
+      },
+      "gain_curve": [
+        [
+          250,
+          1.1
+        ],
+        [
+          500,
+          4.0
+        ],
+        [
+          1000,
+          9.2
+        ],
+        [
+          2000,
+          12.8
+        ]
+      ],
+      "neurogram": "ng_001.png",
+      "audio": "aud_001.wav",
+      "score": 0.41
+    },
+    {
+      "id": 2,
+      "mesh": "horn_002.glb",
+      "params": {
+        "throat_mm2": 1.2,
+        "mouth_mm2": 20.4,
+        "length_mm": 182,
+        "vents": 2
+      },
+      "gain_curve": [
+        [
+          250,
+          1.1
+        ],
+        [
+          500,
+          4.0
+        ],
+        [
+          1000,
+          9.2
+        ],
+        [
+          2000,
+          12.8
+        ]
+      ],
+      "neurogram": "ng_002.png",
+      "audio": "aud_002.wav",
+      "score": 0.72
+    },
+    {
+      "id": 3,
+      "mesh": "horn_003.glb",
+      "params": {
+        "throat_mm2": 1.2,
+        "mouth_mm2": 20.4,
+        "length_mm": 183,
+        "vents": 3
+      },
+      "gain_curve": [
+        [
+          250,
+          1.1
+        ],
+        [
+          500,
+          4.0
+        ],
+        [
+          1000,
+          9.2
+        ],
+        [
+          2000,
+          12.8
+        ]
+      ],
+      "neurogram": "ng_003.png",
+      "audio": "aud_003.wav",
+      "score": 0.58
+    }
+  ],
+  "pick": 2
+}
