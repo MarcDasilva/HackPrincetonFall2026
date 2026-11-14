@@ -62,6 +62,11 @@ class EvaluatorNotConfigured(Exception):
     pass
 
 
+# An evaluator may also offer `check_buildable(spec)`: None when the candidate can be built,
+# or the reason it cannot. It lets a plan be corrected before it is frozen, and it never scores.
+BuildabilityCheck = Callable[[ExperimentSpec], ErrorInfo | None]
+
+
 # --------------------------------------------------------------------------
 # Real evaluator: a thin wrapper around the numerical owner's code
 # --------------------------------------------------------------------------
@@ -79,9 +84,20 @@ class CallableEvaluator:
         self,
         get_capabilities: Callable[[], Any],
         evaluate: Callable[[dict[str, Any]], Any],
+        check_buildable: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
         self._get_capabilities = get_capabilities
         self._evaluate = evaluate
+        self._check_buildable = check_buildable
+        # Optional third call. None when the evaluator cannot say in advance whether a design builds.
+        self.check_buildable: BuildabilityCheck | None = self._check if check_buildable else None
+
+    def _check(self, spec: ExperimentSpec) -> ErrorInfo | None:
+        assert self._check_buildable is not None
+        payload = spec.model_dump(mode="json")
+        payload["spec_hash"] = spec.spec_hash()
+        answer = _as_plain(self._check_buildable(payload))
+        return None if answer is None else ErrorInfo.model_validate(answer)
 
     def get_evaluator_capabilities(self) -> EvaluatorCapabilities:
         return EvaluatorCapabilities.model_validate(_as_plain(self._get_capabilities()))
@@ -106,6 +122,8 @@ def load_evaluator(path: str) -> Evaluator:
     A class or zero-argument factory is called once to obtain that object.
     `evaluate_experiment` receives the spec as a JSON-compatible dict that also
     carries `spec_hash`, and may return a dict or an ExperimentResult.
+    An optional `check_buildable(spec)` on the same object is picked up too. It returns None
+    when the candidate can be built, or `{"code", "message"}` when it cannot.
     """
     module_name, _, attribute = path.partition(":")
     if not module_name:
@@ -121,7 +139,11 @@ def load_evaluator(path: str) -> Evaluator:
         raise EvaluatorNotConfigured(
             f"'{path}' does not provide get_evaluator_capabilities and evaluate_experiment"
         )
-    return CallableEvaluator(target.get_evaluator_capabilities, target.evaluate_experiment)
+    return CallableEvaluator(
+        target.get_evaluator_capabilities,
+        target.evaluate_experiment,
+        getattr(target, "check_buildable", None),
+    )
 
 
 def evaluator_for(mode: EvaluationMode, env: Mapping[str, str] | None = None) -> Evaluator:

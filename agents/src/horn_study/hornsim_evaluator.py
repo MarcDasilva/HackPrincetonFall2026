@@ -969,6 +969,10 @@ def _reason_text(reason: Mapping[str, Any]) -> str:
     return f"{text} ({'; '.join(hints)})" if hints else text
 
 
+# Internal marker for a build-only check that found nothing wrong. Never returned to callers.
+_BUILDABLE = "buildable"
+
+
 class HornsimEvaluator:
     """`get_evaluator_capabilities` and `evaluate_experiment` over the hornsim bridge.
 
@@ -1017,6 +1021,25 @@ class HornsimEvaluator:
     # -- evaluation --------------------------------------------------------
 
     def evaluate_experiment(self, spec: dict[str, Any]) -> dict[str, Any]:
+        return self._evaluate(spec, with_score=True)
+
+    def check_buildable(self, spec: dict[str, Any]) -> dict[str, str] | None:
+        """Say whether this candidate can be built in this ear, without scoring it.
+
+        Returns None when it can, or `{"code", "message"}` with the builder's reason when it
+        cannot. The build is the same one evaluation uses and is cached, so a design checked
+        here is not built again when its cases run.
+        """
+        outcome = self._evaluate(spec, with_score=False)
+        if outcome.get("status") == _BUILDABLE:
+            return None
+        error = outcome.get("error") or {}
+        return {
+            "code": str(error.get("code") or "not_buildable"),
+            "message": str(error.get("message") or "The evaluator could not build this design."),
+        }
+
+    def _evaluate(self, spec: dict[str, Any], *, with_score: bool) -> dict[str, Any]:
         started = time.perf_counter()
         described = self._describe(refresh=False)
         version = described["version"]
@@ -1116,6 +1139,9 @@ class HornsimEvaluator:
                         context=context,
                         build=build,
                     )
+
+            if not with_score:
+                return {"status": _BUILDABLE}
 
             score = self._step(
                 "score",
@@ -1364,3 +1390,7 @@ def get_evaluator_capabilities() -> dict[str, Any]:
 
 def evaluate_experiment(spec: dict[str, Any]) -> dict[str, Any]:
     return _evaluator().evaluate_experiment(spec)
+
+
+def check_buildable(spec: dict[str, Any]) -> dict[str, str] | None:
+    return _evaluator().check_buildable(spec)
