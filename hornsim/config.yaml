@@ -1,0 +1,39 @@
+# Patient context for the horn design loop. Everything here is fixed during a search.
+patient:
+  id: patient_a
+  ear_mesh: ../repos/AudioEar/out/my_ear/ear.ply      # from photo_to_ear.py (mm, right ear)
+  ear_height_mm: 62                                    # measured or phone-depth; scales the mesh
+  side: right
+  # PLACEHOLDER: the handoff doc's example audiogram (dB HL). Replace with a real hearing test.
+  # The doc stops at 4 kHz; 6 kHz (needed by HASPI) is a flat extrapolation.
+  audiogram_db_hl: {250: 15, 500: 20, 1000: 30, 2000: 45, 4000: 55, 6000: 55}
+
+ear_world:
+  landmarks_xlsx: ../repos/AudioEar/data/55_landmarks.xlsx
+  concha_rim_landmarks: [35, 50]   # AudioEar landmark slice that outlines the concha
+  voxel_mm: 0.5
+  fit_tolerance_mm: 0.3            # gap kept between shell and skin
+  faceplate_protrusion_mm: 2.0     # how far the shell may sit proud of the concha rim
+  canal_opening_diameter_mm: 7.5   # ASSUMPTION: typical adult; a photo cannot see it
+
+canal:
+  residual_volume_cc: [0.5, 0.9]   # range from the handoff doc
+  samples: 32
+  seed: 0
+
+speech:
+  sample_rate: 24000
+  # Harvard sentences (IEEE Recommended Practice for Speech Quality Measurements, 1969), list 1
+  clean:
+    - {voice: Samantha, text: "The birch canoe slid on the smooth planks."}
+    - {voice: Daniel, text: "Glue the sheet to the dark blue background."}
+    - {voice: "Reed (English (US))", text: "It's easy to tell the depth of a well."}
+  noisy:
+    - {voice: "Flo (English (US))", text: "These days a chicken leg is a rare dish.", snr_db: 5}
+  babble_voices: [Karen, Moira, Tessa, Fred, "Sandy (English (US))", "Shelley (English (US))"]
+  babble_text: "Rice is often served in round bowls. The juice of lemons makes fine punch. The box was thrown beside the parked truck."
+
+evaluation:
+  levels_db_spl: [50, 65, 80]
+  haspi_seed: 0                    # HASPI adds internal noise; reseed before every call
+  ceiling_prescriptions: [nal_r, half_gain, full_gain]   # linear-aid references for the score's 1.0

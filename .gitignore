@@ -1,0 +1,12 @@
+CLAUDE.local.md
+.claude/settings.local.json
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+# third-party clones and local leftovers
+repos/
+buildinggym/
+# personal photos
+IMG_*.jpg
+IMG_*.HEIC
