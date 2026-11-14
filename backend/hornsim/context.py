@@ -1,8 +1,11 @@
 """Build everything the design loop needs for one patient (no design search here).
 
-    .venv/bin/python prepare.py [config.yaml]
+    python -m hornsim.context <out_dir> [config.yaml]     (defaults: hornsim/defaults.yaml)
 
-Writes out/<patient id>/context/:
+`cfg["patient"]["ear_mesh"]` and `cfg["ear_world"]["landmarks_xlsx"]` must be absolute paths
+(the CLI resolves relative ones against the config file's folder).
+
+Writes <out_dir>/:
     ear_world.npz        shell-space voxels, canal opening, rim, frame
     ear_world.glb        ear + shell space + canal marker, for viewing
     canals.json          32 sampled residual canals
@@ -22,17 +25,33 @@ import trimesh
 import yaml
 from scipy.stats import qmc
 
-from hornsim import audio, ear_world, scoring
+from . import audio, ear_world, scoring
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+SPEECH_CACHE = os.path.join(HERE, "..", "assets", "speech")
 
 
-def main(cfg_path):
-    cfg = yaml.safe_load(open(cfg_path))
+def load_defaults():
+    return yaml.safe_load(open(os.path.join(HERE, "defaults.yaml")))
+
+
+def cached_clip(name, make):
+    """Speech clips come from macOS `say`; cache them so Linux servers reuse the shipped copies."""
+    p = os.path.join(SPEECH_CACHE, name + ".wav")
+    if os.path.exists(p):
+        x, _ = sf.read(p)
+        return x
+    x = make()
+    os.makedirs(SPEECH_CACHE, exist_ok=True)
+    sf.write(p, x, 24000, subtype="FLOAT")
+    return x
+
+
+def build(cfg, out, log=print):
+    """Patient context for the design loop. Returns the context dict."""
     P, E, C, S, V = cfg["patient"], cfg["ear_world"], cfg["canal"], cfg["speech"], cfg["evaluation"]
-    out = os.path.join(HERE, "out", P["id"], "context")
     os.makedirs(os.path.join(out, "speech"), exist_ok=True)
-    rel = lambda p: os.path.join(HERE, p)
+    rel = lambda p: p
     t0 = time.time()
 
     # 1. ear world
@@ -48,7 +67,7 @@ def main(cfg_path):
                                        segment=[world.canal_point, world.canal_point + 6 * world.canal_axis])
     marker.visual.face_colors = [80, 140, 255, 200]
     trimesh.Scene([ear, space, marker]).export(os.path.join(out, "ear_world.glb"))
-    print(f"ear world: bowl {world.bowl_volume_cc:.2f} cc, shell space {world.shell_volume_cc:.2f} cc, "
+    log(f"ear world: bowl {world.bowl_volume_cc:.2f} cc, shell space {world.shell_volume_cc:.2f} cc, "
           f"opening {world.opening_area_mm2:.0f} mm2, depth {world.max_depth_mm:.1f} mm  ({time.time()-t0:.1f}s)")
 
     # 2. canal samples (Latin hypercube over residual volume)
@@ -59,24 +78,24 @@ def main(cfg_path):
                "length_mm": round(float((lo + (hi - lo) * x) / area_cm2 * 10), 2)} for i, x in enumerate(sorted(u))]
     json.dump({"assumed_diameter_mm": E["canal_opening_diameter_mm"], "canals": canals},
               open(os.path.join(out, "canals.json"), "w"), indent=1)
-    print(f"canals: {len(canals)} samples, {canals[0]['volume_cc']}-{canals[-1]['volume_cc']} cc")
+    log(f"canals: {len(canals)} samples, {canals[0]['volume_cc']}-{canals[-1]['volume_cc']} cc")
 
     # 3. speech clips
     fs = S["sample_rate"]
     clips = []
     for i, c in enumerate(S["clean"]):
-        x = audio.tts(c["text"], c["voice"], fs)
+        x = cached_clip(f"clean_{i+1}", lambda c=c: audio.tts(c["text"], c["voice"], fs))
         clips.append({"name": f"clean_{i+1}", "voice": c["voice"], "text": c["text"], "reference": x, "input": x})
     for i, c in enumerate(S["noisy"]):
-        x = audio.tts(c["text"], c["voice"], fs)
-        b = audio.babble(S["babble_voices"], S["babble_text"], fs, len(x))
+        x = cached_clip(f"babble_{i+1}_talker", lambda c=c: audio.tts(c["text"], c["voice"], fs))
+        b = cached_clip(f"babble_{i+1}_noise", lambda n=len(x): audio.babble(S["babble_voices"], S["babble_text"], fs, n))
         mix = x + b * 10 ** (-c["snr_db"] / 20)
         clips.append({"name": f"babble_{i+1}", "voice": c["voice"], "text": c["text"], "snr_db": c["snr_db"],
                       "reference": x, "input": mix})
     for c in clips:
         sf.write(os.path.join(out, "speech", f"{c['name']}_reference.wav"), c["reference"] / 8, fs)
         sf.write(os.path.join(out, "speech", f"{c['name']}_input.wav"), c["input"] / 8, fs)
-    print(f"speech: {len(clips)} clips, {sum(len(c['input']) for c in clips)/fs:.1f} s total ({time.time()-t0:.1f}s)")
+    log(f"speech: {len(clips)} clips, {sum(len(c['input']) for c in clips)/fs:.1f} s total ({time.time()-t0:.1f}s)")
 
     # 4. references: healthy check, unaided, ceiling
     ag = scoring.audiogram(P["audiogram_db_hl"])
@@ -98,7 +117,7 @@ def main(cfg_path):
             r["headroom"] = round(r["ceiling"] - r["unaided"], 4)
             r["use_in_reward"] = r["headroom"] >= 0.02  # too little room to tell designs apart otherwise
             refs.append(r)
-            print(f"  {c['name']:9s} {L} dB  healthy {r['healthy_check']:.3f}  unaided {r['unaided']:.3f}  "
+            log(f"  {c['name']:9s} {L} dB  healthy {r['healthy_check']:.3f}  unaided {r['unaided']:.3f}  "
                   f"ceiling {r['ceiling']:.3f} ({best})")
     json.dump({"metric": "HASPI v2 (pyclarity)", "seed": seed, "prescription_gains_db":
                {k: {"freqs_hz": f.tolist(), "gain_db": np.round(g, 2).tolist()} for k, (f, g) in rx.items()},
@@ -120,7 +139,9 @@ def main(cfg_path):
     json.dump(context, open(os.path.join(out, "context.json"), "w"), indent=1, default=float)
 
     summary_figure(mesh, world, ag, rx, refs, V["levels_db_spl"], os.path.join(out, "summary.png"))
-    print(f"done in {time.time()-t0:.0f}s -> {out}")
+    context["references_data"] = refs
+    log(f"done in {time.time()-t0:.0f}s -> {out}")
+    return context
 
 
 def summary_figure(mesh, world, ag, rx, refs, levels, path):
@@ -174,4 +195,10 @@ def summary_figure(mesh, world, ag, rx, refs, levels, path):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "config.yaml"))
+    out_dir = sys.argv[1]
+    cfg_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(HERE, "defaults.yaml")
+    cfg = yaml.safe_load(open(cfg_path))
+    base = os.path.dirname(os.path.abspath(cfg_path))
+    for sect, key in (("patient", "ear_mesh"), ("ear_world", "landmarks_xlsx")):
+        cfg[sect][key] = os.path.normpath(os.path.join(base, cfg[sect][key]))
+    build(cfg, out_dir)

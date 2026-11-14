@@ -1,7 +1,7 @@
 # Patient context for the horn design loop. Everything here is fixed during a search.
 patient:
   id: patient_a
-  ear_mesh: ../repos/AudioEar/out/my_ear/ear.ply      # from photo_to_ear.py (mm, right ear)
+  ear_mesh: ../data/example/ear.ply                  # set per request by the server (mm, right ear)
   ear_height_mm: 62                                    # measured or phone-depth; scales the mesh
   side: right
   # PLACEHOLDER: the handoff doc's example audiogram (dB HL). Replace with a real hearing test.
@@ -9,7 +9,7 @@ patient:
   audiogram_db_hl: {250: 15, 500: 20, 1000: 30, 2000: 45, 4000: 55, 6000: 55}
 
 ear_world:
-  landmarks_xlsx: ../repos/AudioEar/data/55_landmarks.xlsx
+  landmarks_xlsx: ../third_party/AudioEar/data/55_landmarks.xlsx
   concha_rim_landmarks: [35, 50]   # AudioEar landmark slice that outlines the concha
   voxel_mm: 0.5
   fit_tolerance_mm: 0.3            # gap kept between shell and skin

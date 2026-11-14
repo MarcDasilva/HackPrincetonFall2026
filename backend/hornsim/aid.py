@@ -1,8 +1,8 @@
 """Build a 3D in-ear passive horn aid that fits the patient's concha.
 
-    .venv/bin/python build_aid.py [design.yaml]
+    python -m hornsim.aid <patient_dir> [design.yaml]
 
-Needs out/<id>/context/ from prepare.py. Writes out/<id>/aid/:
+Needs <patient_dir>/context/ from hornsim.context. Writes <patient_dir>/aid/:
     aid.glb           the aid alone: translucent shell + coloured air channels (bore, vent)
     aid_in_ear.glb    the same, seated in the translucent ear
     aid_print.stl     printable solid: shell with the bore and vent cut out
@@ -24,11 +24,9 @@ import yaml
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
-from hornsim import ear_world as ew
+from . import ear_world as ew
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT = {
-    "patient_id": "patient_a",
     "throat_mm2": 1.0, "mouth_mm2": 22.2,        # handoff doc's example areas (area ratio 22.2)
     "max_path_mm": 130, "min_wall_mm": 0.6,
     "tip_length_mm": 6.0, "tip_clearance_mm": 0.6,
@@ -119,16 +117,15 @@ def check(path, radii, world, edt, wall, tip_r, tip_len, top_n):
     return surf, worst, s[-1]
 
 
-def main(cfg_path=None):
+def build(context_dir, out_dir, overrides=None, log=print):
+    """Build the aid for the patient whose context is in `context_dir`. Returns design dict."""
     D = dict(DEFAULT)
-    if cfg_path:
-        D.update(yaml.safe_load(open(cfg_path)) or {})
-    ctx = os.path.join(HERE, "out", D["patient_id"], "context")
-    out = os.path.join(HERE, "out", D["patient_id"], "aid")
+    D.update(overrides or {})
+    out = out_dir
     os.makedirs(out, exist_ok=True)
-    cfg = json.load(open(os.path.join(ctx, "context.json")))["config"]
+    cfg = json.load(open(os.path.join(context_dir, "context.json")))["config"]
 
-    mesh, world = ew.build(os.path.join(HERE, cfg["patient"]["ear_mesh"]), os.path.join(HERE, cfg["ear_world"]["landmarks_xlsx"]),
+    mesh, world = ew.build(cfg["patient"]["ear_mesh"], cfg["ear_world"]["landmarks_xlsx"],
                            tuple(cfg["ear_world"]["concha_rim_landmarks"]), cfg["ear_world"]["voxel_mm"],
                            cfg["ear_world"]["fit_tolerance_mm"], cfg["ear_world"]["faceplate_protrusion_mm"],
                            cfg["ear_world"]["canal_opening_diameter_mm"], cfg["patient"]["ear_height_mm"])
@@ -153,7 +150,7 @@ def main(cfg_path=None):
                 if surf >= -0.1 and inter >= 0 and (best is None or L > best[0]):
                     best = (L, R0, turns, n_top, p, rad, surf, inter)
     if best is None:
-        raise SystemExit("no spiral fits this concha with these areas; reduce mouth area or wall")
+        raise ValueError("no spiral fits this concha with these areas; reduce mouth area or wall")
     L, R0, turns, n_top, path, rad, surf, inter = best
 
     # mouth riser up through the faceplate; tip run down the canal
@@ -197,7 +194,7 @@ def main(cfg_path=None):
             if best_v is None or c > best_v[0]:
                 best_v = (c, vp)
     if best_v is None:
-        raise SystemExit("no vent route fits; try a smaller vent")
+        raise ValueError("no vent route fits; try a smaller vent")
     vent_clear, vent_path = best_v
     vent = tube(vent_path, np.full(len(vent_path), vr), seg=16)
 
@@ -236,8 +233,12 @@ def main(cfg_path=None):
                   "Canal opening position/size are assumed (not visible in a photo)."],
     }
     json.dump(design, open(os.path.join(out, "design.json"), "w"), indent=1)
-    print(json.dumps(design, indent=1))
+    log(f"aid: bore {design['bore_length_mm']} mm, {turns} turns, watertight {design['printable_solid_watertight']}")
+    return design
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else None)
+    # python -m hornsim.aid <patient_dir> [design.yaml]
+    pdir = sys.argv[1]
+    over = yaml.safe_load(open(sys.argv[2])) if len(sys.argv) > 2 else None
+    print(json.dumps(build(os.path.join(pdir, "context"), os.path.join(pdir, "aid"), over), indent=1))

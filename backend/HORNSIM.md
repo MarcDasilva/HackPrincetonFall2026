@@ -1,32 +1,27 @@
 # hornsim
 
 Patient-specific passive in-ear horn: everything up to the design search, plus a 3D aid builder.
-
-## Steps
+The server calls these as functions; they also run from the command line (from `backend/`):
 
 ```bash
-uv venv -p 3.12 .venv
-uv pip install -p .venv pyclarity trimesh scipy numpy matplotlib pyyaml openpyxl pandas soundfile rtree scikit-image manifold3d
-
-.venv/bin/python prepare.py      # patient context (~1 min)
-.venv/bin/python build_aid.py    # 3D aid that fits the concha (~1 min)
+.venv/bin/python -m hornsim.context data/cli/patient_a/context hornsim/defaults.yaml   # ~1 min
+.venv/bin/python -m hornsim.aid data/cli/patient_a                                     # ~1 min
 ```
 
-Inputs are set in `config.yaml`: the ear mesh from `photo_to_ear` (default
-`../repos/AudioEar/out/my_ear/ear.ply`), ear height, and audiogram. **The audiogram is a placeholder**
-(the handoff doc's example) until a real hearing test is supplied.
+Defaults live in `hornsim/defaults.yaml` (ear mesh path, ear height, audiogram). **The default
+audiogram is a placeholder** (the handoff doc's example) until a real hearing test is supplied.
 
-## prepare.py → `out/<id>/context/`
+## hornsim.context → `<patient>/context/`
 
 | File | What |
 |---|---|
 | `ear_world.npz` / `.glb` | Shell space inside the concha (voxels), rim, assumed canal opening |
 | `canals.json` | 32 sampled residual canals (0.5–0.9 cc, Latin hypercube) |
-| `speech/` | Harvard sentences (IEEE 1969) via macOS `say`; one clip in 6-talker babble at +5 dB SNR |
+| `speech/` | Harvard sentences (IEEE 1969) via macOS `say` (cached in `assets/speech/`); one clip in 6-talker babble at +5 dB SNR |
 | `references.json` | HASPI v2 (Kates & Arehart 2021, via pyclarity): healthy check, unaided floor, ceiling = best linear prescription (NAL-R, half-gain, full-gain) |
 | `summary.png` | One-page overview |
 
-## build_aid.py → `out/<id>/aid/`
+## hornsim.aid → `<patient>/aid/`
 
 | File | What |
 |---|---|
