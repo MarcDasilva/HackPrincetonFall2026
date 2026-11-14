@@ -593,6 +593,27 @@ def _profile_slices(design, f_max, st):
 
 # ---------------------------------------------------------------- terminations and sources
 
+_PISTON_X_MAX, _PISTON_N = 32.0, 64001
+
+
+def _piston_exact(x):
+    """Rayleigh's piston functions divided by their leading powers: (1 - 2 J1(x)/x) / x^2 and 2 H1(x) / x^2,
+    both smooth and finite at x = 0 (1/8 and 4/(3 pi))."""
+    x = np.asarray(x, float)
+    small = x < 0.05                         # the closed forms lose digits here; their series do not
+    xs = np.where(small, 1.0, x)
+    return (np.where(small, 1 / 8 - x ** 2 / 192 + x ** 4 / 9216, (1 - 2 * j1(xs) / xs) / xs ** 2),
+            np.where(small, (4 / np.pi) * (1 / 3 - x ** 2 / 45 + x ** 4 / 1575), 2 * struve(1, xs) / xs ** 2))
+
+
+@functools.lru_cache(maxsize=1)
+def _piston_table():
+    """The two piston functions on a grid of x = 2 k a (the Struve function is slow, and a sweep asks for it
+    millions of times). Linear lookup is within 1e-8 of the exact functions."""
+    x = np.linspace(0.0, _PISTON_X_MAX, _PISTON_N)
+    return (x,) + _piston_exact(x)
+
+
 def _radiation(area_m2, w, st):
     """Radiation impedance (Pa s/m^3) of an opening of this area in a baffle."""
     air = st.air
@@ -601,11 +622,12 @@ def _radiation(area_m2, w, st):
     if st.radiation == "low_ka":
         return z0 * (ka ** 2 / 2 + 1j * 8 * ka / (3 * np.pi))
     x = 2 * ka
-    small = x < 1e-2                         # the closed forms lose digits here; their series do not
-    xs = np.where(small, 1.0, x)
-    resistance = np.where(small, x ** 2 / 8 - x ** 4 / 192, 1 - 2 * j1(xs) / xs)
-    reactance = np.where(small, (4 / np.pi) * (x / 3 - x ** 3 / 45), 2 * struve(1, xs) / xs)
-    return z0 * (resistance + 1j * reactance)
+    if np.max(x) <= _PISTON_X_MAX:
+        grid, resistance, reactance = _piston_table()
+        resistance, reactance = np.interp(x, grid, resistance), np.interp(x, grid, reactance)
+    else:                                    # an opening many wavelengths across: evaluate directly
+        resistance, reactance = _piston_exact(x)
+    return z0 * (x ** 2 * resistance + 1j * x * reactance)
 
 
 def radiation_impedance(radius_m, freqs, settings=None):

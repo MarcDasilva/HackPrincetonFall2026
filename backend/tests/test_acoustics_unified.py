@@ -72,12 +72,15 @@ def piston_series(x, terms=40):
 
 def test_exact_radiation_matches_the_flanged_piston_across_ka():
     a = 0.012                                                    # a 450 mm2 mouth
-    for ka in (1e-4, 3e-3, 0.004999, 0.005001, 0.05, 0.3, 1.0, 2.0, 3.0, 5.0):
-        f = ka * ac.C0 / (2 * np.pi * a)
-        z = ac.radiation_impedance(a, [f])[0] * np.pi * a ** 2 / (ac.RHO * ac.C0)
+    normalised = lambda ka: ac.radiation_impedance(a, [ka * ac.C0 / (2 * np.pi * a)])[0] * np.pi * a ** 2 / (ac.RHO * ac.C0)
+    for ka in (1e-4, 3e-3, 0.024999, 0.025001, 0.05, 0.3, 1.0, 2.0, 3.0, 5.0):
         r1, x1 = piston_series(2 * ka)
-        assert z.real == pytest.approx(r1, rel=1e-9), ka
-        assert z.imag == pytest.approx(x1, rel=1e-9), ka
+        assert normalised(ka).real == pytest.approx(r1, rel=1e-7), ka
+        assert normalised(ka).imag == pytest.approx(x1, rel=1e-7), ka
+    # many wavelengths across: the opening looks like free air (R -> 1, X -> 2 / (pi ka)), table or not
+    for ka in (15.99, 16.01, 40.0):
+        assert normalised(ka).real == pytest.approx(1.0, abs=0.02) and normalised(ka).imag == pytest.approx(2 / (np.pi * ka), abs=0.01)
+    assert normalised(15.9999) == pytest.approx(normalised(16.0001), rel=1e-4)
     # the low-ka form is the first term of each series, and is what LEGACY_MAIN still uses
     low = ac.radiation_impedance(a, [50.0], settings=ac.LEGACY_MAIN)[0]
     assert ac.radiation_impedance(a, [50.0])[0] == pytest.approx(low, rel=1e-3)
