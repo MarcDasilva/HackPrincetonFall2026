@@ -556,6 +556,15 @@ def earpiece_acoustic(report: dict[str, Any], ear_params: dict[str, Any]) -> dic
     }
     profile = report.get("area_profile_mm2")
     if profile:
+        opening = geometry.get("collector_mouth_mm2")
+        if opening is not None and abs(float(profile[-1][1]) - float(opening)) > 0.11:
+            # An earlier hornsim.earpiece sampled the profile at whole millimetres and left the end out.
+            raise BridgeError(
+                "profile_incomplete",
+                f"hornsim.earpiece's area profile ends at {profile[-1][1]:g} mm^2, but the outer opening it "
+                f"built is {opening:g} mm^2. The profile stops short of the end, so the built shape cannot "
+                "be scored.",
+            )
         length = float(profile[-1][0])
         s_mm = [round(length - along, 3) for along, _ in reversed(profile)]
         area_mm2 = [float(area) for _, area in reversed(profile)]

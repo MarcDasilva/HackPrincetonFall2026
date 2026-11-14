@@ -188,8 +188,10 @@ _EARPIECE_PARAMETER_NOTES = {
     ),
     COLLECTOR_REACH: (
         "mm",
-        "How far the collector's rim sits out from the mouth centre, straight along the faceplate "
-        "normal. 0 together with collector_mouth_mm2 0 means no collector and a flush faceplate. The "
+        "How far out from the mouth centre the collector's one spine point sits, straight along the "
+        "faceplate normal. The builder rounds off the end of the path, so the rim it builds sits about "
+        "1 mm closer than this, and protrusion_mm reports where the print really ends. 0 together with "
+        "collector_mouth_mm2 0 means no collector and a flush faceplate. The "
         "builder rejects a collector that touches the ear or the head, or that has any point more than "
         "{max_reach:g} mm from the mouth centre, which counts the rim's radius and wall as well as this "
         "distance.",
