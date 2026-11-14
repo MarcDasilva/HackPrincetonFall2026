@@ -14,5 +14,11 @@ export default function Dock(props: {
   items?: DockItem[];
   position?: "bottom" | "top" | "left" | "right";
   showIndicators?: boolean;
+  tiles?: boolean;
+  roundness?: number;
+  baseItemSize?: number;
+  magnification?: number;
+  panelHeight?: number;
+  gap?: number;
   style?: CSSProperties & Record<`--${string}`, string>;
 }): ReactNode;
