@@ -272,6 +272,26 @@ class Design:
                       a.get("concha_fill", 1.0), a.get("tip_length_mm", 9.0),
                       a.get("vent_count", 1), tuple(tuple(p) for p in a.get("dampers", ())))
 
+    @staticmethod
+    def from_dials(x, concha_fill=1.0, points=601):
+        """The profile-door Design of one dial design (scalars): mouth -> flare -> canal stem.
+
+        The flare is sampled at `points` positions; tip_length_mm is the stem, so the profile door's open
+        ear uses the same whole canal the dial door would.
+        """
+        _check_dials(x)
+        g = lambda k, default=None: float(np.asarray(x[k] if default is None else x.get(k, default), float))
+        length, stem, throat = g("length_mm"), g("canal_stem_mm"), g("throat_mm2")
+        s = np.linspace(0.0, length, points)
+        r = _flare_radius(np.sqrt(throat / np.pi), np.sqrt(g("mouth_mm2") / np.pi), g("flare_mid1"), g("flare_mid2"),
+                          1 - s / length if length > 0 else np.ones(points))
+        area = np.pi * r ** 2
+        if stem > 0:
+            s, area = np.r_[s, length + stem], np.r_[area, throat]
+        dampers = [(length * (1 - float(np.asarray(p, float))), float(np.asarray(ohm, float))) for p, ohm in _dial_dampers(x)]
+        return Design(s, area, g("vent_diameter_mm", 0.0), g("vent_length_mm", 0.0), concha_fill, stem,
+                      int(round(g("vent_count", 0))), tuple(dampers))
+
 
 @dataclass
 class Canal:
@@ -775,6 +795,218 @@ def pressure_along_bore(design: Design, canal: Canal, freqs, lossy=None, setting
             p = p + u * np.where(parts.dampers[0] == i, parts.dampers[1], 0.0).sum()
             out[-1] = np.abs(p)              # an edge with a damper reports the pressure on its sound side
     return np.array(out[::-1]), parts.edges_mm
+
+
+# ---------------------------------------------------------------- responses (dial door)
+
+_DIAL_KEYS = ("throat_mm2", "mouth_mm2", "flare_mid1", "flare_mid2", "length_mm", "canal_stem_mm")
+_VENT_KEYS = ("vent_count", "vent_diameter_mm", "vent_length_mm")
+
+
+def _dial_dampers(x):
+    """[(pos, ohm), ...] from a dial design: the damper_pos / damper_ohm pair and/or a "dampers" list."""
+    pairs = [tuple(p) for p in x.get("dampers", ())]
+    if "damper_ohm" in x:
+        pairs.append((x.get("damper_pos", 0.0), x["damper_ohm"]))
+    return pairs
+
+
+def _check_dials(x):
+    for k in _DIAL_KEYS:
+        if k not in x:
+            raise ValueError(f"the design is missing {k!r}")
+    v = lambda k: np.asarray(x[k], float)
+    for k in ("throat_mm2", "mouth_mm2"):
+        _require(v(k) > 0, f"{k} must be positive, got {_span(v(k))} mm^2")
+    _require(v("mouth_mm2") >= v("throat_mm2"),
+             "mouth_mm2 is smaller than throat_mm2: the dial door describes a horn that widens toward the "
+             "sound (use Design with an area profile for other shapes)")
+    for k in ("length_mm", "canal_stem_mm") + tuple(k for k in _VENT_KEYS if k in x):
+        _require(v(k) >= 0, f"{k} must not be negative, got {_span(v(k))}")
+    r_t, r_m = np.sqrt(v("throat_mm2")), np.sqrt(v("mouth_mm2"))
+    for k in ("flare_mid1", "flare_mid2"):
+        _require(r_t + (r_m - r_t) * v(k) > 0, f"{k} = {_span(v(k))} gives a bore of no or negative radius")
+    if "concha_fill" in x:
+        _require((v("concha_fill") >= 0) & (v("concha_fill") <= 1), f"concha_fill must be between 0 and 1, got {_span(v('concha_fill'))}")
+    for pos, ohm in _dial_dampers(x):
+        pos, ohm = np.asarray(pos, float), np.asarray(ohm, float)
+        _require((pos >= 0) & (pos <= 1), f"damper_pos must be between 0 (throat) and 1 (mouth), got {_span(pos)}")
+        _require(ohm >= 0, f"damper_ohm must not be negative, got {_span(ohm)}")
+
+
+def _flare_radius(r_throat, r_mouth, mid1, mid2, s):
+    """Bore radius at fraction s from throat (0) to mouth (1): earpiece.py's flare, piecewise linear with
+    mid1 / mid2 the share of the radius change done 1/3 and 2/3 of the way."""
+    g = np.where(s < 1 / 3, 3 * s * mid1, np.where(s < 2 / 3, mid1 + (3 * s - 1) * (mid2 - mid1), mid2 + (3 * s - 2) * (1 - mid2)))
+    return r_throat + (r_mouth - r_throat) * g
+
+
+def bore_radii(x, n=None):
+    """Bore radius (m) at n segment midpoints, throat (index 0) to mouth: earpiece.py's profile.
+    Shape [..., n]. n defaults to BORE_SEGMENTS, or 40 when that is None."""
+    n = n or BORE_SEGMENTS or LEGACY_BORE_SEGMENTS
+    r_t, r_m = (np.sqrt(np.asarray(x[k], float)[..., None] / np.pi) * 1e-3 for k in ("throat_mm2", "mouth_mm2"))
+    m1, m2 = (np.asarray(x[k], float)[..., None] for k in ("flare_mid1", "flare_mid2"))
+    return _flare_radius(r_t, r_m, m1, m2, (np.arange(n) + 0.5) / n)
+
+
+def horn(radii_m, length_m, w, damper=None, settings=None):
+    """Mouth-to-throat matrix (a, b, c, d) of a bore given as radii[..., n] from throat to mouth (equal
+    cylinder steps, whatever Settings.flare_slices says; `w` is angular frequency). `damper` = (pos 0..1, resistance Pa s/m3) is inserted at
+    the step boundary nearest pos. Any collector shape can be passed here as its radii."""
+    st = _settings(settings)
+    radii_m = np.asarray(radii_m, float)
+    _require(radii_m > 0, f"bore radii must be positive, got {_span(radii_m)} m")
+    _require(np.asarray(length_m) >= 0, f"bore length must not be negative, got {_span(length_m)} m")
+    n = radii_m.shape[-1]
+    dampers = None
+    if damper is not None:
+        boundary = n - np.round(np.clip(damper[0], 0, 1) * n)             # counted from the mouth
+        dampers = (np.asarray(boundary, float)[..., None], np.asarray(damper[1], float)[..., None])
+    lengths = np.asarray(length_m, float)[..., None] / n
+    from_mouth = radii_m[..., ::-1]
+    return _chain(from_mouth, from_mouth, lengths, np.asarray(w, float), st, st.wall_losses, dampers)
+
+
+def _head(theta_deg, w, settings=None):
+    """Blocked pressure at the ear on a rigid sphere vs free field: Brown & Duda 1998 one-pole/one-zero
+    head-shadow model. theta_deg is spec azimuth (0 front, 90 straight out from this ear)."""
+    t = np.abs(np.asarray(theta_deg, float) - 90.0)
+    alpha = (1 + BD_ALPHA_MIN / 2) + (1 - BD_ALPHA_MIN / 2) * np.cos(np.radians(t / BD_THETA_MIN * 180.0))
+    q = w * HEAD_RADIUS_M / (2 * _settings(settings).air.c)
+    return (1 + 1j * alpha * q) / (1 + 1j * q)
+
+
+def _canal(ear_params, canal, settings=None):
+    """Canal area (m2) and WHOLE canal length (m, [..., 1]), canal opening to eardrum."""
+    st = _settings(settings)
+    diameter = st.canal_diameter_mm or ear_params["canal_diameter_mm"]
+    _require(diameter > 0, f"canal_diameter_mm must be positive, got {diameter}")
+    tip = CANAL_SAMPLE_TIP_MM if st.canal_sample_tip_mm is None else st.canal_sample_tip_mm
+    whole = (np.asarray(canal["length_mm"], float)[..., None] + tip) * 1e-3
+    _require(whole >= 0, f"the canal has a negative length: sample {_span(canal['length_mm'])} mm + {tip:g} mm tip")
+    return np.pi * (diameter * 1e-3) ** 2 / 4, whole
+
+
+def _open(ear_params, canal, w, settings=None):
+    """Dial door: open-ear eardrum pressure over the blocked pressure at the ear, [..., F]."""
+    st = _settings(settings)
+    area, whole = _canal(ear_params, canal, st)
+    return _open_ear(whole, area, np.asarray(w, float), st, st.wall_losses, ear_params)
+
+
+def _flare(x, w, st):
+    """Mouth-to-throat matrix of the flare of every design in x, each [X..., F] with X the designs' shape."""
+    names = ("throat_mm2", "mouth_mm2", "flare_mid1", "flare_mid2", "length_mm")
+    pairs = _dial_dampers(x)
+    arrays = [np.asarray(x[k], float) for k in names] + [np.asarray(v, float) for p in pairs for v in p]
+    shape = np.broadcast_shapes(*(a.shape for a in arrays))
+    flat = [np.broadcast_to(a, shape).reshape(-1) for a in arrays]
+    throat, mouth, mid1, mid2, length = flat[:5]
+    r_t, r_m, length = np.sqrt(throat / np.pi) * 1e-3, np.sqrt(mouth / np.pi) * 1e-3, length * 1e-3
+    cones = st.flare_slices == "cones"
+    forced = BORE_SEGMENTS or st.slice_count
+    if forced:
+        counts = np.full(len(r_t), int(forced))
+    elif st.slice_step_mm is not None:
+        counts = _ladder(np.maximum(8, np.ceil(length * 1e3 / st.slice_step_mm)))
+    else:
+        knots = np.log(_flare_radius(r_t[:, None], r_m[:, None], mid1[:, None], mid2[:, None], np.array([0, 1 / 3, 2 / 3, 1])))
+        # multiples of 3, so slice edges fall on the flare's two corners and the cones follow it exactly
+        counts = _ladder(_slices_needed(length, np.abs(np.diff(knots)).sum(-1), w.max() / (2 * np.pi), st, cones), multiple=3)
+    if pairs:
+        # dampers move the slice edges; cones also pin the flare's corners, as two more points with no resistance
+        corners = np.broadcast_to([1 / 3, 2 / 3] if cones else [], (len(r_t), 2 if cones else 0))
+        counts = np.maximum(counts, 2 * (len(pairs) + corners.shape[1] + 1))
+        position = np.concatenate([1 - np.stack(flat[5::2], -1), corners], -1)   # dial 0 = throat; the chain runs from the mouth
+        resistance = np.concatenate([np.stack(flat[6::2], -1) * OHM_CGS, 0 * corners], -1)
+    out = [np.empty((len(r_t), w.shape[-1]), complex) for _ in range(4)]
+    for n in np.unique(counts):                              # designs that need the same number of steps go together
+        pick = np.nonzero(counts == n)[0]
+        col = lambda a: a[pick, None]
+        dampers = None
+        if pairs:
+            fractions, boundary, order = _warped_edges(int(n), position[pick])
+            dampers = (boundary, np.take_along_axis(resistance[pick], order, -1))
+        else:
+            fractions = np.linspace(0.0, 1.0, int(n) + 1)
+        radius = lambda at: _flare_radius(col(r_t), col(r_m), col(mid1), col(mid2), 1 - at)
+        if cones:
+            at_edges = radius(fractions)
+            r_in, r_out = at_edges[..., :-1], at_edges[..., 1:]
+        else:
+            r_in = r_out = radius(0.5 * (fractions[..., :-1] + fractions[..., 1:]))
+        m = _chain(r_in, r_out, col(length) * np.diff(fractions), w, st, st.wall_losses, dampers)
+        for full, part in zip(out, m):
+            full[pick] = part
+    return tuple(a.reshape(shape + (w.shape[-1],)) for a in out)
+
+
+def _aid(x, ear_params, canal, w, settings=None):
+    """Dial door: eardrum pressure with the earpiece over the blocked pressure at the ear, [..., F]."""
+    st = _settings(settings)
+    w = np.asarray(w, float)
+    _require(w.ndim == 1 and w.size > 0, "frequencies must be a 1D array")
+    _check_dials(x)
+    loss = st.wall_losses
+    area, whole = _canal(ear_params, canal, st)
+    g = lambda k, default=None: np.asarray(x[k] if default is None else x.get(k, default), float)[..., None]
+    stem = g("canal_stem_mm") * 1e-3
+    _require(stem <= whole, f"canal_stem_mm ({_span(stem * 1e3)} mm) is longer than the canal ({_span(whole * 1e3)} mm)")
+    m = _mul(_flare(x, w, st), _tube(np.sqrt(g("throat_mm2") * 1e-6 / np.pi), stem, w, st, loss))
+    p_oc, z = _thevenin(m, _radiation(g("mouth_mm2") * 1e-6, w, st))
+    # vents: more sources in parallel at the stem tip (Norton sum); a count, diameter or length of 0 is no vent
+    y_v, i_v = _vent(g("vent_count", 0.0), g("vent_diameter_mm", 0.0) * 0.5e-3, g("vent_length_mm", 0.0) * 1e-3, w, st, loss)
+    y = 1 / z + y_v
+    src = _aided_source(g("concha_fill", 1.0), w, st, ear_params)
+    return _to_drum(src * (p_oc / z + i_v) / y, 1 / y, whole - stem, area, w, st, loss)
+
+
+def _dial_shape(x, canal, w):
+    """The shape B-style callers expect: every dial and the canal broadcast together, frequency last."""
+    keys = [k for k in _DIAL_KEYS + _VENT_KEYS + ("damper_pos", "damper_ohm", "concha_fill") if k in x]
+    return np.broadcast_shapes(*(np.shape(x[k]) for k in keys), np.shape(canal["length_mm"])) + w.shape[-1:]
+
+
+def insertion_gain(x, ear_params, canal, freqs_hz, theta_deg=0, settings=None):
+    """Eardrum pressure with the earpiece over the open ear, dB (the dial door).
+
+    x            design dials (mm, mm2), names shared with earpiece.py:
+                   throat_mm2, mouth_mm2, flare_mid1, flare_mid2, length_mm (flared bore, throat to mouth),
+                   canal_stem_mm (how far the device runs into the canal; the bore continues through it at
+                   the throat area), vent_count, vent_diameter_mm, vent_length_mm (optional; a count or a
+                   diameter of 0 is no vent), damper_pos (0 throat .. 1 mouth) and damper_ohm (cgs acoustic
+                   ohms; optional), "dampers" (optional list of (pos, ohm) pairs for more than one),
+                   concha_fill (optional; "bump" concha model only).
+    ear_params   the patient's ear: canal_diameter_mm, and for the geometry-based open ear concha_depth_mm,
+                 bowl_volume_cc, opening_area_mm2.
+    canal        {"length_mm": ...}: residual canal samples; the whole canal is sample + CANAL_SAMPLE_TIP_MM.
+    Values may be numpy arrays; x, canal and freqs broadcast together with frequency on the LAST axis.
+
+    theta_deg is accepted and ignored: both paths share the source, so the direction of the sound cancels in
+    insertion gain (no mouth offset from the canal opening is modelled). It only changes open_ear_gain.
+
+    DEFAULT PHYSICS: the unified model, not marc-sim's. Numbers differ from marc-sim's acoustics.py, mostly
+    below 1 kHz (the eardrum now has compliance: sealed designs move by several dB there) and by a shift of
+    about 2.6 % in every resonance frequency (air at 35 C, not 20 C). Pass settings=LEGACY_MARC_SIM to get
+    the old numbers back.
+    """
+    w = _omega(freqs_hz)
+    st = _settings(settings)
+    gain = 20 * np.log10(np.abs(_aid(x, ear_params, canal, w, st) / _open(ear_params, canal, w, st)))
+    shape = _dial_shape(x, canal, w)
+    return gain if gain.shape == shape else np.broadcast_to(gain, shape).copy()
+
+
+def open_ear_gain(ear_params, canal, freqs_hz, theta_deg=0, settings=None):
+    """Open-ear eardrum pressure over the free field, dB (head + concha + canal), for checks.
+
+    theta_deg (0 front, 90 straight out from this ear) sets the head's contribution; this is the only
+    place the direction of the sound enters the model.
+    """
+    w = _omega(freqs_hz)
+    st = _settings(settings)
+    return 20 * np.log10(np.abs(_head(theta_deg, w, st) * _open(ear_params, canal, w, st)))
 
 
 # ---------------------------------------------------------------- patient-level run
