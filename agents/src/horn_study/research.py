@@ -561,8 +561,14 @@ async def run_investigator(
     reader: Reader,
     ledger: ResearchLedger,
     events: EventBus,
+    direction: str | None = None,
+    prior_files: dict[str, Any] | None = None,
 ) -> BranchResult:
-    """Run one investigator to completion. Failures are returned, not raised."""
+    """Run one investigator to completion. Failures are returned, not raised.
+
+    `direction` is added to what the investigator is told, after the starting package.
+    `prior_files` puts source texts that were read earlier in the study back in its file system.
+    """
     started = datetime.now(UTC)
     budget = package.budget.max_research_tool_calls_per_agent
     session = ResearchSession(
@@ -600,18 +606,22 @@ async def run_investigator(
             response_format=InvestigatorOutput,
             name=spec.name,
         )
+        assignment: Any = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Here is the study's starting package. Every investigator receives "
+                        "the same one.\n\n"
+                        + render_package(package)
+                        + (f"\n\n{direction}" if direction else "")
+                    ),
+                }
+            ],
+            **({"files": prior_files} if prior_files else {}),
+        }
         result = await agent.ainvoke(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": (
-                            "Here is the study's starting package. Every investigator receives "
-                            "the same one.\n\n" + render_package(package)
-                        ),
-                    }
-                ]
-            },
+            assignment,
             config={
                 "run_name": f"{spec.name}_agent",
                 "recursion_limit": 4 * model_calls,
