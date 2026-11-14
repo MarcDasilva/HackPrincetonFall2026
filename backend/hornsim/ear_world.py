@@ -108,6 +108,7 @@ def shell_space_mesh(world: EarWorld):
 # ---------------------------------------------------------------- ear parameters (spec 02)
 
 COIL_GROW = 1.25   # area growth per step when finding the widest throat and mouth the coil takes
+CANAL_ENTRY_SLACK_MM = 1.5   # the bore may end at the canal opening: this far above it counts as tip, not wall
 
 
 def _profile(s, throat_mm2, mouth_mm2, flare_mid1, flare_mid2):
@@ -118,25 +119,30 @@ def _profile(s, throat_mm2, mouth_mm2, flare_mid1, flare_mid2):
 
 
 def _fit_setup(world, aid_defaults):
-    from scipy import ndimage
     from .aid import DEFAULT          # aid imports this module; importing at call time breaks the cycle
     D = DEFAULT | (aid_defaults or {})
-    edt = ndimage.distance_transform_edt(world.voxels) * world.voxel_mm
     top = float((world.origin - world.rim_center) @ world.axes[2] + (world.voxels.shape[2] - 1) * world.voxel_mm)
-    return D, edt, top, world.canal_diameter_mm / 2 - D["tip_clearance_mm"]
+    # aid.check measures clearance against the printed solid (shell + canal tip), whose distance field
+    # depends on how far the tip runs into the canal: one field per stem length, built on first use.
+    return D, {}, top, world.canal_diameter_mm / 2 - D["tip_clearance_mm"]
 
 
 def coil_fits(world, spiral_params, throat_mm2, mouth_mm2, flare_mid1, flare_mid2, canal_stem_mm,
               aid_defaults=None, _setup=None):
     """aid.py's clearance test for one spiral (from ear_params()["coil"]) carrying this bore."""
-    from .aid import check, spiral
-    D, edt, _, tip_r = _setup or _fit_setup(world, aid_defaults)
+    from .aid import check, solid_edt, spiral
+    D, fields, _, tip_r = _setup or _fit_setup(world, aid_defaults)
+    stem = round(float(canal_stem_mm), 3)
+    if stem not in fields:
+        fields[stem] = solid_edt(world, tip_r, stem)
+    edt = fields[stem]
     sp = spiral_params
     p = spiral(world, sp["R0_mm"], sp["turns"], sp["top_mm"])
     s = np.r_[0, np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=1))]
     # the spiral starts at the mouth, so path fraction 0 is the mouth end of the profile
     r = _profile(1 - s / s[-1], throat_mm2, mouth_mm2, flare_mid1, flare_mid2)
-    surf, inter, _ = check(p, r, world, edt, D["min_wall_mm"], tip_r, canal_stem_mm, sp["top_mm"] + 0.5)
+    surf, inter, _ = check(p, r, world, edt, D["min_wall_mm"], tip_r, canal_stem_mm, sp["top_mm"] + 0.5,
+                           entry_slack_mm=CANAL_ENTRY_SLACK_MM)
     return bool(surf >= -0.1 and inter >= 0)
 
 
@@ -155,7 +161,7 @@ def ear_params(world, mesh, aid_defaults=None):
     """
     from .aid import spiral
     from .earpiece import concha_opening
-    D, edt, top, tip_r = setup = _fit_setup(world, aid_defaults)
+    D, _, top, tip_r = setup = _fit_setup(world, aid_defaults)
     wall = D["min_wall_mm"]
 
     # tip cross-section: bore on the axis, vent beside it, wall outside each (aid.py's layout), so
