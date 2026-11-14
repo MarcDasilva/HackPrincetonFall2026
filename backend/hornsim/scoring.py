@@ -1,15 +1,23 @@
 """Hearing model: SII (ANSI S3.5-1997), HASPI v2 and HASQI v2 (Kates & Arehart, pyclarity), and a
 display-only auditory-nerve neurogram (Zilany, Bruce & Carney 2014, via the `cochlea` package).
 
-Level convention, ONE for every score: a signal with RMS 1 is `level_db` dB SPL in the free field at
-the listener's head position, talker in front. pyclarity documents HASPI/HASQI `level1` as exactly
-this scale ("level in dB SPL that corresponds to a signal RMS = 1", haspi.py / hasqi.py / eb.py);
-Kates' ear model then applies only a middle-ear filter (2-pole HP 350 Hz, 1-pole LP 5 kHz, "a rough
+Level scale, ONE for every score: a signal with RMS 1 is a stated dB SPL in the free field at the
+listener's head position, talker in front. pyclarity documents HASPI/HASQI `level1` as exactly this
+scale ("level in dB SPL that corresponds to a signal RMS = 1", haspi.py / hasqi.py / eb.py); Kates'
+ear model then applies only a middle-ear filter (2-pole HP 350 Hz, 1-pole LP 5 kHz, "a rough
 approximation to the equal-loudness contour at threshold") and NO ear-canal or concha gain. SII's
 speech and noise levels are free-field levels with the listener absent (ANSI S3.5). So dB HL already
-contains the normal open ear's boost — apply ONLY insertion gain or a direction filter normalised to
-frontal incidence before scoring, never the raw eardrum pressure (spec 04). Gains go on the
-processed signal (the clip or the noisy mixture), never on the HASPI/HASQI reference.
+contains the normal open ear's boost - apply ONLY insertion gain or a direction filter normalised to
+frontal incidence before scoring, never the raw eardrum pressure (spec 04).
+
+HASPI and HASQI reference: the clean reference is normalised to RMS 1 and always stands for
+REFERENCE_DB_SPL (65 dB SPL), the level the ear model expects its normal-hearing reference at
+(pyclarity `ear_model`: "reference signal: should be adjusted to 65 dB SPL"). The presentation
+level moves only what the listener hears: the processed signal is scaled by (L - 65) dB.
+Presenting the reference at L as well hides the audibility loss at soft levels: unaided HASPI
+then stays flat or even rises as speech gets quieter (measured on four babble clips, 45-85 dB).
+Gains go on the processed signal (the clip or the noisy mixture), never on the reference.
+SII is unaffected: it takes the speech and noise levels directly.
 
 Calibration check (test_hearing.py, Kates ear model, 1 kHz tone, 0 dB SL = threshold):
     healthy ear, tone at 2.4 dB SPL (ISO 389-7 free-field threshold)   -> +5.1 dB SL
@@ -33,6 +41,7 @@ from scipy.signal import resample_poly
 from .audio import apply_gain
 
 HASPI_FREQS = np.array([250, 500, 1000, 2000, 4000, 6000])
+REFERENCE_DB_SPL = 65.0     # what RMS 1 means to HASPI
 
 # ANSI S3.5-1997 Table 3, one-third-octave band procedure: band centres, band importance (the
 # standard's "average speech" SII function), reference internal noise spectrum level X_i, and the
@@ -56,19 +65,21 @@ FIBRES = {"lsr": 10, "msr": 10, "hsr": 30}
 
 
 def audiogram(levels_by_freq: dict) -> Audiogram:
-    f = np.array(sorted(levels_by_freq), float)
-    return Audiogram(levels=np.array([levels_by_freq[k] for k in sorted(levels_by_freq)], float), frequencies=f)
+    pairs = sorted((float(k), float(v)) for k, v in levels_by_freq.items())   # JSON keys arrive as strings
+    return Audiogram(levels=np.array([v for _, v in pairs]), frequencies=np.array([k for k, _ in pairs]))
 
 
 def haspi(reference, processed, fs, ag: Audiogram, level_db, seed=0):
     np.random.seed(seed)  # HASPI adds random noise internally; fix it so scores repeat
-    score, _ = haspi_v2(reference, fs, processed, fs, ag, level1=level_db)
+    heard = np.asarray(processed) * 10 ** ((level_db - REFERENCE_DB_SPL) / 20)
+    score, _ = haspi_v2(reference, fs, heard, fs, ag, level1=REFERENCE_DB_SPL)
     return float(score)
 
 
 def hasqi(reference, processed, fs, ag: Audiogram, level_db, seed=0):
     np.random.seed(seed)  # SAME reason as haspi()
-    score, _, _, _ = hasqi_v2(reference, fs, processed, fs, ag, level1=level_db)
+    heard = np.asarray(processed) * 10 ** ((level_db - REFERENCE_DB_SPL) / 20)   # same reference rule as haspi()
+    score, _, _, _ = hasqi_v2(reference, fs, heard, fs, ag, level1=REFERENCE_DB_SPL)
     return float(score)
 
 

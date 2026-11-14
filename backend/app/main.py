@@ -38,6 +38,7 @@ FILES = {
     "references.json": "context/references.json", "canals.json": "context/canals.json",
     "aid.glb": "aid/aid.glb", "aid_in_ear.glb": "aid/aid_in_ear.glb",
     "aid_print.stl": "aid/aid_print.stl", "design.json": "aid/design.json",
+    "acoustics.json": "aid/acoustics.json", "insertion_gain.png": "aid/insertion_gain.png", "score.json": "aid/score.json",
 }
 DEFAULT_AUDIOGRAM = {250: 15, 500: 20, 1000: 30, 2000: 45, 4000: 55, 6000: 55}
 
@@ -140,11 +141,16 @@ def get_wave_file(pid: str, name: str):
 
 
 class AidDesign(BaseModel):
-    throat_mm2: float = Field(1.0, ge=0.3, le=10)
-    mouth_mm2: float = Field(22.2, ge=2, le=60)
-    vent_diameter_mm: float = Field(0.8, ge=0, le=2.5)
+    # Bounds are what hornsim.aid can route in some ear; a design that misses this ear fails its job with the reason.
+    # throat: the bore passes the canal tip with a wall left, so at most pi * (7.5 / 2 - tip clearance - wall)^2:
+    # 20.4 mm2 with the defaults, 31 mm2 with the snuggest tip (0.2) and thinnest wall (0.4).
+    # A throat above ~3 mm2 leaves no room for a vent beside it: use vent 0 (the bore vents the canal itself).
+    throat_mm2: float = Field(1.0, ge=0.3, le=31)
+    mouth_mm2: float = Field(22.2, ge=2, le=200)
+    vent_diameter_mm: float = Field(0.8, ge=0, le=2.5)      # 0 = no vent
     min_wall_mm: float = Field(0.6, ge=0.4, le=2)
     max_path_mm: float = Field(130, ge=20, le=300)
+    tip_clearance_mm: float = Field(0.6, ge=0.2, le=1.5)    # gap between the canal tip and the assumed canal wall
 
 
 @app.post("/api/patients/{pid}/aid", status_code=202)
@@ -157,6 +163,7 @@ def rebuild_aid(pid: str, design: AidDesign):
         raise HTTPException(409, "patient context is missing; create the patient again")
     if design.mouth_mm2 <= design.throat_mm2:
         raise HTTPException(422, "mouth area must be larger than throat area")
+    jobs._update(pid, status="queued", step="aid", error=None)   # so a poll right after this sees it pending
     jobs.submit(jobs.run_aid, pid, design.model_dump())
     return {"id": pid, "status_url": f"/api/patients/{pid}"}
 

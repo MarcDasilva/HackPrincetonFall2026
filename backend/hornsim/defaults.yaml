@@ -28,8 +28,13 @@ speech:
     - {voice: Samantha, text: "The birch canoe slid on the smooth planks."}
     - {voice: Daniel, text: "Glue the sheet to the dark blue background."}
     - {voice: "Reed (English (US))", text: "It's easy to tell the depth of a well."}
+  # More than one noisy clip: HASPI on a single two-second sentence swings too much to rank designs.
+  # The added talkers are full-band voices like most of the babble (Flo has nothing above 5.5 kHz).
   noisy:
     - {voice: "Flo (English (US))", text: "These days a chicken leg is a rare dish.", snr_db: 5}
+    - {voice: Samantha, text: "The hogs were fed chopped corn and garbage.", snr_db: 5}
+    - {voice: Daniel, text: "Four hours of steady work faced us.", snr_db: 5}
+    - {voice: Rishi, text: "A large size in stockings is hard to sell.", snr_db: 5}
   babble_voices: [Karen, Moira, Tessa, Fred, "Sandy (English (US))", "Shelley (English (US))"]
   babble_text: "Rice is often served in round bowls. The juice of lemons makes fine punch. The box was thrown beside the parked truck."
 

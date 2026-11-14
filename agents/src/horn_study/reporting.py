@@ -30,8 +30,11 @@ from horn_study.contracts import (
     MetricAggregate,
     NeedOutcome,
     ResearchRecord,
+    ScenarioComparison,
     ScenarioMean,
+    ScenarioStanding,
     Selection,
+    SelectionRule,
     StartingPackage,
     StudyPlan,
     StudyReport,
@@ -95,6 +98,81 @@ def _signed(direction: str, value: float) -> float:
     return value if direction == "higher_is_better" else -value
 
 
+def _scenario_means(
+    plan: StudyPlan, specs: list[ExperimentSpec], records: dict[str, ExperimentRecord], metric: str
+) -> dict[str, tuple[float | None, int, int]]:
+    """Per scenario of the plan: (mean over completed cases, completed cases, planned cases)."""
+    means: dict[str, tuple[float | None, int, int]] = {}
+    for scenario_id in plan.scenario_ids:
+        in_scenario = [e for e in specs if e.scenario_id == scenario_id]
+        values = _metric_values(in_scenario, records, metric)
+        means[scenario_id] = (fmean(values) if values else None, len(values), len(in_scenario))
+    return means
+
+
+def _compare_scenarios(
+    rule: SelectionRule,
+    own: dict[str, tuple[float | None, int, int]],
+    control: dict[str, tuple[float | None, int, int]],
+) -> tuple[ScenarioComparison, ...]:
+    """Set one candidate's scenario means against the reference control's.
+
+    A scenario is compared only when both sides completed every planned case in
+    it, so a missing case can never pass as "not worse".
+    """
+    comparisons: list[ScenarioComparison] = []
+    for scenario_id, (mean, n_completed, n_planned) in own.items():
+        control_mean, control_completed, control_planned = control[scenario_id]
+        difference: float | None = None
+        standing: ScenarioStanding = "not_compared"
+        if (
+            mean is not None
+            and control_mean is not None
+            and 0 < n_planned == n_completed
+            and 0 < control_planned == control_completed
+        ):
+            difference = _signed(rule.direction, mean) - _signed(rule.direction, control_mean)
+            # Rounded so a difference of exactly the tolerance is not tipped over by float error.
+            if round(difference, 9) < -rule.scenario_tolerance:
+                standing = "worse"
+            elif round(difference, 9) > rule.scenario_tolerance:
+                standing = "better"
+            else:
+                standing = "within_tolerance"
+        comparisons.append(
+            ScenarioComparison(
+                scenario_id=scenario_id,
+                mean=mean,
+                n_completed=n_completed,
+                n_planned=n_planned,
+                reference_mean=control_mean,
+                difference_from_reference=difference,
+                standing=standing,
+            )
+        )
+    return tuple(comparisons)
+
+
+def _pair(value: float, other: float) -> tuple[str, str]:
+    """Format two numbers briefly, with enough digits that they read as different."""
+    first, second = f"{value:.4g}", f"{other:.4g}"
+    for digits in range(5, 13):
+        if first != second:
+            break
+        first, second = f"{value:.{digits}g}", f"{other:.{digits}g}"
+    return first, second
+
+
+def _losses(comparisons: tuple[ScenarioComparison, ...]) -> str:
+    """Name each scenario a candidate lost in, with its number against the control's."""
+    listed: list[str] = []
+    for item in comparisons:
+        if item.standing == "worse" and item.mean is not None and item.reference_mean is not None:
+            own, control = _pair(item.mean, item.reference_mean)
+            listed.append(f"{item.scenario_id} ({own} against {control})")
+    return ", ".join(listed)
+
+
 def summarize_candidates(
     plan: StudyPlan, records: list[ExperimentRecord], capabilities: EvaluatorCapabilities
 ) -> tuple[tuple[CandidateSummary, ...], Selection]:
@@ -102,12 +180,17 @@ def summarize_candidates(
 
     A candidate is judged on all of its planned cases. One that is missing a
     case is not eligible, so a design cannot look better because a hard
-    scenario failed.
+    scenario failed. A design that is worse than the reference control in any
+    one scenario is not eligible either, whatever its mean over all cases, so
+    a gain in one listening situation cannot pay for a loss in another.
     """
     rule = plan.selection_rule
     by_experiment = {record.experiment_id: record for record in records}
     units = {m.name: m.unit for m in capabilities.metrics}
     directions = {m.name: m.direction for m in capabilities.metrics}
+    unit = units.get(rule.primary_metric, "")
+    reference_specs = [e for e in plan.experiments if e.candidate_id == rule.reference_candidate_id]
+    reference_scenarios = _scenario_means(plan, reference_specs, by_experiment, rule.primary_metric)
 
     drafts: dict[str, dict[str, Any]] = {}
     for candidate in plan.candidates:
@@ -135,6 +218,11 @@ def summarize_candidates(
             "complete": n_completed == len(specs) and len(primary_values) == len(specs) and bool(specs),
             "metrics": tuple(aggregates),
             "primary": fmean(primary_values) if primary_values else None,
+            "scenarios": _compare_scenarios(
+                rule,
+                _scenario_means(plan, specs, by_experiment, rule.primary_metric),
+                reference_scenarios,
+            ),
         }
 
     reference = drafts[rule.reference_candidate_id]
@@ -146,12 +234,17 @@ def summarize_candidates(
                 return aggregate.mean
         return None
 
+    tolerance = rule.scenario_tolerance
+    beyond = f", by more than the {tolerance:g} {unit} tolerance".replace("  ", " ") if tolerance else ""
+
     eligible: list[str] = []
     for candidate_id, draft in drafts.items():
         candidate: Candidate = draft["candidate"]
         reasons: list[str] = []
         improvement: float | None = None
-        if draft["complete"] and reference_ok:
+        lost = ""
+        comparable = bool(draft["complete"]) and reference_ok
+        if comparable:
             improvement = _signed(rule.direction, draft["primary"]) - _signed(
                 rule.direction, reference["primary"]
             )
@@ -176,9 +269,20 @@ def summarize_candidates(
                     reasons.append(
                         f"{constraint.metric} mean {value:.4g} is below the floor {constraint.value:.4g}."
                     )
+            if comparable:
+                lost = _losses(draft["scenarios"])
+                if lost:
+                    reasons.append(f"Worse than the reference control in {lost}{beyond}.")
+                uncompared = [s.scenario_id for s in draft["scenarios"] if s.standing == "not_compared"]
+                if uncompared:
+                    reasons.append(
+                        f"No complete {rule.primary_metric} data to compare with the reference "
+                        f"control in {', '.join(uncompared)}."
+                    )
             if improvement is not None and improvement <= rule.minimum_improvement:
                 reasons.append(f"Does not improve on the reference control for {rule.primary_metric}.")
         draft["improvement"] = improvement
+        draft["lost"] = lost
         draft["reasons"] = tuple(reasons)
         if not reasons:
             eligible.append(candidate_id)
@@ -194,7 +298,6 @@ def summarize_candidates(
     ranked = sorted(eligible, key=lambda cid: (sort_key(cid), cid))
     ranks = {candidate_id: index + 1 for index, candidate_id in enumerate(ranked)}
 
-    unit = units.get(rule.primary_metric, "")
     if not reference_ok:
         selection = Selection(
             selected_candidate_id=None,
@@ -206,12 +309,16 @@ def summarize_candidates(
             ),
         )
     elif not ranked:
+        losers = "; ".join(f"'{cid}' in {draft['lost']}" for cid, draft in drafts.items() if draft["lost"])
         selection = Selection(
             selected_candidate_id=None,
             reason_code="no_eligible_candidate",
             explanation=(
                 "No design was selected: no candidate completed all planned cases, met the "
-                f"plan's constraints, and improved on the reference control for {rule.primary_metric}."
+                "plan's constraints, stayed at least as good as the reference control "
+                f"'{rule.reference_candidate_id}' in every scenario, and improved on it over all "
+                f"cases for {rule.primary_metric}."
+                + (f" Worse than the control{beyond}: {losers}." if losers else "")
             ),
         )
     elif len(ranked) > 1 and sort_key(ranked[0]) == sort_key(ranked[1]):
@@ -226,6 +333,11 @@ def summarize_candidates(
         )
     else:
         winner = drafts[ranked[0]]
+        n_scenarios = len(plan.scenario_ids)
+        everywhere = (
+            "the one planned scenario" if n_scenarios == 1 else f"each of the {n_scenarios} planned scenarios"
+        )
+        within = f", within the {tolerance:g} {unit} tolerance" if tolerance else ""
         selection = Selection(
             selected_candidate_id=ranked[0],
             reason_code="selected",
@@ -233,7 +345,8 @@ def summarize_candidates(
                 f"'{ranked[0]}' has the best mean {rule.primary_metric} among eligible designs: "
                 f"{winner['primary']:.4g} {unit} over {winner['n_planned']} completed cases, against "
                 f"{reference['primary']:.4g} {unit} for the reference control "
-                f"'{rule.reference_candidate_id}'."
+                f"'{rule.reference_candidate_id}'. In {everywhere} it is at least as good as the "
+                f"control{within}."
             ).replace("  ", " "),
         )
 
@@ -247,6 +360,7 @@ def summarize_candidates(
             all_cases_completed=draft["complete"],
             metrics=draft["metrics"],
             primary_metric_mean=draft["primary"],
+            primary_metric_by_scenario=draft["scenarios"],
             improvement_over_reference=draft["improvement"],
             eligible=not draft["reasons"],
             ineligibility_reasons=draft["reasons"],
@@ -410,6 +524,12 @@ selection outcome, and the data for each hypothesis. Explain what these results 
 or convert a number into other units.
 - The selection was made by the plan's rule. Explain it; do not change it or name a \
 different winner. If no candidate was selected, say so plainly and give the reason from the data.
+- Under the rule a design is eligible only if it is not worse than the reference control in \
+any scenario, allowing for the rule's scenario_tolerance, and better on its mean over all \
+cases. Each candidate's primary_metric_by_scenario gives its result in every scenario and \
+the difference from the control there. Say where each design gained and where it lost, and \
+when a design was excluded for a loss, name the scenario and both numbers. A higher overall \
+mean does not make up for it.
 - For each hypothesis, compare its data with its own supports_if and contradicts_if \
 conditions and give a verdict: supported, contradicted, or inconclusive. Use inconclusive \
 when cases are missing or failed, or when the data do not clearly meet either condition.
@@ -586,6 +706,23 @@ def build_report(
                 f"The {branch.investigator.replace('_', ' ')} branch ended as '{branch.status}', "
                 "so its evidence is partial."
             )
+    by_tier: dict[str, int] = {}
+    for finding in research.findings:
+        by_tier[finding.source_tier] = by_tier.get(finding.source_tier, 0) + 1
+    scholarly = by_tier.get("scholarly", 0)
+    if research.findings and scholarly < len(research.findings):
+        limitations.append(
+            f"{scholarly} of {len(research.findings)} research findings rest on scholarly literature. "
+            "The others cite software documentation or general web pages, which can describe the "
+            "tools but are not evidence about acoustics or hearing."
+        )
+    abstract_only = {s.source_id for s in research.sources if s.content_type == "abstract_only"}
+    from_abstracts = sum(1 for finding in research.findings if finding.source_id in abstract_only)
+    if from_abstracts:
+        limitations.append(
+            f"{from_abstracts} of {len(research.findings)} research findings were drawn from an abstract "
+            "because the full text could not be retrieved."
+        )
     untested = [n.need for n in needs if n.status == "untested"]
     if untested:
         limitations.append(f"Not tested by this study: {', '.join(untested)}.")
@@ -638,4 +775,5 @@ def build_report(
         inconclusive_findings=tuple(narrative.inconclusive_findings) if narrative else (),
         follow_up_proposals=proposals,
         narrative_source="model" if narrative else "unavailable",
+        findings_by_source_tier=by_tier,
     )

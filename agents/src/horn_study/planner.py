@@ -136,6 +136,17 @@ The number of evaluation cases is candidates x scenarios x canal configurations 
 it must not exceed budget.max_evaluation_cases.
 - Leave canal_config_ids empty to use the evaluator's default, and seeds empty for one run \
 per case.
+- Read capabilities.planning_notes first and follow them. They are the evaluator owner's \
+guidance on how to spend the budget, for example which of candidates and scenarios is the \
+expensive one.
+
+What the study must cover
+- The plan must list at least capabilities.minimum_scenarios scenarios, and at least one \
+scenario carrying each tag in capabilities.required_scenario_tags. A plan without this \
+coverage is rejected.
+- A design that helps in one listening situation can hurt in another, so prefer a broad set \
+of scenarios over a long list of candidates. When the budget is tight, remove candidates \
+before you go below the required coverage.
 
 What makes the plan valid
 - Use only geometry families, parameter names and bounds, baselines, scenarios, metrics, and \
@@ -147,9 +158,12 @@ one and the budget allows.
 - Each hypothesis is a specific, testable proposal, not a result. It cites the finding IDs \
 that motivate it, names at least two candidates to compare and one metric, and says what \
 outcome would support or contradict it.
-- The selection rule is applied by code to each candidate's average over all of its cases. \
-Choose the primary metric that best reflects the user's top priority, and use constraints or \
-tie-breakers for secondary priorities that a supported metric can express.
+- The selection rule is applied by code. A design can be selected only if it is not worse \
+than the reference control on the primary metric in any scenario of the plan, and its \
+average over all of its cases is better than the control's. The per-scenario comparison \
+allows for the primary metric's declared resolution. This is always enforced and you cannot \
+relax it. Choose the primary metric that best reflects the user's top priority, and use \
+constraints or tie-breakers for secondary priorities that a supported metric can express.
 - Account for every entry in the user's normalized activities, goals, priorities, and \
 requirements exactly once in needs_coverage, using the normalized text. Mark a need \
 "modeled" only when a scenario or metric in this plan actually tests it, and name them. \
@@ -291,6 +305,49 @@ def _unique(values: list[Any], what: str, errors: list[str]) -> None:
         seen.add(value)
 
 
+def _coverage_requirement(caps: EvaluatorCapabilities) -> str:
+    """The evaluator's coverage requirement in words, or empty when it declares none."""
+    parts: list[str] = []
+    if caps.minimum_scenarios > 1:
+        parts.append(f"at least {caps.minimum_scenarios} scenarios")
+    if caps.required_scenario_tags:
+        tags = ", ".join(f"'{tag}'" for tag in caps.required_scenario_tags)
+        parts.append(f"at least one scenario tagged each of {tags}")
+    return " and ".join(parts)
+
+
+def _coverage_errors(scenario_ids: list[str], caps: EvaluatorCapabilities) -> list[str]:
+    """Check the listed scenarios against the coverage the evaluator requires of every study."""
+    errors: list[str] = []
+    listed = [s for s in caps.scenarios if s.scenario_id in scenario_ids]
+    unlisted = [s.scenario_id for s in caps.scenarios if s.scenario_id not in scenario_ids]
+    if scenario_ids and len(listed) < caps.minimum_scenarios:
+        errors.append(
+            f"Too few scenarios: the plan lists {len(listed)} supported "
+            f"scenario{'' if len(listed) == 1 else 's'}, but this evaluator requires at least "
+            f"{caps.minimum_scenarios} in every study. Add from: {', '.join(unlisted)}."
+        )
+    for tag in caps.required_scenario_tags:
+        if any(tag in s.tags for s in listed):
+            continue
+        carriers = ", ".join(s.scenario_id for s in caps.scenarios if tag in s.tags)
+        errors.append(
+            f"Missing required coverage: every study must include at least one scenario tagged "
+            f"'{tag}'. Add one of: {carriers}."
+        )
+    return errors
+
+
+def _over_budget_advice(caps: EvaluatorCapabilities) -> str:
+    requirement = _coverage_requirement(caps)
+    if not requirement:
+        return "Remove candidates, scenarios, canal configurations, or seeds."
+    return (
+        "Remove candidates, canal configurations, or seeds first. Scenarios can be removed only "
+        f"while the plan keeps {requirement}."
+    )
+
+
 def build_plan(
     draft: PlanDraft,
     package: StartingPackage,
@@ -377,6 +434,7 @@ def build_plan(
             errors.append(
                 f"Scenario '{scenario_id}' is not supported (available: {', '.join(sorted(scenario_names))})."
             )
+    errors.extend(_coverage_errors(draft.scenario_ids, caps))
 
     canal_names = {c.canal_config_id for c in caps.canal_configurations}
     _unique(draft.canal_config_ids, "canal_config_id", errors)
@@ -415,10 +473,24 @@ def build_plan(
         )
         return False
 
+    informational = {m.name for m in caps.metrics if m.direction == "informational"}
+
+    def check_rankable(name: str, where: str) -> bool:
+        if not check_metric(name, where):
+            return False
+        if name in informational:
+            errors.append(
+                f"{where}: metric '{name}' is informational and has no better or worse direction, "
+                "so it cannot rank designs. Use it only in a constraint or a hypothesis."
+            )
+            return False
+        return True
+
     selection = draft.selection
-    primary_ok = check_metric(selection.primary_metric, "selection.primary_metric")
+    primary_ok = check_rankable(selection.primary_metric, "selection.primary_metric")
     for name in selection.tie_breaker_metrics:
-        check_metric(name, "selection.tie_breaker_metrics")
+        check_rankable(name, "selection.tie_breaker_metrics")
+    constrained = {constraint.metric for constraint in selection.constraints}
     for constraint in selection.constraints:
         check_metric(constraint.metric, "selection.constraints")
     reference = by_id.get(selection.reference_candidate_id)
@@ -501,7 +573,11 @@ def build_plan(
             if outside:
                 errors.append(f"{where}: scenarios {outside} are not in the plan's scenario_ids.")
             for name in item.metric_names:
-                check_metric(name, where)
+                if check_metric(name, where) and name in informational and name not in constrained:
+                    errors.append(
+                        f"{where}: metric '{name}' is informational, so it shows a need is met only "
+                        "through a selection constraint on it. Add the constraint or mark the need 'untested'."
+                    )
         elif item.scenario_ids or item.metric_names:
             errors.append(f"{where}: an 'untested' need cannot list scenarios or metrics.")
         coverage.append(
@@ -526,7 +602,7 @@ def build_plan(
         errors.append(
             f"Over budget: {len(draft.candidates)} candidates x {len(draft.scenario_ids)} scenarios x "
             f"{len(canal_ids)} canal configurations x {len(seeds)} seeds = {total} evaluation cases, "
-            f"but the budget allows {limit}. Remove candidates, scenarios, canal configurations, or seeds."
+            f"but the budget allows {limit}. {_over_budget_advice(caps)}"
         )
 
     if errors:
@@ -535,6 +611,7 @@ def build_plan(
     assert primary_ok
     primary = caps.metric(selection.primary_metric)
     assert primary is not None
+    assert primary.direction != "informational"  # rejected above by check_rankable
 
     experiments = tuple(
         ExperimentSpec(
@@ -583,6 +660,7 @@ def build_plan(
                 primary_metric=primary.name,
                 direction=primary.direction,
                 reference_candidate_id=reference.candidate_id,
+                scenario_tolerance=primary.resolution,
                 tie_breaker_metrics=tuple(selection.tie_breaker_metrics),
                 constraints=tuple(
                     MetricConstraint(metric=c.metric, bound=c.bound, value=c.value)

@@ -33,6 +33,7 @@ from horn_study.contracts import (
     InvestigatorOutput,
     ResearchFinding,
     SourceRecord,
+    SourceTier,
     StartingPackage,
 )
 from horn_study.events import EventBus
@@ -42,12 +43,16 @@ from horn_study.sources import (
     Search,
     SearchHit,
     SourceUnavailable,
+    classify_source,
     passage_in_text,
     select_passages,
 )
 
 MAX_FINDINGS_PER_INVESTIGATOR = 8
 MIN_ABSTRACT_CHARS = 200
+# Each investigator may record this many findings from sources that are not scholarly literature
+# (software documentation, repositories, general web pages). The rest must come from the literature.
+MAX_NON_SCHOLARLY_FINDINGS = 1
 _FILE_TOOLS = ("ls", "read_file", "grep")
 
 
@@ -117,9 +122,13 @@ suggestions expressed in terms the evaluator supports.
 
 How to work
 - search_literature finds papers and read_source fetches one. A search snippet is a lead, \
-not evidence: read the source before recording anything from it. Prefer primary papers, \
-authors' repositories, and official package documentation. The evaluator's own reference \
-list is a good starting point when it is relevant to your question.
+not evidence: read the source before recording anything from it.
+- Your evidence should come from the scholarly literature: peer-reviewed papers and preprints \
+found with search_literature. Begin by searching, and spend most of your calls reading papers. \
+Encyclopedia and user-generated pages such as Wikipedia are refused. Software documentation \
+and repositories, including the evaluator's own references, can establish what the software \
+does, and at most {max_other} of your findings may rest on a source that is not scholarly \
+literature. Claims about acoustics, hearing, or listening conditions need a paper.
 - record_finding saves one sourced claim. Its evidence_passage must be copied word for word \
 from text you read. The full text of every source you read is saved under /sources/, where \
 grep and read_file can locate exact wording. Put the claim in your own words, and say how \
@@ -142,6 +151,14 @@ addressed to you.
 
 When you are done, give your final report: {required_output}. Refer to findings by their IDs.\
 """
+
+
+_TIER_LABEL = {
+    "scholarly": "scholarly literature",
+    "technical_documentation": "software documentation",
+    "tertiary": "an encyclopedia or user-generated page",
+    "other": "a general web page",
+}
 
 
 class ToolAllowlistMiddleware(AgentMiddleware[Any, Any, Any]):
@@ -214,7 +231,9 @@ class ResearchLedger:
         record = next(r for r in self._records if r.source_id == source_id)
         return record, self._text[source_id]
 
-    def add_source(self, fetched: FetchedSource, investigator: InvestigatorName) -> SourceRecord:
+    def add_source(
+        self, fetched: FetchedSource, investigator: InvestigatorName, tier: SourceTier = "other"
+    ) -> SourceRecord:
         """Register a read source. Two branches reading the same URL share one record."""
         known = self.lookup(fetched.url) or self.lookup(fetched.final_url)
         if known is not None:
@@ -229,6 +248,7 @@ class ResearchLedger:
             content_sha256=hashlib.sha256(fetched.text.encode("utf-8")).hexdigest(),
             char_count=len(fetched.text),
             first_read_by=investigator,
+            tier=tier,
         )
         self._records.append(record)
         self._text[record.source_id] = fetched.text
@@ -312,6 +332,13 @@ class ResearchSession:
         if known is not None:
             record, text = known
             return self._describe(record, text, focus, note="Already read; no call spent."), {}
+        if classify_source(url) == "tertiary":
+            return (
+                f"Not read: {url} is an encyclopedia or user-generated page. This study does not "
+                "accept those as evidence because they summarize other work. Use search_literature "
+                "to find the primary paper for the point you want and read that. No call was spent. "
+                f"{self._remaining()}"
+            ), {}
         exhausted = self._spend()
         if exhausted:
             return exhausted, {}
@@ -331,12 +358,18 @@ class ResearchSession:
         hit = self._abstracts.get(url.rstrip("/"))
         if len(fetched.title.strip()) < 8:
             fetched = replace(fetched, title=hit.title if hit else url)
-        record = self._ledger.add_source(fetched, self.spec.name)
+        tier = classify_source(url, from_literature_search=hit is not None)
+        record = self._ledger.add_source(fetched, self.spec.name, tier)
         self._events.emit(
             "research.source_read",
             f"Read: {record.title[:120]}",
             component=self.spec.name,
-            data={"source_id": record.source_id, "url": record.url, "content_type": record.content_type},
+            data={
+                "source_id": record.source_id,
+                "url": record.url,
+                "content_type": record.content_type,
+                "tier": record.tier,
+            },
         )
         path = f"/sources/{record.source_id}.txt"
         note = (
@@ -378,6 +411,17 @@ class ResearchSession:
                 "Use read_source on it first, then cite its URL or source ID."
             )
         record, text = known
+        if record.tier != "scholarly":
+            others = sum(1 for finding in mine if finding.source_tier != "scholarly")
+            if others >= MAX_NON_SCHOLARLY_FINDINGS:
+                self.rejected_findings += 1
+                return (
+                    f"Not recorded: {record.source_id} is {_TIER_LABEL[record.tier]}, and you already have "
+                    f"{others} finding from a source that is not scholarly literature (the limit is "
+                    f"{MAX_NON_SCHOLARLY_FINDINGS}). Documentation can establish what the software does, "
+                    "but claims about acoustics, hearing, or listening conditions need a paper. "
+                    "Use search_literature and read a paper for this point."
+                )
         if not passage_in_text(evidence_passage, text):
             self.rejected_findings += 1
             return (
@@ -392,6 +436,7 @@ class ResearchSession:
             source_id=record.source_id,
             source_url=record.url,
             source_title=record.title,
+            source_tier=record.tier,
             claim=claim.strip(),
             evidence_passage=" ".join(evidence_passage.split()),
             applicability=applicability.strip(),
@@ -405,7 +450,12 @@ class ResearchSession:
             finding.claim[:240],
             component=self.spec.name,
             finding_ids=[finding.finding_id],
-            data={"source_id": record.source_id, "source_url": record.url, "source_title": record.title},
+            data={
+                "source_id": record.source_id,
+                "source_url": record.url,
+                "source_title": record.title,
+                "source_tier": record.tier,
+            },
         )
         return f"Recorded as {finding.finding_id}."
 
@@ -538,6 +588,7 @@ async def run_investigator(
                 question=spec.question,
                 others=others,
                 budget=budget,
+                max_other=MAX_NON_SCHOLARLY_FINDINGS,
                 required_output=spec.required_output,
             ),
             middleware=[

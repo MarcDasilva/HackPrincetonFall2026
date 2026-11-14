@@ -154,6 +154,52 @@ async def test_investigators_hold_evidence_tools_only(tmp_path):
     assert harness.interpreter_model.log.bound_tool_sets == [["ReportNarrative"]]
 
 
+async def test_the_report_states_how_much_of_the_evidence_is_scholarly(tmp_path):
+    def cites_documentation(messages, bound):
+        """The design investigator reads a repository directly instead of searching the literature."""
+        who = investigator_of(messages)
+        if who != "acoustic_design_research":
+            return research_responder(messages, bound)
+        step = sum(1 for m in messages if isinstance(m, AIMessage))
+        url = "https://github.com/example/acoustics-tool"
+        if step == 0:
+            return call("read_source", {"url": url, "focus": "horn"}, "d-1")
+        if step == 1:
+            return call(
+                "record_finding",
+                {
+                    "question": "q",
+                    "source": url,
+                    "claim": "The tool models path length.",
+                    "evidence_passage": "The acoustic path length of a horn shifts the frequency region where its response peaks.",
+                    "applicability": "a",
+                    "limitations": "l",
+                    "related_user_goal": "g",
+                    "motivates": "m",
+                },
+                "d-2",
+            )
+        return call("InvestigatorOutput", investigator_report(who), "d-3")
+
+    outcome = await run_study(make_request(), Harness(tmp_path, research=cites_documentation).deps)
+    report = outcome.report
+    assert report is not None
+    assert report.findings_by_source_tier == {"scholarly": 2, "technical_documentation": 1}
+    assert any(
+        text.startswith("2 of 3 research findings rest on scholarly literature.")
+        for text in report.limitations
+    )
+    research = load(outcome, "research.json")
+    assert {f["finding_id"]: f["source_tier"] for f in research["findings"]}[
+        "design-F1"
+    ] == "technical_documentation"
+
+    all_scholarly = await run_study(make_request("all_papers"), Harness(tmp_path).deps)
+    assert all_scholarly.report is not None
+    assert all_scholarly.report.findings_by_source_tier == {"scholarly": 3}
+    assert not any("rest on scholarly literature" in text for text in all_scholarly.report.limitations)
+
+
 async def test_an_investigator_cannot_reach_tools_outside_its_allowlist(tmp_path):
     forbidden = ("execute", "task", "write_file")
     refusals: dict[str, str] = {}
@@ -455,6 +501,334 @@ async def test_no_winner_when_the_control_is_incomplete_or_nothing_improves(tmp_
         for c in flat.report.candidates
         if c.kind == "design"
     )
+
+
+# --------------------------------------------------------------------------
+# A design must not lose to the control in any scenario
+# --------------------------------------------------------------------------
+
+PRIMARY = "fixture_audible_speech_fraction"
+QUIET, BABBLE, DISTANT = "quiet_conversation", "speech_in_babble", "distant_talker"
+
+
+class FixedScores(CountingEvaluator):
+    """Returns chosen primary-metric values. Everything else is the fixture's own output.
+
+    `scores` maps candidate -> scenario -> one value, or one value per seed.
+    `resolution` replaces the primary metric's declared resolution.
+    """
+
+    def __init__(self, scores: dict[str, dict[str, Any]], resolution: float | None = None):
+        super().__init__()
+        self.scores, self.resolution = scores, resolution
+
+    def get_evaluator_capabilities(self):
+        capabilities = self.inner.get_evaluator_capabilities()
+        if self.resolution is None:
+            return capabilities
+        metrics = tuple(
+            m.model_copy(update={"resolution": self.resolution}) if m.name == PRIMARY else m
+            for m in capabilities.metrics
+        )
+        return capabilities.model_copy(update={"metrics": metrics})
+
+    def evaluate_experiment(self, spec):
+        self.calls.append(spec.experiment_id)
+        result = self.inner.evaluate_experiment(spec)
+        value = self.scores[spec.candidate_id][spec.scenario_id]
+        if isinstance(value, dict):
+            value = value[spec.seed]
+        metrics = tuple(
+            m.model_copy(update={"value": value}) if m.name == PRIMARY else m for m in result.metrics
+        )
+        return result.model_copy(update={"metrics": metrics})
+
+
+def summary_of(outcome, candidate_id: str):
+    return next(c for c in outcome.report.candidates if c.candidate_id == candidate_id)
+
+
+def standings(outcome, candidate_id: str) -> dict[str, str]:
+    return {s.scenario_id: s.standing for s in summary_of(outcome, candidate_id).primary_metric_by_scenario}
+
+
+async def test_a_design_that_loses_to_the_control_in_one_scenario_cannot_win(tmp_path):
+    scores = {
+        "unaided": {QUIET: 0.93, BABBLE: 0.30, DISTANT: 0.40},
+        "len30": {QUIET: 0.667, BABBLE: 0.80, DISTANT: 0.90},
+        "len45": {QUIET: 0.94, BABBLE: 0.50, DISTANT: 0.55},
+        "len90": {QUIET: 0.93, BABBLE: 0.45, DISTANT: 0.45},
+    }
+    outcome = await run_study(make_request(), Harness(tmp_path, evaluator=FixedScores(scores)).deps)
+    report = outcome.report
+
+    loser = summary_of(outcome, "len30")
+    assert loser.primary_metric_mean == max(c.primary_metric_mean for c in report.candidates)
+    assert loser.improvement_over_reference == pytest.approx(0.789 - 0.5433, abs=1e-3)
+    assert not loser.eligible
+    assert loser.rank is None
+    assert loser.ineligibility_reasons == (
+        "Worse than the reference control in quiet_conversation (0.667 against 0.93), "
+        "by more than the 0.01 fraction tolerance.",
+    )
+    assert standings(outcome, "len30") == {QUIET: "worse", BABBLE: "better", DISTANT: "better"}
+
+    assert report.selected_candidate_id == "len45"
+    assert report.selection.explanation == (
+        f"'len45' has the best mean {PRIMARY} among eligible designs: 0.6633 fraction over 3 completed "
+        "cases, against 0.5433 fraction for the reference control 'unaided'. In each of the 3 planned "
+        "scenarios it is at least as good as the control, within the 0.01 fraction tolerance."
+    )
+    assert summary_of(outcome, "len90").rank == 2
+    assert load(outcome, "results.json")["selected_candidate"]["candidate_id"] == "len45"
+
+
+async def test_a_design_within_the_declared_resolution_of_the_control_stays_eligible(tmp_path):
+    scores = {
+        "unaided": {QUIET: 0.93, BABBLE: 0.30, DISTANT: 0.40},
+        # Exactly the declared resolution (0.01) below the control in quiet: not a meaningful loss.
+        "len30": {QUIET: 0.92, BABBLE: 0.80, DISTANT: 0.90},
+        "len45": {QUIET: 0.925, BABBLE: 0.50, DISTANT: 0.55},
+        # Just past the resolution: a loss.
+        "len90": {QUIET: 0.919, BABBLE: 0.95, DISTANT: 0.95},
+    }
+    outcome = await run_study(make_request(), Harness(tmp_path, evaluator=FixedScores(scores)).deps)
+
+    assert load(outcome, "plan.json")["selection_rule"]["scenario_tolerance"] == 0.01
+    for candidate_id in ("len30", "len45"):
+        assert summary_of(outcome, candidate_id).eligible
+        assert standings(outcome, candidate_id)[QUIET] == "within_tolerance"
+    assert summary_of(outcome, "len30").primary_metric_by_scenario[0].difference_from_reference == (
+        pytest.approx(-0.01)
+    )
+    assert outcome.report.selected_candidate_id == "len30"
+    assert summary_of(outcome, "len90").ineligibility_reasons == (
+        "Worse than the reference control in quiet_conversation (0.919 against 0.93), "
+        "by more than the 0.01 fraction tolerance.",
+    )
+
+
+async def test_a_scenario_at_the_metric_ceiling_does_not_disqualify_a_design(tmp_path):
+    scores = {
+        "unaided": {QUIET: 1.0, BABBLE: 0.30, DISTANT: 0.40},
+        "len30": {QUIET: 1.0, BABBLE: 0.80, DISTANT: 0.90},
+        "len45": {QUIET: 0.999, BABBLE: 0.85, DISTANT: 0.95},
+        "len90": {QUIET: 1.0, BABBLE: 0.30, DISTANT: 0.40},
+    }
+    # No resolution declared: every difference counts, and equal is still not worse.
+    harness = Harness(tmp_path, evaluator=FixedScores(scores, resolution=0.0))
+    outcome = await run_study(make_request(), harness.deps)
+
+    assert load(outcome, "plan.json")["selection_rule"]["scenario_tolerance"] == 0.0
+    at_ceiling = summary_of(outcome, "len30")
+    assert at_ceiling.eligible
+    assert at_ceiling.primary_metric_by_scenario[0].difference_from_reference == 0.0
+    assert standings(outcome, "len30") == {QUIET: "within_tolerance", BABBLE: "better", DISTANT: "better"}
+    assert outcome.report.selected_candidate_id == "len30"
+    assert summary_of(outcome, "len45").ineligibility_reasons == (
+        "Worse than the reference control in quiet_conversation (0.999 against 1).",
+    )
+    # Never worse anywhere, but no better overall either: equal to the control is not a win.
+    assert summary_of(outcome, "len90").ineligibility_reasons == (
+        f"Does not improve on the reference control for {PRIMARY}.",
+    )
+
+
+async def test_nothing_is_selected_when_every_design_loses_somewhere(tmp_path):
+    scores = {
+        "unaided": {QUIET: 0.93, BABBLE: 0.30, DISTANT: 0.40},
+        "len30": {QUIET: 0.667, BABBLE: 0.80, DISTANT: 0.90},
+        "len45": {QUIET: 0.95, BABBLE: 0.20, DISTANT: 0.90},
+        "len90": {QUIET: 0.70, BABBLE: 0.90, DISTANT: 0.25},
+    }
+    outcome = await run_study(make_request(), Harness(tmp_path, evaluator=FixedScores(scores)).deps)
+    report = outcome.report
+
+    assert outcome.state is StudyState.COMPLETED
+    assert all(c.improvement_over_reference > 0 for c in report.candidates if c.kind == "design")
+    assert report.selected_candidate_id is None
+    assert report.selection.reason_code == "no_eligible_candidate"
+    assert report.selection.explanation == (
+        "No design was selected: no candidate completed all planned cases, met the plan's constraints, "
+        "stayed at least as good as the reference control 'unaided' in every scenario, and improved on "
+        f"it over all cases for {PRIMARY}. Worse than the control, by more than the 0.01 fraction "
+        "tolerance: 'len30' in quiet_conversation (0.667 against 0.93); 'len45' in speech_in_babble "
+        "(0.2 against 0.3); 'len90' in quiet_conversation (0.7 against 0.93), distant_talker "
+        "(0.25 against 0.4)."
+    )
+    # The progress event has room for less, and stops at the end of a sentence.
+    assert first(outcome, "report.completed").summary == (
+        "No design was selected: no candidate completed all planned cases, met the plan's constraints, "
+        "stayed at least as good as the reference control 'unaided' in every scenario, and improved on "
+        f"it over all cases for {PRIMARY}."
+    )
+    document = load(outcome, "results.json")
+    assert document["selected_candidate_id"] is None
+    assert document["selected_candidate"] is None
+    assert all(n.status != "addressed" for n in report.needs)
+
+
+async def test_scenarios_are_compared_on_their_means_over_seeds(tmp_path):
+    draft = valid_draft()
+    draft["candidates"] = [c for c in draft["candidates"] if c["candidate_id"] != "len90"]
+    draft["hypotheses"][0]["candidate_ids"] = ["len30", "len45"]
+    draft["scenario_ids"] = [QUIET, BABBLE]
+    draft["seeds"] = [0, 1]
+    for item in draft["needs_coverage"]:
+        item["scenario_ids"] = [BABBLE] if item["scenario_ids"] else []
+    scores = {
+        "unaided": {QUIET: 0.90, BABBLE: 0.30},
+        # One seed beats the control in quiet, but the scenario mean (0.89) does not.
+        "len30": {QUIET: {0: 0.80, 1: 0.98}, BABBLE: 0.90},
+        # One seed is below the control in quiet, but the scenario mean (0.91) is not.
+        "len45": {QUIET: {0: 0.85, 1: 0.97}, BABBLE: 0.60},
+    }
+    harness = Harness(
+        tmp_path, evaluator=FixedScores(scores, resolution=0.0), coordinator=coordinator_responder(draft)
+    )
+    outcome = await run_study(make_request(), harness.deps)
+
+    assert len(harness.evaluator.calls) == 3 * 2 * 2
+    quiet = summary_of(outcome, "len30").primary_metric_by_scenario[0]
+    assert (quiet.mean, quiet.reference_mean) == (pytest.approx(0.89), pytest.approx(0.90))
+    assert (quiet.n_completed, quiet.n_planned) == (2, 2)
+    assert summary_of(outcome, "len30").ineligibility_reasons == (
+        "Worse than the reference control in quiet_conversation (0.89 against 0.9).",
+    )
+    assert standings(outcome, "len45") == {QUIET: "better", BABBLE: "better"}
+    assert outcome.report.selected_candidate_id == "len45"
+
+
+async def test_a_scenario_with_a_missing_case_is_never_counted_as_not_worse(tmp_path):
+    harness = Harness(tmp_path, evaluator=ScenarioFailure({"len45"}))
+    outcome = await run_study(make_request(), harness.deps)
+
+    incomplete = summary_of(outcome, "len45")
+    assert not incomplete.eligible
+    babble = next(s for s in incomplete.primary_metric_by_scenario if s.scenario_id == BABBLE)
+    assert (babble.mean, babble.n_completed, babble.n_planned) == (None, 0, 1)
+    assert babble.reference_mean is not None
+    assert babble.difference_from_reference is None
+    assert babble.standing == "not_compared"
+    assert standings(outcome, "len45") == {QUIET: "better", BABBLE: "not_compared", DISTANT: "better"}
+
+    # Without the control's case no design can be compared in that scenario at all.
+    no_control = await run_study(
+        make_request("no_control"), Harness(tmp_path, evaluator=ScenarioFailure({"unaided"})).deps
+    )
+    for candidate in no_control.report.candidates:
+        assert not candidate.eligible
+        assert standings(no_control, candidate.candidate_id)[BABBLE] == "not_compared"
+
+
+async def test_per_scenario_numbers_in_the_report_are_the_evaluators_numbers(tmp_path):
+    outcome = await run_study(make_request(), Harness(tmp_path).deps)
+    document = load(outcome, "results.json")
+
+    def returned(candidate_id: str, scenario_id: str) -> float:
+        (case,) = [
+            c
+            for c in document["experiments"]
+            if c["candidate_id"] == candidate_id and c["scenario_id"] == scenario_id
+        ]
+        (value,) = [m["value"] for m in case["metrics"] if m["name"] == PRIMARY]
+        return value
+
+    assert [c["candidate_id"] for c in document["report"]["candidates"]] == [
+        "unaided",
+        "len30",
+        "len45",
+        "len90",
+    ]
+    for candidate in document["report"]["candidates"]:
+        rows = candidate["primary_metric_by_scenario"]
+        assert [row["scenario_id"] for row in rows] == [QUIET, BABBLE, DISTANT]
+        for row in rows:
+            own = returned(candidate["candidate_id"], row["scenario_id"])
+            control = returned("unaided", row["scenario_id"])
+            assert row["mean"] == own
+            assert row["reference_mean"] == control
+            assert row["difference_from_reference"] == own - control
+            assert (row["n_completed"], row["n_planned"]) == (1, 1)
+        assert candidate["primary_metric_mean"] == pytest.approx(sum(row["mean"] for row in rows) / 3)
+    assert {row["standing"] for row in document["report"]["candidates"][0]["primary_metric_by_scenario"]} == {
+        "within_tolerance"
+    }
+
+
+async def test_the_interpreter_is_shown_where_each_design_wins_and_loses(tmp_path):
+    seen: dict[str, Any] = {}
+
+    def capture(messages, bound):
+        seen["system"] = str(messages[0].content)
+        seen["brief"] = json.loads(str(messages[-1].content).removeprefix("Study results:\n\n"))
+        return call("ReportNarrative", narrative())
+
+    scores = {
+        "unaided": {QUIET: 0.93, BABBLE: 0.30, DISTANT: 0.40},
+        "len30": {QUIET: 0.667, BABBLE: 0.80, DISTANT: 0.90},
+        "len45": {QUIET: 0.94, BABBLE: 0.50, DISTANT: 0.55},
+        "len90": {QUIET: 0.93, BABBLE: 0.45, DISTANT: 0.45},
+    }
+    harness = Harness(tmp_path, evaluator=FixedScores(scores), interpreter=capture)
+    outcome = await run_study(make_request(), harness.deps)
+
+    assert "not worse than the reference control in any scenario" in " ".join(seen["system"].split())
+    assert seen["brief"]["plan"]["selection_rule"]["scenario_tolerance"] == 0.01
+    shown = next(c for c in seen["brief"]["candidate_comparison"] if c["candidate_id"] == "len30")
+    assert shown["primary_metric_by_scenario"] == [
+        s.model_dump(mode="json") for s in summary_of(outcome, "len30").primary_metric_by_scenario
+    ]
+    assert shown["primary_metric_by_scenario"][0]["standing"] == "worse"
+    assert shown["ineligibility_reasons"] == list(summary_of(outcome, "len30").ineligibility_reasons)
+
+
+async def test_a_plan_without_required_coverage_is_sent_back_before_freezing(tmp_path):
+    narrow = valid_draft(needs=False)
+    narrow["scenario_ids"] = [BABBLE]
+    harness = Harness(tmp_path, coordinator=coordinator_responder(narrow, valid_draft(needs=False)))
+    outcome = await run_study(make_request(needs=False), harness.deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    revision = first(outcome, "plan.revision_requested")
+    assert revision.sequence < first(outcome, "plan.frozen").sequence
+    assert revision.data["errors"] == [
+        "Too few scenarios: the plan lists 1 supported scenario, but this evaluator requires at least 2 "
+        "in every study. Add from: quiet_conversation, distant_talker.",
+        "Missing required coverage: every study must include at least one scenario tagged 'quiet'. "
+        "Add one of: quiet_conversation.",
+    ]
+    assert load(outcome, "plan.json")["scenario_ids"] == [QUIET, BABBLE, DISTANT]
+    assert load(outcome, "plan.json")["plan_version"] == 2
+    assert {e.split("--")[1] for e in harness.evaluator.calls} == {QUIET, BABBLE, DISTANT}
+
+    stubborn = Harness(tmp_path, coordinator=coordinator_responder(narrow))
+    failed = await run_study(make_request("never_broadened", needs=False), stubborn.deps)
+    assert failed.state is StudyState.FAILED
+    assert failed.failure["kind"] == "plan_invalid"
+    assert stubborn.evaluator.calls == []
+
+
+async def test_the_coordinator_is_given_the_coverage_rules_and_planning_notes(tmp_path):
+    seen: dict[str, str] = {}
+
+    def capture(messages, bound):
+        seen["system"] = " ".join(str(messages[0].content).split())
+        seen["brief"] = str(messages[1].content)
+        return coordinator_responder(valid_draft())(messages, bound)
+
+    harness = Harness(tmp_path, coordinator=capture)
+    outcome = await run_study(make_request(), harness.deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    capabilities = load(outcome, "capabilities.json")
+    assert capabilities["required_scenario_tags"] == ["quiet", "noise"]
+    assert capabilities["minimum_scenarios"] == 2
+    for note in capabilities["planning_notes"]:
+        assert json.dumps(note) in seen["brief"]
+    assert "capabilities.planning_notes" in seen["system"]
+    assert "capabilities.required_scenario_tags" in seen["system"]
+    assert "not worse than the reference control on the primary metric in any scenario" in seen["system"]
 
 
 async def test_hypotheses_get_per_scenario_data_and_needs_say_how_they_were_met(tmp_path):

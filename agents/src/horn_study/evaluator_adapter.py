@@ -274,6 +274,8 @@ def _fixture_capabilities() -> EvaluatorCapabilities:
                 unit="fraction",
                 direction="higher_is_better",
                 description="Placeholder share of the speech band above the modeled threshold.",
+                # The seed jitter moves a result by at most 0.005, so two results can differ by 0.01.
+                resolution=0.01,
             ),
             MetricSpec(
                 name="fixture_target_band_gain_db",
@@ -330,6 +332,14 @@ def _fixture_capabilities() -> EvaluatorCapabilities:
                 url="https://pubmed.ncbi.nlm.nih.gov/16212766/",
                 note="Prior model-based hearing-compensation optimization.",
             ),
+        ),
+        required_scenario_tags=("quiet", "noise"),
+        minimum_scenarios=2,
+        planning_notes=(
+            "Every study covers speech in quiet and speech in noise, so a design cannot be chosen "
+            "for one listening situation alone.",
+            "Each case costs the same here. A design is rejected if it is worse than the unaided "
+            "control in any scenario, so add scenarios before adding near-duplicate candidates.",
         ),
     )
 

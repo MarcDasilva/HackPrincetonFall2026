@@ -79,6 +79,12 @@ def test_capabilities_are_printed_for_the_frontend(capsys):
     capabilities = json.loads(capsys.readouterr().out)
     assert capabilities["kind"] == "development_fixture"
     assert capabilities["hearing_input"]["required_frequencies_hz"] == [500.0, 1000.0, 2000.0, 4000.0]
+    assert capabilities["required_scenario_tags"] == ["quiet", "noise"]
+    assert capabilities["minimum_scenarios"] == 2
+    assert len(capabilities["planning_notes"]) == 2
+    resolutions = {m["name"]: m["resolution"] for m in capabilities["metrics"]}
+    assert resolutions["fixture_audible_speech_fraction"] == 0.01
+    assert resolutions["fixture_device_length_mm"] == 0.0
 
 
 async def test_replay_reemits_recorded_events_labeled_as_a_replay(tmp_path, capsys):

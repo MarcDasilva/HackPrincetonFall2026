@@ -229,8 +229,19 @@ class ScenarioSpec(ExternalContract):
 class MetricSpec(ExternalContract):
     name: str
     unit: str
-    direction: Literal["higher_is_better", "lower_is_better"]
+    # "informational" metrics are reported but have no preferred direction, so they cannot rank
+    # designs. They may still be used in a selection constraint or compared in a hypothesis.
+    direction: Literal["higher_is_better", "lower_is_better", "informational"]
     description: str = ""
+    resolution: float = Field(
+        default=0.0,
+        ge=0,
+        allow_inf_nan=False,
+        description=(
+            "Smallest difference in this metric that is meaningful, in its unit. Two values closer "
+            "than this are treated as the same result. 0 means every difference counts."
+        ),
+    )
 
 
 class CanalConfig(ExternalContract):
@@ -278,6 +289,33 @@ class EvaluatorCapabilities(ExternalContract):
     output_assets: tuple[str, ...] = ()
     unsupported_requirements: tuple[UnsupportedRequirement, ...] = ()
     references: tuple[Reference, ...] = ()
+    required_scenario_tags: tuple[str, ...] = Field(
+        default=(),
+        description="A plan must include at least one scenario carrying each of these tags.",
+    )
+    minimum_scenarios: int = Field(
+        default=1, ge=1, description="A plan must include at least this many scenarios."
+    )
+    planning_notes: tuple[str, ...] = Field(
+        default=(),
+        description="Short guidance for whoever plans a study, such as what is cheap and what is costly.",
+    )
+
+    @model_validator(mode="after")
+    def _coverage_is_satisfiable(self) -> EvaluatorCapabilities:
+        if self.minimum_scenarios > max(1, len(self.scenarios)):
+            raise ValueError(
+                f"minimum_scenarios is {self.minimum_scenarios} but only {len(self.scenarios)} "
+                "scenarios are declared, so no plan could comply"
+            )
+        offered = {tag for scenario in self.scenarios for tag in scenario.tags}
+        missing = [tag for tag in self.required_scenario_tags if tag not in offered]
+        if missing:
+            raise ValueError(
+                f"required_scenario_tags {missing} are not carried by any declared scenario, "
+                "so no plan could comply"
+            )
+        return self
 
     def snapshot_hash(self) -> str:
         return content_hash(self.model_dump(mode="json"))
@@ -366,6 +404,7 @@ class InputIssue(Contract):
 # --------------------------------------------------------------------------
 
 InvestigatorName = Literal["hearing_research", "use_context_research", "acoustic_design_research"]
+SourceTier = Literal["scholarly", "technical_documentation", "tertiary", "other"]
 
 
 class SourceRecord(Contract):
@@ -378,6 +417,10 @@ class SourceRecord(Contract):
     content_sha256: str
     char_count: int
     first_read_by: InvestigatorName
+    tier: SourceTier = Field(
+        default="other",
+        description="scholarly, technical_documentation, tertiary, or other. See sources.classify_source.",
+    )
 
 
 class ResearchFinding(Contract):
@@ -387,6 +430,7 @@ class ResearchFinding(Contract):
     source_id: str
     source_url: str
     source_title: str
+    source_tier: SourceTier = "other"
     claim: str
     evidence_passage: str = Field(description="Verbatim excerpt, verified against the read text.")
     applicability: str
@@ -484,7 +528,12 @@ class MetricConstraint(Contract):
 
 
 class SelectionRule(Contract):
-    """Fixed before execution. Applied in code, never by a model."""
+    """Fixed before execution. Applied in code, never by a model.
+
+    A design is eligible only if it completed every planned case, meets the
+    constraints, is not worse than the reference control in any scenario of the
+    plan, and improves on the control's mean over all cases.
+    """
 
     primary_metric: str
     direction: Literal["higher_is_better", "lower_is_better"]
@@ -494,6 +543,17 @@ class SelectionRule(Contract):
     tie_breaker_metrics: tuple[str, ...] = ()
     constraints: tuple[MetricConstraint, ...] = ()
     require_all_cases_completed: Literal[True] = True
+    require_not_worse_than_reference_in_every_scenario: Literal[True] = True
+    scenario_tolerance: float = Field(
+        default=0.0,
+        ge=0,
+        allow_inf_nan=False,
+        description=(
+            "How far below the reference control's scenario mean a design's scenario mean may fall, "
+            "in the primary metric's unit, before it counts as worse. Taken from the primary "
+            "metric's declared resolution when the plan is built."
+        ),
+    )
 
 
 class ExperimentSpec(Contract):
@@ -657,6 +717,37 @@ class MetricAggregate(Contract):
     n_cases: int
 
 
+ScenarioStanding = Literal["better", "within_tolerance", "worse", "not_compared"]
+
+
+class ScenarioComparison(Contract):
+    """One candidate's primary-metric result in one scenario, against the reference control."""
+
+    scenario_id: str
+    mean: float | None = Field(
+        default=None, description="Mean over this candidate's completed cases in the scenario."
+    )
+    n_completed: int
+    n_planned: int
+    reference_mean: float | None = Field(
+        default=None, description="The reference control's mean in the same scenario."
+    )
+    difference_from_reference: float | None = Field(
+        default=None,
+        description=(
+            "Signed so that positive means better than the reference control. Present only when "
+            "both completed every planned case in the scenario."
+        ),
+    )
+    standing: ScenarioStanding = Field(
+        description=(
+            "'worse' when the candidate falls below the control by more than the plan's "
+            "scenario_tolerance, 'better' when it exceeds it by more than that, "
+            "'within_tolerance' otherwise, and 'not_compared' when either side is missing a case."
+        )
+    )
+
+
 class CandidateSummary(Contract):
     candidate_id: str
     kind: Literal["design", "baseline"]
@@ -666,6 +757,7 @@ class CandidateSummary(Contract):
     all_cases_completed: bool
     metrics: tuple[MetricAggregate, ...] = ()
     primary_metric_mean: float | None = None
+    primary_metric_by_scenario: tuple[ScenarioComparison, ...] = ()
     improvement_over_reference: float | None = Field(
         default=None,
         description="Signed so that positive means better than the reference control.",
@@ -749,6 +841,10 @@ class StudyReport(Contract):
     inconclusive_findings: tuple[str, ...]
     follow_up_proposals: tuple[FollowUpProposal, ...]
     narrative_source: Literal["model", "unavailable"]
+    findings_by_source_tier: dict[str, int] = Field(
+        default_factory=dict,
+        description="How many accepted findings rest on each kind of source, for example scholarly.",
+    )
 
 
 # --------------------------------------------------------------------------
