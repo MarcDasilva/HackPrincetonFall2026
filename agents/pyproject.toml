@@ -13,6 +13,8 @@ dependencies = [
     "httpx",
     "pypdf>=7.1.0",
     "python-dotenv>=1.2.4",
+    "fastapi>=0.163.0",
+    "uvicorn>=0.54.0",
 ]
 
 [project.scripts]
