@@ -1,200 +1,373 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { MetalFx } from "@/components/metal";
 import Dock from "@/components/Dock";
+import Orb from "@/components/Orb";
+import gsap from "gsap";
+import { supabase } from "@/lib/supabase";
 
-// Mirrors the results manifest in handoff.md. Paths are relative to /data/. The agent overwrites results.json; nothing here may call a backend.
-type Experiment = {
-  id: number;
-  mesh: string;
-  params: Record<string, number>;
-  gain_curve: [number, number][];
-  neurogram: string;
-  audio: string;
-  score: number;
-};
-type Manifest = {
-  ear: {
-    mesh: string;
-    audiogram: [number, number][];
-    canal_band: { volume_cc: [number, number]; samples: number };
-    cohc: number;
-    cihc: number;
-  };
-  reference_neurogram: string;
-  unaided: { neurogram: string; audio: string };
-  experiments: Experiment[];
-  pick: number;
-};
-
-const D = "/data/";
-const panel: React.CSSProperties = {
-  scrollMarginTop: 110,
-  background: "rgba(8,8,12,0.72)",
-  border: "1px solid rgba(255,255,255,0.12)",
-  padding: 20,
-  backdropFilter: "blur(6px)",
-};
-const h2: React.CSSProperties = { margin: "0 0 12px", fontSize: 13, letterSpacing: "0.14em", textTransform: "uppercase", color: "#9aa0a8", fontWeight: 500 };
-const btn = (on: boolean): React.CSSProperties => ({
-  padding: "10px 18px",
-  background: on ? "#fff" : "rgba(255,255,255,0.08)",
-  color: on ? "#000" : "#e6e8eb",
-  border: "1px solid rgba(255,255,255,0.3)",
-  font: "inherit",
-  cursor: "pointer",
-});
-
-const svg = (d: string[]) => (
-  <svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+// Same chrome ramp as the "Auris" title on the splash (app/page.tsx). Gradient ids are document-global, so each icon gets its OWN id — a shared one breaks when the first icon unmounts.
+const svg = (id: string, d: string[]) => (
+  <svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke={`url(#metal-${id})`} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <defs>
+      <linearGradient id={`metal-${id}`} x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stopColor="#ffffff" />
+        <stop offset="0.3" stopColor="#c9ccd1" />
+        <stop offset="0.52" stopColor="#7d8189" />
+        <stop offset="0.75" stopColor="#e6e8eb" />
+        <stop offset="1" stopColor="#9aa0a8" />
+      </linearGradient>
+    </defs>
     {d.map((p) => <path key={p} d={p} />)}
   </svg>
 );
-// One icon per panel in handoff.md: ear, audiogram, cochlea spiral, experiment grid, speaker.
-const icons = {
-  ear: svg(["M6 8.5a6.5 6.5 0 1 1 13 0c0 6-6 6-6 10a3.5 3.5 0 1 1-7 0", "M15 8.5a2.5 2.5 0 0 0-5 0v1a2 2 0 1 1 0 4"]),
-  profile: svg(["M3 3v18h18", "M7 8l4 3 3-2 5 7"]),
-  cochlea: svg(["M12 12a1 1 0 0 1 1-1 2 2 0 0 1 2 2 4 4 0 0 1-4 4 6 6 0 0 1-6-6 8 8 0 0 1 8-8 9 9 0 0 1 9 9"]),
-  experiments: svg(["M4 4h6v6H4z", "M14 4h6v6h-6z", "M4 14h6v6H4z", "M14 14h6v6h-6z"]),
-  listen: svg(["M11 5 6 9H2v6h4l5 4z", "M15.5 8.5a5 5 0 0 1 0 7", "M18.5 5.5a9 9 0 0 1 0 13"]),
-};
-const jump = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
 
-function Audiogram({ points }: { points: [number, number][] }) {
-  // dB HL grows downward: worse hearing plots lower, as on a clinical audiogram.
-  const xs = (i: number) => 30 + (i * 260) / (points.length - 1);
-  const y = (db: number) => 10 + (db / 80) * 140;
-  return (
-    <svg viewBox="0 0 300 175" style={{ width: "100%" }} role="img" aria-label="Audiogram">
-      {[0, 20, 40, 60, 80].map((db) => (
-        <g key={db}>
-          <line x1="30" x2="290" y1={y(db)} y2={y(db)} stroke="#2a2734" />
-          <text x="24" y={y(db) + 3} textAnchor="end" fontSize="8" fill="#9aa0a8">{db}</text>
-        </g>
-      ))}
-      <polyline fill="none" stroke="#ff5fa2" strokeWidth="2" points={points.map(([, db], i) => `${xs(i)},${y(db)}`).join(" ")} />
-      {points.map(([hz], i) => (
-        <text key={hz} x={xs(i)} y="168" textAnchor="middle" fontSize="8" fill="#9aa0a8">{hz}</text>
-      ))}
-    </svg>
-  );
-}
+/** Black square with a silver metal ring. MetalFx strips the CHILD's background (transparent !important) and a root-background fill does not paint, so the black fill is a wrapper div under each MetalFx — the ring still draws on top. variant="circle" forces a round outline whatever borderRadius says, so the square needs "button". The child and MetalFx take the SAME radius — a mismatch draws the ring off the tile edge. The dock runs with tiles off, so this square IS the tile — MetalFx must wrap a child that fills the dock face or the ring collapses to the glyph. */
+const RADIUS = 12;
+// Same chrome ramp as the title and icon strokes, as a CSS border (MetalFx would bake its ring from the panel's size mid-animation).
+const SILVER = "linear-gradient(135deg, #ffffff 0%, #c9ccd1 30%, #7d8189 52%, #e6e8eb 75%, #9aa0a8 100%)";
+const metal = (glyph: React.ReactNode) => (
+  <div style={{ width: "100%", height: "100%", background: "#000", borderRadius: RADIUS }}>
+  <MetalFx variant="button" preset="silver" theme="dark" innerShadow ringCssPx={2} borderRadius={RADIUS} style={{ width: "100%", height: "100%" }}>
+    <span style={{ display: "flex", alignItems: "center", justifyContent: "center", width: "100%", height: "100%", borderRadius: RADIUS, background: "#000", color: "#c9ccd1", fontSize: "0.62em" }}>
+      {glyph}
+    </span>
+  </MetalFx>
+  </div>
+);
+
+// One icon per panel in handoff.md: ear, audiogram, cochlea spiral, experiment grid, speaker.
+const items = [
+  { icon: metal(svg("ear", ["M6 8.5a6.5 6.5 0 1 1 13 0c0 6-6 6-6 10a3.5 3.5 0 1 1-7 0", "M15 8.5a2.5 2.5 0 0 0-5 0v1a2 2 0 1 1 0 4"])), label: "Ear and horn" },
+  { icon: metal(svg("audiogram", ["M3 3v18h18", "M7 8l4 3 3-2 5 7"])), label: "Ear profile" },
+  { icon: metal(svg("cochlea", ["M12 12a1 1 0 0 1 1-1 2 2 0 0 1 2 2 4 4 0 0 1-4 4 6 6 0 0 1-6-6 8 8 0 0 1 8-8 9 9 0 0 1 9 9"])), label: "Cochlea" },
+  { icon: metal(svg("experiments", ["M4 4h6v6H4z", "M14 4h6v6h-6z", "M4 14h6v6H4z", "M14 14h6v6h-6z"])), label: "Experiments" },
+  { icon: metal(svg("listen", ["M11 5 6 9H2v6h4l5 4z", "M15.5 8.5a5 5 0 0 1 0 7", "M18.5 5.5a9 9 0 0 1 0 13"])), label: "Listen" },
+  { separator: true },
+  { icon: metal(svg("user", ["M12 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8z", "M4 21a8 8 0 0 1 16 0"])), label: "Profile" },
+];
+
+/** Resolves once fonts are loaded and 3 frames in a row land under 25ms, or after 400ms regardless. The dashboard mounts a dozen WebGL rings and the orb at once; animating through that init drops frames and the icons judder. */
+const settled = async () => {
+  await document.fonts.ready;
+  await new Promise<void>((done) => {
+    const t0 = performance.now();
+    let last = t0;
+    let calm = 0;
+    const tick = (now: number) => {
+      calm = now - last < 25 ? calm + 1 : 0;
+      last = now;
+      if (calm >= 3 || now - t0 > 400) done();
+      else requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+};
+
+const ORB_PX = 450;
+/** The sphere fills ~80% of the Orb canvas; the rest is transparent padding. Layout math uses the visible size, or the separated pair sits too far apart. */
+const ORB_FILL = 0.8;
+const DOCK_BOTTOM = 100;
+/** Gap between the sent-state chat card and the bottom edge. */
+const BOTTOM = 64;
 
 export default function Dashboard() {
-  const [m, setM] = useState<Manifest | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-  const [sel, setSel] = useState<number | null>(null);
-  const [playing, setPlaying] = useState<string | null>(null);
-  const audio = useRef<HTMLAudioElement | null>(null);
-
+  // MetalFx renders a placeholder on the server and a WebGL canvas on the client — mounting after hydration avoids the mismatch.
+  const [ready, setReady] = useState(false);
+  useEffect(() => setReady(true), []);
+  const dockWrap = useRef<HTMLDivElement>(null);
+  const chat = useRef<HTMLDivElement>(null);
+  const orb = useRef<HTMLDivElement>(null);
+  const form = useRef<HTMLFormElement>(null);
+  // Flips on the first send; the orb and card split apart from then on (see the layout effect below).
+  const [sent, setSent] = useState(false);
+  // Anchor point under the Profile icon, or null when the popover is closed.
+  const [profileAt, setProfileAt] = useState<{ x: number; y: number } | null>(null);
+  // Intro drops each icon in one at a time with a SINGLE overshoot (back.out, not bounce.out). Translate only, NEVER scale — MetalFx sizes its WebGL ring from getBoundingClientRect, so a scaled item bakes a wrong-size border. clearProps hands transform back to Dock's per-frame magnification — leftover inline transform would fight it.
+  // Layout effect so the dock and chat are hidden BEFORE first paint; the animation then waits for the page to settle (see settled) — starting it while the WebGL rings and orb are still initializing is what made it lag and look jagged.
+  useLayoutEffect(() => {
+    if (!ready) return;
+    let cancelled = false;
+    const ctx = gsap.context(() => gsap.set([".dock-item", chat.current], { opacity: 0 }), dockWrap);
+    settled().then(() => {
+      if (cancelled) return;
+      ctx.add(() => {
+        // fromTo, not from: the layout effect already set opacity 0, and from() would read that as the END value.
+        const dock = gsap.fromTo(".dock-item", { y: -70, opacity: 0 }, { y: 0, opacity: 1, duration: 0.6, ease: "back.out(2.4)", stagger: 0.18, clearProps: "transform,opacity", });
+        // Chat fades in once the last icon lands. Opacity only — the wrapper's translate centers it, and clearProps there would drop that.
+        gsap.fromTo(chat.current, { opacity: 0 }, { opacity: 1, duration: 0.8, ease: "power1.out", clearProps: "opacity", delay: dock.totalDuration() });
+      });
+    });
+    return () => {
+      cancelled = true;
+      ctx.revert();
+    };
+  }, [ready]);
+  // Dismiss on Escape or any click outside the popover and the Profile icon (the icon's own click toggles it).
   useEffect(() => {
-    fetch(D + "results.json")
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`results.json ${r.status}`))))
-      .then((j: Manifest) => {
-        setM(j);
-        setSel(j.pick);
-      })
-      .catch((e) => setErr(String(e)));
-  }, []);
+    if (!profileAt) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setProfileAt(null);
+    const onDown = (e: PointerEvent) => {
+      const t = e.target as Element;
+      if (!t.closest("[data-profile-pop]") && !t.closest('[aria-label="Profile"]')) setProfileAt(null);
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("pointerdown", onDown);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("pointerdown", onDown);
+    };
+  }, [profileAt]);
+  // Capture Ear: camOn mounts the feed panel; photo is the still taken from it (null while live). ponytail: the photo only lives in state until the backend upload (POST /api/patients) is wired.
+  const [camOn, setCamOn] = useState(false);
+  const [camErr, setCamErr] = useState<string | null>(null);
+  const [photo, setPhoto] = useState<{ blob: Blob; url: string } | null>(null);
+  // Software zoom (CSS scale on the feed, same crop baked into the snapshot) — most webcams expose no hardware zoom constraint. ponytail: use track.applyConstraints({zoom}) where supported if quality matters.
+  const [zoom, setZoom] = useState(1);
+  const camPanel = useRef<HTMLDivElement>(null);
+  const camInner = useRef<HTMLDivElement>(null);
+  const camVideo = useRef<HTMLVideoElement>(null);
+  const stream = useRef<MediaStream | null>(null);
+  const stopStream = () => {
+    stream.current?.getTracks().forEach((t) => t.stop());
+    stream.current = null;
+  };
+  // Stream tracks outlive the component — leaving them running keeps the camera light on after navigation.
+  useEffect(() => stopStream, []);
+  // The panel grows from the chat card's top edge: the wrapper's height clips while the content rises out from behind the card. Height animates on this plain-bordered wrapper, NEVER on a MetalFx — it sizes its ring from getBoundingClientRect once.
+  useEffect(() => {
+    if (!camOn) return;
+    const v = camVideo.current;
+    if (v && stream.current) {
+      v.srcObject = stream.current;
+      v.play().catch(() => {});
+    }
+    const ctx = gsap.context(() => {
+      gsap.fromTo(camPanel.current, { height: 0, marginBottom: 0, borderWidth: 0 }, { height: "auto", marginBottom: 12, borderWidth: 2, duration: 0.6, ease: "power3.out" });
+      gsap.fromTo(camInner.current, { yPercent: 100 }, { yPercent: 0, duration: 0.6, ease: "power3.out" });
+    });
+    return () => ctx.revert();
+  }, [camOn]);
+  // After the first send the card slides down to the bottom and the orb rises into the space above it. Card moves by marginTop on the wrapper (its translate does the centering); the orb tween subtracts that same shift. Camera mode returns both to center — the feed is sized for a centered stack. ponytail: measured on send/camera toggle only, not on window resize.
+  useLayoutEffect(() => {
+    const w = chat.current, o = orb.current, f = form.current;
+    if (!w || !o || !f) return;
+    let shift = 0, orbY = 0, s = 1;
+    if (sent && !camOn) {
+      // Card drops to BOTTOM px above the screen edge; the orb centers in the gap between the dock icons' bottom edge (DOCK_BOTTOM: dock top 12 + (panelHeight 100 - item 76) / 2 + 76) and the Capture Ear button's top (card top - 40 button - 12 margin), shrinking only when that gap is too short.
+      const vh = window.innerHeight, h = f.offsetHeight, bar = 52, gap = 8;
+      shift = vh - BOTTOM - h / 2 - vh / 2;
+      const capTop = vh - BOTTOM - h - bar;
+      s = Math.min(1, (capTop - DOCK_BOTTOM - 2 * gap) / (ORB_PX * ORB_FILL));
+      orbY = (DOCK_BOTTOM + capTop) / 2 - (vh / 2 + shift);
+    }
+    const ctx = gsap.context(() => {
+      gsap.to(w, { marginTop: shift, duration: 0.9, ease: "power3.inOut" });
+      gsap.to(o, { y: orbY, scale: s, duration: 0.9, ease: "power3.inOut" });
+    });
+    return () => ctx.kill();
+  }, [ready, sent, camOn]);
+  if (!ready) return null;
 
-  if (err) return <p style={{ position: "relative", padding: 40 }}>Could not load results: {err}</p>;
-  if (!m) return <p style={{ position: "relative", padding: 40 }}>Loading…</p>;
-
-  const ranked = [...m.experiments].sort((a, b) => b.score - a.score);
-  const cur = m.experiments.find((e) => e.id === sel) ?? ranked[0];
-  const pick = m.experiments.find((e) => e.id === m.pick) ?? ranked[0];
-
-  const play = (key: string, file: string) => {
-    audio.current?.pause();
-    const a = new Audio(D + file);
-    a.onended = () => setPlaying(null);
-    audio.current = a;
-    setPlaying(key);
-    a.play().catch(() => setPlaying(null));
+  const openCam = async () => {
+    setCamErr(null);
+    try {
+      stream.current = await navigator.mediaDevices.getUserMedia({ video: true });
+    } catch {
+      setCamErr("Camera unavailable");
+      return;
+    }
+    if (photo) URL.revokeObjectURL(photo.url);
+    setPhoto(null);
+    setZoom(1);
+    setCamOn(true);
+  };
+  const clearPhoto = () => {
+    if (photo) URL.revokeObjectURL(photo.url);
+    setPhoto(null);
+  };
+  const closeCam = () => {
+    gsap.to(camPanel.current, { height: 0, marginBottom: 0, borderWidth: 0, duration: 0.45, ease: "power2.in", onComplete: () => { stopStream(); setCamOn(false); } });
+    gsap.to(camInner.current, { yPercent: 100, duration: 0.45, ease: "power2.in" });
+  };
+  const snap = () => {
+    const v = camVideo.current;
+    if (!v || !v.videoWidth) return;
+    // WYSIWYG: the feed is object-fit cover inside the panel, then scaled by zoom about the center — crop the same region from the full-resolution frame.
+    const pa = v.clientWidth / v.clientHeight;
+    const cw = v.videoWidth / v.videoHeight > pa ? v.videoHeight * pa : v.videoWidth;
+    const sw = cw / zoom;
+    const sh = sw / pa;
+    const c = document.createElement("canvas");
+    c.width = Math.round(sw);
+    c.height = Math.round(sh);
+    c.getContext("2d")?.drawImage(v, (v.videoWidth - sw) / 2, (v.videoHeight - sh) / 2, sw, sh, 0, 0, c.width, c.height);
+    c.toBlob((blob) => {
+      if (!blob) return;
+      stopStream();
+      setPhoto({ blob, url: URL.createObjectURL(blob) });
+      // The still becomes a chat attachment (chip in the composer), so the panel retracts instead of lingering over it.
+      closeCam();
+    }, "image/jpeg", 0.92);
   };
 
-  const items = [
-    { icon: icons.ear, label: "Ear and horn", onClick: () => jump("ear") },
-    { icon: icons.profile, label: "Ear profile", onClick: () => jump("profile") },
-    { icon: icons.cochlea, label: "Cochlea", onClick: () => jump("cochlea") },
-    { icon: icons.experiments, label: "Experiments", badge: m.experiments.length, onClick: () => jump("experiments") },
-    { separator: true },
-    { icon: icons.listen, label: "Listen", onClick: () => jump("listen") },
-  ];
+  // The Dock calls item.onClick with no arguments, so find the icon in the DOM to anchor the popover under it.
+  const toggleProfile = () => {
+    const el = dockWrap.current?.querySelector('[aria-label="Profile"]');
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    setProfileAt((cur) => (cur ? null : { x: r.left + r.width / 2, y: r.bottom + 10 }));
+  };
+  const dockItems = items.map((it) => (it.label === "Profile" ? { ...it, onClick: toggleProfile } : it));
+
+  const iconBtn = { display: "flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, borderRadius: 999, cursor: "pointer", font: "inherit" } as const;
+  const zoomBtn = { ...iconBtn, width: 38, height: 38, border: 0, background: "rgba(0,0,0,0.55)", color: "#e6e8eb" } as const;
+  const icon = { width: 18, height: 18, fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" } as const;
 
   return (
     <>
-      {/* The dock positions itself against its nearest positioned parent, so this fixed strip is the "top of the screen". It is click-through; the dock opts back in. */}
-      <div style={{ position: "fixed", top: 0, left: 0, right: 0, height: 100, zIndex: 20, pointerEvents: "none" }}>
-        <Dock
-          items={items}
-          position="top"
-          showIndicators={false}
-          style={{
-            pointerEvents: "auto",
-            // Tray is see-through: only the icon tiles draw. Both backdrop-filter spellings or Safari keeps the blur.
-            "--dock-panel": "transparent",
-            "--dock-panel-edge": "transparent",
-            "--dock-panel-highlight": "transparent",
-            "--dock-panel-shadow": "0 0 0 0 transparent",
-            backdropFilter: "none",
-            WebkitBackdropFilter: "none",
-          }}
-        />
-      </div>
-    <div style={{ position: "relative", maxWidth: 1200, margin: "0 auto", padding: "120px 24px 80px", display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))" }}>
-      <section id="ear" style={{ ...panel, gridColumn: "span 2", minHeight: 320 }}>
-        <h2 style={h2}>Ear and horn</h2>
-        {/* ponytail: placeholder — three.js + GLTFLoader once ear.glb / horn_*.glb exist (npm i three). */}
-        <div style={{ height: 260, display: "grid", placeItems: "center", border: "1px dashed rgba(255,255,255,0.25)", color: "#9aa0a8", textAlign: "center" }}>
-          3D viewer pending<br />
-          {m.ear.mesh} + {cur.mesh}
-        </div>
-      </section>
-
-      <section id="profile" style={panel}>
-        <h2 style={h2}>Ear profile</h2>
-        <Audiogram points={m.ear.audiogram} />
-        <p style={{ margin: "12px 0 0", fontSize: 14, lineHeight: 1.6 }}>
-          Canal volume {m.ear.canal_band.volume_cc[0]}–{m.ear.canal_band.volume_cc[1]} cc ({m.ear.canal_band.samples} samples)
-          <br />
-          Outer hair cells {m.ear.cohc} · inner hair cells {m.ear.cihc}
-        </p>
-      </section>
-
-      <section id="cochlea" style={{ ...panel, gridColumn: "1 / -1" }}>
-        <h2 style={h2}>Cochlea — reference vs. design {cur.id}</h2>
-        <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))" }}>
-          {[
-            ["Healthy reference", m.reference_neurogram],
-            [`Design ${cur.id} (score ${cur.score.toFixed(2)})`, cur.neurogram],
-          ].map(([label, src]) => (
-            <figure key={label} style={{ margin: 0 }}>
-              {/* eslint-disable-next-line @next/next/no-img-element -- manifest PNGs are static, sizes unknown */}
-              <img src={D + src} alt={label} style={{ width: "100%", height: 160, objectFit: "fill", imageRendering: "pixelated" }} />
-              <figcaption style={{ fontSize: 13, color: "#9aa0a8", marginTop: 6 }}>{label}</figcaption>
-            </figure>
-          ))}
-        </div>
-      </section>
-
-      <section id="experiments" style={{ ...panel, gridColumn: "1 / -1" }}>
-        <h2 style={h2}>{m.experiments.length} experiments — click one to select it</h2>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-          {ranked.map((e) => (
-            <button key={e.id} onClick={() => setSel(e.id)} aria-pressed={e.id === sel} style={btn(e.id === sel)}>
-              #{e.id} · {e.score.toFixed(2)}
-              {e.id === m.pick ? " ★" : ""}
+    {/* ponytail: no backend yet, so send only clears the box; plus is inert. Width 600 approximates the dock's resting width — retune if the dock changes. */}
+    <div ref={chat} style={{ position: "fixed", top: "50%", left: "50%", transform: "translate(-50%, -50%)", width: 600, maxWidth: "calc(100vw - 32px)", zIndex: 10 }}>
+    {/* Orb draws at full resolution (components/Orb.tsx), so size is plain pixels. zIndex -1 sits behind the card and bar inside this wrapper's stacking context. The inner div carries the post-send y/scale tween, so GSAP NEVER rewrites the centering translate on the outer one. */}
+    <div aria-hidden style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)", zIndex: -1, pointerEvents: "none" }}>
+      <div ref={orb} data-testid="orb"><Orb px={ORB_PX} /></div>
+    </div>
+    {/* Bar floats above the card (bottom: 100%) so the card stays centered, and hugs its content. While the camera is ON the bar joins the flow instead, so the wrapper (centered by its translate) re-centers feed + card together and the card is pushed down. Inert until capture is wired. Grey matches the textarea placeholder. */}
+    <div style={camOn ? { display: "flex", justifyContent: "center" } : { position: "absolute", bottom: "100%", left: 0, right: 0, marginBottom: 12, display: "flex", justifyContent: "center" }}>
+      {!camOn && <div style={{ background: "#000", borderRadius: 20 }}>
+      <MetalFx variant="button" preset="silver" theme="dark" innerShadow ringCssPx={2} borderRadius={20}>
+        <button type="button" onClick={openCam} style={{ display: "flex", alignItems: "center", gap: 8, height: 40, padding: "0 24px", border: 0, borderRadius: 20, background: "#000", color: camErr ? "#f87171" : "#757575", cursor: "pointer", font: "inherit", fontSize: 16 }}>
+          <svg viewBox="0 0 24 24" width="1.1em" height="1.1em" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M4 8h3l2-3h6l2 3h3v11H4z" /><path d="M12 10a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z" /></svg>
+          {camErr ?? "Capture Ear"}
+        </button>
+      </MetalFx>
+      </div>}
+      {/* Camera panel REPLACES the Capture Ear button above the card. It is in flow, so growing its height shoves the card down while the centered wrapper keeps the pair centered. The 12px gap is animated on the panel (not the bar) so the swap back to the floating button does not jump the card; border is a box-shadow for the same reason. Height cap keeps the pair clear of the 140px dock; see the camOn effect. */}
+      {camOn && (
+        <div ref={camPanel} style={{ width: "100%", overflow: "hidden", borderRadius: 24, border: "2px solid transparent", background: `linear-gradient(#000, #000) padding-box, ${SILVER} border-box` }}>
+          <div ref={camInner} style={{ position: "relative", height: "max(180px, min(340px, calc(100vh - 420px)))" }}>
+            <video ref={camVideo} muted playsInline style={{ width: "100%", height: "100%", objectFit: "cover", display: "block", transform: `scaleX(-1) scale(${zoom})` }} />
+            {photo && <img src={photo.url} alt="Captured ear" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", transform: "scaleX(-1)" }} />}
+            <button type="button" aria-label="Close camera" onClick={closeCam} style={{ position: "absolute", top: 12, right: 12, width: 32, height: 32, borderRadius: 999, border: 0, background: "rgba(0,0,0,0.55)", color: "#e6e8eb", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <svg viewBox="0 0 24 24" {...icon}><path d="M6 6l12 12M18 6 6 18" /></svg>
             </button>
-          ))}
+            {!photo && (
+              <div style={{ position: "absolute", bottom: 16, left: 0, right: 0, display: "flex", flexDirection: "column", alignItems: "center", gap: 10 }}>
+                <span style={{ padding: "3px 10px", borderRadius: 999, background: "rgba(0,0,0,0.55)", color: "#e6e8eb", fontSize: 13, fontVariantNumeric: "tabular-nums" }}>{zoom.toFixed(1)}×</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 28 }}>
+                  <button type="button" aria-label="Zoom out" disabled={zoom <= 1} onClick={() => setZoom((z) => Math.max(1, z - 0.5))} style={{ ...zoomBtn, opacity: zoom <= 1 ? 0.4 : 1 }}>
+                    <svg viewBox="0 0 24 24" {...icon}><path d="M5 12h14" /></svg>
+                  </button>
+                  <button type="button" aria-label="Take picture" onClick={snap} style={{ width: 52, height: 52, padding: 0, borderRadius: 999, border: "3px solid #fff", background: "rgba(255,255,255,0.85)", boxShadow: "0 0 0 3px rgba(0,0,0,0.35) inset", cursor: "pointer" }} />
+                  <button type="button" aria-label="Zoom in" disabled={zoom >= 4} onClick={() => setZoom((z) => Math.min(4, z + 0.5))} style={{ ...zoomBtn, opacity: zoom >= 4 ? 0.4 : 1 }}>
+                    <svg viewBox="0 0 24 24" {...icon}><path d="M12 5v14M5 12h14" /></svg>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
-      </section>
-
-      <section id="listen" style={{ ...panel, gridColumn: "1 / -1", display: "flex", flexWrap: "wrap", gap: 12 }}>
-        <button onClick={() => play("unaided", m.unaided.audio)} style={btn(playing === "unaided")}>▶ Unaided</button>
-        <button onClick={() => play("sel", cur.audio)} style={btn(playing === "sel")}>▶ This design (#{cur.id})</button>
-        <button onClick={() => play("pick", pick.audio)} style={btn(playing === "pick")}>▶ Agent&apos;s pick (#{pick.id})</button>
-      </section>
+      )}
+    </div>
+    <div style={{ background: "#000", borderRadius: 24 }}>
+    <MetalFx variant="button" preset="silver" theme="dark" innerShadow ringCssPx={2} borderRadius={24} style={{ width: "100%" }}>
+    <form
+      ref={form}
+      onSubmit={(e) => {
+        e.preventDefault();
+        const ta = e.currentTarget.elements.namedItem("msg") as HTMLTextAreaElement;
+        if (ta.value.trim() || photo) {
+          ta.value = "";
+          setSent(true);
+        }
+        clearPhoto();
+      }}
+      style={{ boxSizing: "border-box", width: "100%", padding: 14, borderRadius: 24, background: "#000" }}
+    >
+      {photo && (
+        <div data-testid="attachment" style={{ position: "relative", width: 64, height: 64, margin: "0 6px 8px" }}>
+          <img src={photo.url} alt="Captured ear attachment" style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: 12, transform: "scaleX(-1)" }} />
+          <button type="button" aria-label="Remove attachment" onClick={clearPhoto} style={{ position: "absolute", top: -6, right: -6, width: 20, height: 20, padding: 0, borderRadius: 999, border: 0, background: "#3b3d42", color: "#e6e8eb", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
+          </button>
+        </div>
+      )}
+      <textarea
+        name="msg"
+        rows={2}
+        placeholder="How can I help you today?"
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            e.currentTarget.form?.requestSubmit();
+          }
+        }}
+        style={{ display: "block", width: "100%", boxSizing: "border-box", resize: "none", border: 0, outline: 0, background: "transparent", color: "#e6e8eb", font: "inherit", fontSize: 16, padding: "4px 6px" }}
+      />
+      <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8 }}>
+        <button type="button" aria-label="Add" style={{ ...iconBtn, border: "1px solid rgba(255,255,255,0.18)", background: "transparent", color: "#c9ccd1" }}>
+          <svg viewBox="0 0 24 24" {...icon}><path d="M12 5v14M5 12h14" /></svg>
+        </button>
+        <button type="submit" aria-label="Send" style={{ ...iconBtn, border: 0, background: "#3b82f6", color: "#fff" }}>
+          <svg viewBox="0 0 24 24" {...icon}><path d="M12 19V5M5 12l7-7 7 7" /></svg>
+        </button>
+      </div>
+    </form>
+    </MetalFx>
+    </div>
+    </div>
+    {/* The dock positions itself against its nearest positioned parent, so this fixed strip is the "top of the screen". It is click-through; the dock opts back in. */}
+    <div ref={dockWrap} style={{ position: "fixed", top: 0, left: 0, right: 0, height: 140, zIndex: 20, pointerEvents: "none" }}>
+      <Dock
+        items={dockItems}
+        position="top"
+        tiles={false}
+        showIndicators={false}
+        roundness={0}
+        baseItemSize={76}
+        magnification={108}
+        panelHeight={100}
+        gap={16}
+        style={{
+          pointerEvents: "auto",
+          // Tray is see-through: only the metal squares draw. Both backdrop-filter spellings or Safari keeps the blur.
+          "--dock-panel": "transparent",
+          "--dock-panel-edge": "transparent",
+          "--dock-panel-highlight": "transparent",
+          "--dock-panel-shadow": "0 0 0 0 transparent",
+          backdropFilter: "none",
+          WebkitBackdropFilter: "none",
+        }}
+      />
+      {profileAt && (
+        <div
+          data-profile-pop=""
+          style={{ position: "fixed", left: profileAt.x, top: profileAt.y, transform: "translateX(-50%)", pointerEvents: "auto", zIndex: 30 }}
+        >
+          <button
+            type="button"
+            onClick={async () => {
+              await supabase?.auth.signOut();
+              window.location.assign("/");
+            }}
+            style={{
+              padding: "8px 18px",
+              border: "1px solid rgba(255,255,255,0.18)",
+              borderRadius: 999,
+              background: "rgba(10,10,12,0.85)",
+              color: "#e6e8eb",
+              font: "inherit",
+              fontSize: 14,
+              letterSpacing: "0.04em",
+              cursor: "pointer",
+              boxShadow: "0 8px 24px rgba(0,0,0,0.6)",
+            }}
+          >
+            sign out
+          </button>
+        </div>
+      )}
     </div>
     </>
   );
