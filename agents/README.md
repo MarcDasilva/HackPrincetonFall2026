@@ -245,6 +245,12 @@ A result that does not match its spec is recorded as `invalid` and excluded from
 Extra fields in results and capabilities are preserved.
 
 To request a retry of the identical spec, return `status: "failed"` with `error.transient: true`, or raise `horn_study.evaluator_adapter.TransientEvaluatorError`.
+
+An evaluator may also provide an optional third call, `check_buildable(spec)`.
+It returns `None` when the candidate can be built, or `{"code", "message"}` with the reason when it cannot, and it never scores anything.
+When it exists, plan validation test-builds every design before the plan is frozen and sends each rejection back to the coordinator to correct.
+This catches designs whose dials are each in range but do not fit together, which would otherwise fail in every scenario after the plan was locked.
+A rejected draft uses one of the plan's `max_plan_revisions`, so a request for a real evaluator should allow a few more than the default of 2.
 Any other failure is recorded once as a failed case.
 
 The adapter does not normalize levels or rescale outputs.

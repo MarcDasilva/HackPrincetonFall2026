@@ -73,6 +73,10 @@ HASPI_RESOLUTION = 0.02
 # A study must cover enough listening conditions that one noisy condition cannot decide it.
 MINIMUM_SCENARIOS = 4
 _PLANNING_NOTES = (
+    "Every design in a plan is test-built in this ear before the plan is frozen. Whether a design "
+    "fits depends on the combination of its dials, not on each dial's range alone, so a design can "
+    "be rejected even with every value in range. When one is rejected, change the dials the builder "
+    "names (for example a smaller mouth or a wider throat) instead of resubmitting the same values.",
     "Evaluations are cheap here: building a candidate's geometry and scoring one scenario each take "
     "seconds. Use the budget to cover clean speech and speech in babble at every presentation level, "
     "with a handful of candidates, in preference to many candidates in few scenarios.",
