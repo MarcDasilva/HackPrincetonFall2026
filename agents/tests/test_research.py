@@ -274,3 +274,104 @@ async def test_only_one_finding_per_investigator_may_rest_on_a_non_scholarly_sou
         "scholarly",
         "scholarly",
     ]
+
+
+# --------------------------------------------------------------------------
+# Open-access copies
+# --------------------------------------------------------------------------
+
+ALT = "https://repository.example.org/paper.pdf"
+LONG_TEXT = "The horn was measured on a coupler and the response peaked near three kilohertz. " * 80
+ABSTRACT = "The abstract states one precise thing about horn length and response. " * 4
+
+
+class CopySearch:
+    """One hit whose landing page is URL and whose open-access copy is ALT."""
+
+    async def search(self, query, limit=6):
+        hit = SearchHit(
+            title="A paper with an open copy",
+            url=URL,
+            year=2021,
+            authors="B",
+            venue="J",
+            snippet="short",
+            open_access=True,
+            backend="fake",
+            abstract=ABSTRACT,
+            alternates=(ALT,),
+        )
+        return [hit], []
+
+
+class CopyReader:
+    """Serves a fixed text per URL. A missing URL is unreadable."""
+
+    def __init__(self, texts: dict[str, str]) -> None:
+        self.texts = texts
+        self.fetched: list[str] = []
+
+    async def fetch(self, url: str):
+        from horn_study.sources import FetchedSource
+
+        self.fetched.append(url)
+        if url not in self.texts:
+            raise SourceUnavailable("The server answered HTTP 403.")
+        return FetchedSource(
+            url=url,
+            final_url=url,
+            title="A paper with an open copy",
+            content_type="pdf",
+            text=self.texts[url],
+        )
+
+
+async def test_an_unreadable_page_is_read_from_the_open_access_copy_the_search_listed():
+    reader = CopyReader({ALT: LONG_TEXT})
+    s, _ = session(reader=reader, search=CopySearch())
+    await s.search_literature("x")
+    message, files = await s.read_source(URL, "horn")
+
+    assert reader.fetched == [URL, ALT]
+    assert "abstract" not in message.split("Passages")[0]
+    assert s.calls_used == 2
+    (source,) = s._ledger.sources
+    assert (source.url, source.final_url, source.content_type) == (URL, ALT, "pdf")
+    assert source.char_count == len(LONG_TEXT)
+    assert list(files) == ["/sources/S1.txt"]
+    sentence = "The horn was measured on a coupler and the response peaked near three kilohertz."
+    assert s.record_finding(source=URL, evidence_passage=sentence, **FINDING).startswith("Recorded")
+    again, _ = await s.read_source(ALT, "horn")
+    assert "Already read" in again
+
+
+async def test_a_short_landing_page_gives_way_to_a_longer_open_access_copy():
+    reader = CopyReader({URL: "A landing page with a title and little else. " * 12, ALT: LONG_TEXT})
+    s, _ = session(reader=reader, search=CopySearch())
+    await s.search_literature("x")
+    await s.read_source(URL, "horn")
+
+    assert reader.fetched == [URL, ALT]
+    (source,) = s._ledger.sources
+    assert source.final_url == ALT
+    assert source.char_count == len(LONG_TEXT)
+
+
+async def test_a_page_that_already_has_the_full_text_is_not_fetched_twice():
+    reader = CopyReader({URL: LONG_TEXT, ALT: LONG_TEXT})
+    s, _ = session(reader=reader, search=CopySearch())
+    await s.search_literature("x")
+    await s.read_source(URL, "horn")
+    assert reader.fetched == [URL]
+
+
+async def test_when_no_copy_is_readable_the_abstract_is_used_and_said_to_be_one():
+    reader = CopyReader({})
+    s, _ = session(reader=reader, search=CopySearch())
+    await s.search_literature("x")
+    message, _ = await s.read_source(URL, "horn")
+
+    assert reader.fetched == [URL, ALT]
+    assert "Only the abstract could be retrieved" in message
+    (source,) = s._ledger.sources
+    assert source.content_type == "abstract_only"

@@ -30,6 +30,11 @@ USER_AGENT = "horn-study-research/0.1 (literature research agent)"
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MIN_USEFUL_CHARS = 400
 MIN_ABSTRACT_RECORD_CHARS = 200
+# A source counts as full text when it is not an abstract and is at least this long. Shorter
+# pages are usually a landing page or a summary, and support a claim no better than an abstract.
+FULL_TEXT_MIN_CHARS = 5000
+# How many other copies of a paper a search hit may list, and a read may try.
+MAX_ALTERNATE_COPIES = 3
 # NCBI allows three E-utilities requests per second from one address without an API key, and
 # answers HTTP 429 at exactly that rate. Two per second leaves room for its counting window.
 EUTILS_MIN_INTERVAL_SECONDS = 0.5
@@ -48,6 +53,8 @@ class SearchHit:
     backend: str
     doi: str | None = None
     abstract: str = ""
+    # Other places the same paper can be read, best first: open-access PDFs, then the landing page.
+    alternates: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -187,8 +194,8 @@ class OpenAlexBackend:
             "search": query,
             "per-page": limit,
             "select": (
-                "id,doi,title,publication_year,authorships,primary_location,"
-                "best_oa_location,open_access,abstract_inverted_index"
+                "id,ids,doi,title,publication_year,authorships,primary_location,"
+                "best_oa_location,open_access,locations,abstract_inverted_index"
             ),
         }
         if self._api_key:
@@ -203,7 +210,7 @@ class OpenAlexBackend:
             best = work.get("best_oa_location") or {}
             primary = work.get("primary_location") or {}
             oa = work.get("open_access") or {}
-            url = (
+            landing = (
                 best.get("landing_page_url")
                 or best.get("pdf_url")
                 or oa.get("oa_url")
@@ -211,6 +218,16 @@ class OpenAlexBackend:
                 or work.get("doi")
                 or work.get("id")
             )
+            # A PubMed Central copy is read through its API and is the most reliable full text.
+            # Publisher landing pages often refuse automated readers, so they come last.
+            url = (work.get("ids") or {}).get("pmcid") or landing
+            copies = [
+                best.get("pdf_url"),
+                oa.get("oa_url"),
+                *(location.get("pdf_url") for location in (work.get("locations") or [])),
+                landing,
+            ]
+            alternates = tuple(dict.fromkeys(copy for copy in copies if copy and copy != url))
             authors = ", ".join(
                 (a.get("author") or {}).get("display_name", "") for a in (work.get("authorships") or [])[:4]
             )
@@ -227,6 +244,7 @@ class OpenAlexBackend:
                     backend=self.name,
                     doi=_bare_doi(work.get("doi")),
                     abstract=abstract,
+                    alternates=alternates[:MAX_ALTERNATE_COPIES],
                 )
             )
         return hits

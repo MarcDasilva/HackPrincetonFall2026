@@ -38,6 +38,7 @@ from horn_study.contracts import (
 )
 from horn_study.events import EventBus
 from horn_study.sources import (
+    FULL_TEXT_MIN_CHARS,
     FetchedSource,
     Reader,
     Search,
@@ -134,6 +135,8 @@ from text you read. The full text of every source you read is saved under /sourc
 grep and read_file can locate exact wording. Put the claim in your own words, and say how \
 far it applies to this device and this evaluator and what limits it.
 - You have {budget} search and read calls in total. When they run out, finish with what you have.
+- Work in parallel. When you have several searches or several sources in mind, call the tool \
+for all of them in the same turn instead of one at a time.
 - Suggest only scenarios, metrics, geometry families, and parameter values that appear in the \
 evaluator capabilities. Ideas the evaluator cannot run belong under future_work.
 - Report conflicting or missing evidence as it is. An honest gap is more useful than a \
@@ -343,7 +346,7 @@ class ResearchSession:
         if exhausted:
             return exhausted, {}
         try:
-            fetched = await self._reader.fetch(url)
+            fetched = await self._fetch_best_copy(url)
         except SourceUnavailable as error:
             hit = self._abstracts.get(url.rstrip("/"))
             if hit is None or len(hit.abstract) < MIN_ABSTRACT_CHARS:
@@ -378,6 +381,32 @@ class ResearchSession:
             else f"Full text saved at {path}."
         )
         return self._describe(record, fetched.text, focus, note=note), {path: create_file_data(fetched.text)}
+
+    async def _fetch_best_copy(self, url: str) -> FetchedSource:
+        """Read a source, trying the open-access copies a search listed when the page falls short.
+
+        A page that will not load, or that holds little more than a title and an abstract, is
+        followed by each other copy of the same paper until one has the full text. The longest
+        text read wins. Still one call: the investigator asked for one source.
+        """
+        hit = self._abstracts.get(url.rstrip("/"))
+        best: FetchedSource | None = None
+        refused: SourceUnavailable | None = None
+        for candidate in (url, *(hit.alternates if hit else ())):
+            try:
+                got = await self._reader.fetch(candidate)
+            except SourceUnavailable as error:
+                refused = refused or error
+                continue
+            # Keep the address that was asked for. `final_url` says where the text came from.
+            got = replace(got, url=url)
+            if best is None or len(got.text) > len(best.text):
+                best = got
+            if len(got.text) >= FULL_TEXT_MIN_CHARS:
+                break
+        if best is None:
+            raise refused or SourceUnavailable("The source could not be read.")
+        return best
 
     def _describe(self, record: SourceRecord, text: str, focus: str, *, note: str) -> str:
         return (

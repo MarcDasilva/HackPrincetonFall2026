@@ -7,7 +7,7 @@ import asyncio
 import httpx
 import pytest
 
-from horn_study.sources import HttpReader, Pacer, SourceUnavailable, extract_jats_text
+from horn_study.sources import HttpReader, OpenAlexBackend, Pacer, SourceUnavailable, extract_jats_text
 
 PARAGRAPH = "Listeners were tested twice within fourteen days and the thresholds were compared. " * 6
 JATS = f"""<?xml version="1.0" ?>
@@ -235,3 +235,59 @@ async def test_pubmed_records_and_articles_share_one_pace():
     await reader.fetch("https://pmc.ncbi.nlm.nih.gov/articles/PMC4668587/")
     await reader.fetch("https://pubmed.ncbi.nlm.nih.gov/16212766/")
     assert waits == ["wait", "wait"]
+
+
+async def test_a_search_hit_points_at_the_readable_copy_and_lists_the_others():
+    """OpenAlex names the open-access copies of a paper. A landing page alone is often unreadable."""
+    works = {
+        "results": [
+            {
+                "id": "https://openalex.org/W1",
+                "doi": "https://doi.org/10.1098/rsos.210342",
+                "title": "Effects of reverberation on speech intelligibility in noise",
+                "publication_year": 2022,
+                "ids": {"pmcid": "https://www.ncbi.nlm.nih.gov/pmc/articles/9428532"},
+                "best_oa_location": {
+                    "landing_page_url": "https://doi.org/10.1098/rsos.210342",
+                    "pdf_url": "https://royalsocietypublishing.org/doi/pdf/10.1098/rsos.210342",
+                },
+                "open_access": {
+                    "is_oa": True,
+                    "oa_url": "https://royalsocietypublishing.org/doi/pdf/10.1098/rsos.210342",
+                },
+                "locations": [
+                    {"pdf_url": "https://royalsocietypublishing.org/doi/pdf/10.1098/rsos.210342"},
+                    {"pdf_url": "https://backup.example.org/rsos.pdf"},
+                    {"pdf_url": None},
+                ],
+            },
+            {
+                "id": "https://openalex.org/W2",
+                "doi": "https://doi.org/10.1121/10.0001037",
+                "title": "Shape optimization of acoustic horns",
+                "best_oa_location": {
+                    "landing_page_url": "https://doi.org/10.1121/10.0001037",
+                    "pdf_url": None,
+                },
+                "open_access": {"is_oa": True, "oa_url": "https://doi.org/10.1121/10.0001037"},
+            },
+        ]
+    }
+    asked: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(request)
+        return httpx.Response(200, json=works)
+
+    backend = OpenAlexBackend(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    first, second = await backend.search("reverberation", 6)
+
+    assert {"ids", "locations"} <= set(asked[0].url.params["select"].split(","))
+    assert first.url == "https://www.ncbi.nlm.nih.gov/pmc/articles/9428532"
+    assert first.alternates == (
+        "https://royalsocietypublishing.org/doi/pdf/10.1098/rsos.210342",
+        "https://backup.example.org/rsos.pdf",
+        "https://doi.org/10.1098/rsos.210342",
+    )
+    assert second.url == "https://doi.org/10.1121/10.0001037"
+    assert second.alternates == ()
