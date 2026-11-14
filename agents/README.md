@@ -208,6 +208,13 @@ The amplitude and calibration convention is defined by the evaluator and named b
 `horn_study.hornsim_evaluator` connects `evaluation_mode: "real"` to the backend's `hornsim` pipeline (see `../backend/HORNSIM.md`).
 It builds the 3D aid in the configured ear, models its insertion gain with the 1D acoustic model, applies that gain to the speech clips, and scores them with HASPI v2 using the supplied audiogram.
 
+What the model says about this device, so results are read correctly:
+A narrow throat feeding the ear canal is a low-pass filter, so the hornsim default (throat 1 mm^2) sits 10 to 25 dB below the open ear above 500 Hz and scores worse than no device.
+Widening the throat is what brings 1 to 4 kHz back, and a wide bore is routed as a short funnel with no vent.
+Even the widest buildable bore stays about 6 dB below the open ear at 2 to 4 kHz, because the shell fills the concha and removes its natural boost.
+On the template ear with the example sloping loss, the widest bores score above the unaided control for soft speech, about level with it at 65 dB SPL, and below it at 80 dB SPL, where the listener hears the highs unaided and the device cuts them.
+Expect the best designs to land near the unaided control, not far above it.
+
 hornsim needs torch and pyclarity, which this environment does not install.
 Every numerical step therefore runs in the backend's own interpreter through `bridges/hornsim_bridge.py`, one short process per step, with JSON on stdin and stdout.
 The bridge calls hornsim's functions and adds no numerics of its own.
@@ -256,10 +263,16 @@ uv run horn-study run examples/requests/real_with_needs.json
 
 What it declares, all read from the installed backend each time a study starts:
 
-- One geometry family, `spiral_exponential_horn`, with the parameters and bounds of `AidDesign` in `backend/app/main.py`.
-  The vent minimum is raised from 0 to 0.1 mm because `hornsim.aid` cannot build a vent of exactly 0.
+- One geometry family, `spiral_exponential_horn`, with the parameters and bounds of `AidDesign` in `backend/app/main.py`: throat 0.3 to 31 mm^2, mouth 2 to 200 mm^2, vent 0 to 2.5 mm, wall 0.4 to 2 mm, path 20 to 300 mm, and tip clearance 0.2 to 1.5 mm.
+  A vent of 0 means no vent, which a throat above about 3 mm^2 needs because there is no room for a vent beside it in the canal tip.
+  The largest throat that passes the canal tip is `pi * (canal diameter / 2 - tip clearance - wall)^2`: 20.4 mm^2 at the defaults and 31 mm^2 with the smallest tip clearance and wall.
+  The bounds are what some ear can hold, so a design can be in bounds and still not fit the configured ear.
 - One baseline, `unaided`: a flat 0 dB response sent through the same clips, levels, and HASPI call as the designs.
 - Scenarios for each clip type (clean speech, speech in babble) at each presentation level in `hornsim/defaults.yaml`.
+  Every scenario is the mean over its clips: three clean sentences, or four sentences in babble.
+  HASPI on a single two-second clip swings too much with level to rank designs, so per-clip values are kept for inspection only.
+- One calibration, `hornsim-reference-at-65-db-spl-v2`: HASPI's clean reference always stands for 65 dB SPL and the presentation level scales only what the listener hears.
+  Results made under the earlier `hornsim-reference-rms1-at-level-v1` convention are not comparable at 50 and 80 dB SPL.
 - Metrics: `haspi_v2_mean`, `haspi_v2_worst_canal`, `haspi_v2_improvement_over_unaided`, four insertion gain band averages, and `bore_length_mm`.
 - Required thresholds at 250, 500, 1000, 2000, 4000, and 6000 Hz, the six frequencies HASPI v2 uses.
   pyclarity would interpolate a missing one, so a request without all six is rejected instead.
@@ -270,12 +283,13 @@ What it declares, all read from the installed backend each time a study starts:
 
 What to expect when it runs:
 
-- The patient context is built once per ear mesh and audiogram (about one minute) and each design once per set of design numbers (about two minutes), however many scenarios or threads ask for it.
+- The patient context is built once per ear mesh and audiogram (about three minutes) and each design once per set of design numbers (about ten seconds), however many scenarios or threads ask for it.
   Both are kept in `HORNSIM_WORK_DIR` and reused by later studies.
-- Scoring one scenario takes 5 to 20 seconds.
-- A design that cannot be routed in the ear comes back as `status: "failed"` with `error.code: "geometry_does_not_fit"`, never as a score.
-- A design that hornsim builds with its vent overlapping the bore (`vent_wall_to_bore_mm` below 0 in `design.json`) comes back as `status: "failed"` with `error.code: "vent_intersects_bore"`.
-  The acoustic model assumes separate channels, so a score would describe a different object.
+- Scoring one scenario takes 20 to 40 seconds.
+- A design that cannot be routed in the ear comes back as `status: "failed"` with `error.code: "geometry_does_not_fit"` and hornsim's reason, never as a score.
+  The reasons are a throat too wide for the canal tip, no bore route that fits the concha, and a vent that cannot keep the minimum wall to the bore.
+- hornsim itself now refuses a vent that would cut into the bore.
+  The adapter still checks `vent_wall_to_bore_mm` in `design.json` and reports `error.code: "vent_intersects_bore"` if an older backend lets one through, because the acoustic model assumes separate channels.
 - Results carry references to `design.json`, `aid.glb`, `aid_in_ear.glb`, `aid_print.stl`, `acoustics.json`, and `references.json`, plus hornsim's own per-clip scores and its unaided and ceiling references.
 - The bridge process does not inherit model or tracing keys.
 

@@ -18,7 +18,8 @@ Commands
 This file is glue. The geometry, the acoustic model, and the scoring are
 hornsim's own functions, called the way backend/app/jobs.py and
 hornsim/score.py call them. Nothing here rescales a level or fills in a
-hearing threshold.
+hearing threshold. A clip type with several clips (three clean, four in
+babble) is scored clip by clip and averaged, the same way for both types.
 """
 
 from __future__ import annotations
@@ -192,6 +193,8 @@ def cmd_describe(payload: dict[str, Any]) -> dict[str, Any]:
         "clips": clips,
         "babble_talkers": len(speech["babble_voices"]),
         "haspi_seed": cfg["evaluation"]["haspi_seed"],
+        # The level hornsim.scoring holds HASPI's clean reference at, whatever the presentation level.
+        "reference_db_spl": scoring.REFERENCE_DB_SPL,
         "haspi_frequencies_hz": [float(f) for f in HASPI_AUDIOGRAM_FREQUENCIES],
         "hornsim_haspi_frequencies_hz": [float(f) for f in scoring.HASPI_FREQS],
         "ceiling_prescriptions": list(cfg["evaluation"]["ceiling_prescriptions"]),
@@ -320,7 +323,8 @@ def cmd_build(payload: dict[str, Any]) -> dict[str, Any]:
             try:
                 design = aid.build(os.path.join(patient, "context"), aid_dir, overrides, log=log)
             except ValueError as error:
-                # hornsim.aid itself raises ValueError when no bore or vent route fits this ear.
+                # hornsim.aid itself raises ValueError when no bore or vent route fits this ear,
+                # including a throat too wide for the canal tip and a vent that cannot clear the bore.
                 # A ValueError from deeper down (a mesh library) is a crash, not a verdict on fit.
                 raised_in = traceback.extract_tb(error.__traceback__)[-1].filename
                 if os.path.abspath(raised_in) != os.path.abspath(inspect.getfile(aid)):

@@ -62,7 +62,10 @@ DEFAULT_DESIGN = {
     "vent_diameter_mm": 0.8,
     "min_wall_mm": 0.6,
     "max_path_mm": 130.0,
+    "tip_clearance_mm": 0.6,
 }
+# A design the first version could not build: a wide throat, a large mouth, and no vent.
+WIDE_DESIGN = {**DEFAULT_DESIGN, "throat_mm2": 20.0, "mouth_mm2": 150.0, "vent_diameter_mm": 0.0}
 BRIDGE = Path(__file__).resolve().parents[1] / "bridges" / "hornsim_bridge.py"
 
 # What `hornsim_bridge.py describe` printed for the backend this adapter was written against.
@@ -71,11 +74,12 @@ DESCRIBED: dict[str, Any] = {
     "version": VERSION,
     "dependencies": {"pyclarity": "0.9.0"},
     "aid_design_fields": {
-        "throat_mm2": {"default": 1.0, "minimum": 0.3, "maximum": 10},
-        "mouth_mm2": {"default": 22.2, "minimum": 2, "maximum": 60},
+        "throat_mm2": {"default": 1.0, "minimum": 0.3, "maximum": 31},
+        "mouth_mm2": {"default": 22.2, "minimum": 2, "maximum": 200},
         "vent_diameter_mm": {"default": 0.8, "minimum": 0, "maximum": 2.5},
         "min_wall_mm": {"default": 0.6, "minimum": 0.4, "maximum": 2},
         "max_path_mm": {"default": 130, "minimum": 20, "maximum": 300},
+        "tip_clearance_mm": {"default": 0.6, "minimum": 0.2, "maximum": 1.5},
     },
     "aid_defaults": {
         "throat_mm2": 1.0,
@@ -93,9 +97,13 @@ DESCRIBED: dict[str, Any] = {
         {"name": "clean_2", "type": "clean"},
         {"name": "clean_3", "type": "clean"},
         {"name": "babble_1", "type": "babble", "snr_db": 5},
+        {"name": "babble_2", "type": "babble", "snr_db": 5},
+        {"name": "babble_3", "type": "babble", "snr_db": 5},
+        {"name": "babble_4", "type": "babble", "snr_db": 5},
     ],
     "babble_talkers": 6,
     "haspi_seed": 0,
+    "reference_db_spl": 65.0,
     "haspi_frequencies_hz": [250.0, 500.0, 1000.0, 2000.0, 4000.0, 6000.0],
     "hornsim_haspi_frequencies_hz": [250.0, 500.0, 1000.0, 2000.0, 4000.0, 6000.0],
     "ceiling_prescriptions": ["nal_r", "half_gain", "full_gain"],
@@ -171,14 +179,15 @@ class FakeBridge:
         if mouth in self.crashes:
             return {"ok": False, "error": {"code": "bridge_crashed", "message": "ValueError: boom"}}
         if mouth in self.does_not_fit:
-            return {**answer, "fits": False, "error": "no spiral fits this concha with these areas"}
+            return {**answer, "fits": False, "error": "no bore route fits this concha with these areas"}
         return {
             **answer,
             "fits": True,
             "design": {
                 "bore_length_mm": 50.0 + mouth,
                 "printable_solid_watertight": True,
-                "vent_wall_to_bore_mm": self.vent_wall_to_bore_mm,
+                # hornsim.aid writes null here for a design with no vent.
+                "vent_wall_to_bore_mm": self.vent_wall_to_bore_mm if parameters["vent_diameter_mm"] else None,
                 **parameters,
             },
             "acoustics_summary": {
@@ -198,7 +207,9 @@ class FakeBridge:
         }
 
     def _score(self, payload: dict[str, Any]) -> dict[str, Any]:
-        unaided = 0.5 if payload["clip_type"] == "clean" else 0.1
+        # The bridge scores every clip of the type and reports their mean.
+        clips = [clip["name"] for clip in DESCRIBED["clips"] if clip["type"] == payload["clip_type"]]
+        unaided = 0.5 if payload["clip_type"] == "clean" else 0.25
         aided = unaided if payload["candidate_dir"] is None else unaided + 0.125
         return {
             "ok": True,
@@ -210,7 +221,7 @@ class FakeBridge:
             "unaided_haspi_mean": unaided,
             "canals_used_cc": [0.5, 0.6, 0.7, 0.8, 0.9],
             "haspi_seed": 0,
-            "per_clip": [{"clip": f"{payload['clip_type']}_1", "unaided_haspi": unaided}],
+            "per_clip": [{"clip": name, "unaided_haspi": unaided} for name in clips],
             "seconds": 5.0,
         }
 
@@ -286,13 +297,15 @@ def test_capabilities_validate_against_the_contract_and_come_from_the_backend(tm
     (family,) = capabilities.geometry_families
     assert family.family_id == FAMILY_ID
     assert {p.name: (p.minimum, p.maximum, p.unit) for p in family.parameters} == {
-        "throat_mm2": (0.3, 10, "mm^2"),
-        "mouth_mm2": (2, 60, "mm^2"),
-        # The server allows 0, but hornsim.aid cannot build a vent of 0.
-        "vent_diameter_mm": (0.1, 2.5, "mm"),
+        "throat_mm2": (0.3, 31, "mm^2"),
+        "mouth_mm2": (2, 200, "mm^2"),
+        # 0 is a design with no vent, which hornsim.aid builds.
+        "vent_diameter_mm": (0, 2.5, "mm"),
         "min_wall_mm": (0.4, 2, "mm"),
         "max_path_mm": (20, 300, "mm"),
+        "tip_clearance_mm": (0.2, 1.5, "mm"),
     }
+    assert all(p.description for p in family.parameters)
     assert [(b.baseline_id, b.kind) for b in capabilities.baselines] == [("unaided", "unaided")]
 
     assert capabilities.hearing_input.required_frequencies_hz == (250, 500, 1000, 2000, 4000, 6000)
@@ -310,6 +323,10 @@ def test_capabilities_validate_against_the_contract_and_come_from_the_backend(tm
         "speech_in_babble_80_db_spl",
     ]
     assert [s.source_level_db_spl for s in capabilities.scenarios] == [50, 65, 80, 50, 65, 80]
+    babble = capabilities.scenarios[4].description
+    assert babble.startswith("4 Harvard sentences")
+    assert "at +5 dB" in babble
+    assert "means over the 4 clips" in babble
     names = [m.name for m in capabilities.metrics]
     assert len(names) == len(set(names))
     assert names[:3] == ["haspi_v2_mean", "haspi_v2_worst_canal", "haspi_v2_improvement_over_unaided"]
@@ -317,6 +334,8 @@ def test_capabilities_validate_against_the_contract_and_come_from_the_backend(tm
 
     assert not capabilities.supports_seeds
     assert capabilities.calibration.calibration_ref == CALIBRATION_REF
+    assert "65 dB SPL" in capabilities.calibration.description
+    assert "(level - 65) dB" in capabilities.calibration.source_level_convention
     assert capabilities.default_fidelity in capabilities.fidelity_levels
     unsupported = {u.requirement for u in capabilities.unsupported_requirements}
     assert {"secure_retention", "comfort", "hearing_protection", "music_quality"} <= unsupported
@@ -326,11 +345,7 @@ def test_capabilities_validate_against_the_contract_and_come_from_the_backend(tm
     # The mesh identity is part of the snapshot, so cached results never cross ears.
     dumped = capabilities.model_dump(mode="json")
     assert dumped["ear_mesh"]["sha256"] == "f" * 64
-    assert dumped["fixed_design_values"] == {
-        "tip_length_mm": 9.0,
-        "tip_clearance_mm": 0.6,
-        "vent_offset_mm": 2.2,
-    }
+    assert dumped["fixed_design_values"] == {"tip_length_mm": 9.0, "vent_offset_mm": 2.2}
 
 
 def test_capabilities_follow_the_backend_when_it_changes(tmp_path):
@@ -394,6 +409,29 @@ def test_design_and_control_results_pass_the_runner_checks(tmp_path):
     assert bridge.payloads("score")[-1]["candidate_dir"] is None
 
 
+def test_a_wide_throat_design_with_no_vent_is_built_and_scored(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    contract = as_contract(evaluator)
+    capabilities = contract.get_evaluator_capabilities()
+    spec = make_spec("wide_funnel", "speech_in_babble_65_db_spl", parameters=WIDE_DESIGN)
+    result = contract.evaluate_experiment(spec)
+
+    assert check_result(spec, result, capabilities) == []
+    assert result.status == "completed", result.error
+    assert bridge.payloads("build")[0]["parameters"] == WIDE_DESIGN
+    saved = result.model_dump(mode="json")
+    assert saved["design"]["vent_wall_to_bore_mm"] is None
+    # A babble scenario is the mean over every babble clip, like a clean one over the clean clips.
+    assert [entry["clip"] for entry in saved["haspi_per_clip"]] == [
+        "babble_1",
+        "babble_2",
+        "babble_3",
+        "babble_4",
+    ]
+    assert bridge.payloads("score")[0]["clip_type"] == "babble"
+    assert {m.name: m.value for m in result.metrics}["haspi_v2_improvement_over_unaided"] == 0.125
+
+
 def test_supplied_thresholds_reach_the_model_unmodified(tmp_path):
     evaluator, bridge = make_evaluator(tmp_path)
     odd = {250: 12.5, 500: 20, 1000: 33, 2000: 47.5, 4000: 55, 6000: 61}
@@ -434,7 +472,9 @@ def test_a_spec_without_every_haspi_frequency_is_refused_not_filled_in(tmp_path)
         ({"ear_mesh_ref": "/somewhere/else.ply"}, "ear_mesh_mismatch"),
         ({"family_id": "conical_horn_fixture"}, "unsupported_family"),
         ({"parameters": {**DEFAULT_DESIGN, "throat_mm2": 0.1}}, "out_of_bounds"),
-        ({"parameters": {**DEFAULT_DESIGN, "vent_diameter_mm": 0.0}}, "out_of_bounds"),
+        ({"parameters": {**DEFAULT_DESIGN, "throat_mm2": 40.0, "mouth_mm2": 150.0}}, "out_of_bounds"),
+        ({"parameters": {**DEFAULT_DESIGN, "vent_diameter_mm": -0.1}}, "out_of_bounds"),
+        ({"parameters": {**DEFAULT_DESIGN, "tip_clearance_mm": 0.05}}, "out_of_bounds"),
         ({"parameters": {**DEFAULT_DESIGN, "mouth_mm2": 2.0, "throat_mm2": 5.0}}, "out_of_bounds"),
         ({"parameters": {k: v for k, v in DEFAULT_DESIGN.items() if k != "max_path_mm"}}, "bad_parameter"),
     ],
@@ -512,7 +552,7 @@ def test_a_design_that_does_not_fit_the_ear_is_a_failed_case_with_no_score(tmp_p
         assert result.metrics == ()
         assert result.error is not None
         assert result.error.code == "geometry_does_not_fit"
-        assert "no spiral fits this concha" in result.error.message
+        assert "no bore route fits this concha" in result.error.message
         assert not result.error.transient
     assert bridge.count("build") == 1
     assert bridge.count("score") == 0
@@ -779,8 +819,8 @@ _BACKEND_CONFIGURED = all(os.environ.get(name) for name in (BACKEND_DIR_ENV, EAR
     not _BACKEND_CONFIGURED,
     reason=f"set {BACKEND_DIR_ENV}, {EAR_MESH_ENV}, and {WORK_DIR_ENV} to run the real hornsim pipeline",
 )
-def test_the_real_backend_scores_the_control_and_the_default_design():
-    """Minutes on first run (one context and one aid build), seconds once they exist in the work dir."""
+def test_the_real_backend_scores_the_control_the_default_and_a_wide_design():
+    """Minutes on first run (one context and two aid builds), seconds once they exist in the work dir."""
     evaluator = evaluator_for("real", env={REAL_EVALUATOR_ENV: "horn_study.hornsim_evaluator"})
     capabilities = evaluator.get_evaluator_capabilities()
     assert capabilities.kind == "real"
@@ -791,15 +831,23 @@ def test_the_real_backend_scores_the_control_and_the_default_design():
     scenario = "speech_in_babble_65_db_spl"
     control_spec = make_spec("unaided", scenario, baseline=True)
     design_spec = make_spec("default_horn", scenario)
+    wide_spec = make_spec("wide_funnel", scenario, parameters=WIDE_DESIGN)
     control = evaluator.evaluate_experiment(control_spec)
     design = evaluator.evaluate_experiment(design_spec)
+    wide = evaluator.evaluate_experiment(wide_spec)
 
-    for spec, result in ((control_spec, control), (design_spec, design)):
+    for spec, result in ((control_spec, control), (design_spec, design), (wide_spec, wide)):
         assert check_result(spec, result, capabilities) == []
         assert result.status == "completed", result.error
         assert {m.name for m in result.metrics} == declared
     control_values = {m.name: m.value for m in control.metrics}
     design_values = {m.name: m.value for m in design.metrics}
+    wide_values = {m.name: m.value for m in wide.metrics}
+    # The wide throat with no vent builds, and attenuates far less than the default across speech.
+    for band in ("insertion_gain_1000_2000_hz_db", "insertion_gain_2000_4000_hz_db"):
+        assert wide_values[band] > design_values[band] + 10
+    assert wide_values["bore_length_mm"] < design_values["bore_length_mm"]
+    assert len(control.model_dump(mode="json")["haspi_per_clip"]) >= 4
     assert 0 <= control_values["haspi_v2_mean"] <= 1
     assert 0 <= design_values["haspi_v2_worst_canal"] <= design_values["haspi_v2_mean"] <= 1
     assert design_values["haspi_v2_improvement_over_unaided"] == pytest.approx(

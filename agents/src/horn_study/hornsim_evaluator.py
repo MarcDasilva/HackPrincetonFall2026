@@ -44,7 +44,7 @@ EVALUATOR_NAME = "hornsim"
 FAMILY_ID = "spiral_exponential_horn"
 BASELINE_ID = "unaided"
 CANAL_CONFIG_ID = "sampled_canals"
-CALIBRATION_REF = "hornsim-reference-rms1-at-level-v1"
+CALIBRATION_REF = "hornsim-reference-at-65-db-spl-v2"
 FIDELITY = "plane_wave_1d"
 HASPI_UNIT = "HASPI v2 (0-1)"
 
@@ -78,24 +78,40 @@ _GAIN_BANDS = (
 )
 
 _PARAMETER_NOTES = {
-    "throat_mm2": ("mm^2", "Bore cross-section at the canal end. Must be smaller than mouth_mm2."),
-    "mouth_mm2": ("mm^2", "Bore cross-section at the faceplate opening. Must be larger than throat_mm2."),
+    "throat_mm2": (
+        "mm^2",
+        "Bore cross-section at the canal end, the area that runs through the canal tip. Must be smaller "
+        "than mouth_mm2. In the acoustic model this is the strongest lever: a narrow throat acts as a "
+        "low-pass filter above about 500 Hz, and widening it brings 1 to 4 kHz back toward the open ear. "
+        "It has to pass the canal tip with a wall left, so the largest buildable value is "
+        "pi * (canal diameter / 2 - tip_clearance_mm - min_wall_mm)^2: about 20.4 at the defaults and "
+        "about 31 with the smallest tip clearance and wall. A throat above about 3 leaves no room for "
+        "a vent beside it and needs vent_diameter_mm 0.",
+    ),
+    "mouth_mm2": (
+        "mm^2",
+        "Bore cross-section at the faceplate opening. Must be larger than throat_mm2. A larger mouth "
+        "raises 2 to 8 kHz once the throat is wide. How large a mouth fits depends on the ear.",
+    ),
     "vent_diameter_mm": (
         "mm",
-        "Diameter of the straight vent from the faceplate to the canal tip. A design with no vent cannot "
-        "be built, and a vent too wide to route clear of the bore comes back as a failed case.",
+        "Diameter of the straight vent from the faceplate to the canal tip. 0 means no vent, which is the "
+        "right choice for a wide throat: the bore then vents the canal itself. A vent that cannot be "
+        "routed with min_wall_mm of wall to the bore comes back as a failed case.",
     ),
     "min_wall_mm": ("mm", "Thinnest printed wall allowed around the bore and vent. A fit constraint."),
     "max_path_mm": (
         "mm",
-        "Upper limit on the spiral bore path. The builder keeps the longest spiral that fits, up to this.",
+        "Upper limit on the bore path inside the concha. The builder keeps the longest route that fits, "
+        "up to this, so a small value forces a short bore.",
+    ),
+    "tip_clearance_mm": (
+        "mm",
+        "Gap left between the canal tip and the assumed canal wall. A smaller gap makes the tip wider, "
+        "which makes room for a wider throat. A fit choice: the acoustic model treats the tip as sealed "
+        "whatever this is.",
     ),
 }
-
-# hornsim.aid cannot build a vent of exactly 0: the zero-width vent tube has no volume and the
-# mesh boolean raises. The server model still allows 0, so the declared minimum is raised to the
-# smallest diameter that was verified to build (0.1 mm, hornsim-a229daf).
-_VERIFIED_MINIMUMS = {"vent_diameter_mm": 0.1}
 
 _CLIP_TYPE_NAMES = {"clean": "clean_speech", "babble": "speech_in_babble"}
 _LEVEL_TAGS = {50: "soft_speech", 65: "conversational_speech", 80: "loud_speech"}
@@ -297,7 +313,7 @@ def _scenarios(described: Mapping[str, Any]) -> list[dict[str, Any]]:
                 text = f"{count} in quiet, presented at {level:g} dB SPL.{averaged}"
                 tags = ["speech", "quiet"]
             else:
-                ratios = "/".join(f"{clip['snr_db']:+g}" for clip in clips)
+                ratios = "/".join(dict.fromkeys(f"{clip['snr_db']:+g}" for clip in clips))
                 text = (
                     f"{count} in {described['babble_talkers']}-talker babble at {ratios} dB "
                     f"signal-to-noise ratio, with the talker at {level:g} dB SPL.{averaged}"
@@ -372,8 +388,10 @@ def _metrics(described: Mapping[str, Any]) -> list[dict[str, Any]]:
             "description": (
                 "Length of the bore that was actually routed in this ear, from design.json. It counts the "
                 "mouth riser and the run through the canal tip, so it can exceed max_path_mm, which limits "
-                "the spiral only. A longer bore lowers the estimated horn cutoff. It is not a size or "
-                "comfort measure: the shell fills the concha either way. 0 for the unaided control."
+                "the path inside the concha only. Reported to describe the design, not as a goal: a longer "
+                "bore lowers the estimated horn cutoff, while a wide bore is routed short and keeps more "
+                "of the 2 to 4 kHz response. It is not a size or comfort measure: the shell fills the "
+                "concha either way. 0 for the unaided control."
             ),
         }
     )
@@ -388,18 +406,25 @@ def _model_description(described: Mapping[str, Any]) -> str:
     return " ".join(
         [
             "hornsim builds a passive in-ear aid in the configured ear mesh and models it.",
-            "Geometry: a shell that fills the concha, a spiral bore with exponential area flare, and a straight vent.",
+            "Geometry: a shell that fills the concha, a bore with exponential area flare that is coiled as a"
+            " spiral when narrow and routed as a short uncoiled funnel when wide, and an optional straight vent.",
             "Acoustics: a 1D plane-wave transmission-line model with viscous and thermal wall losses,"
             " giving insertion gain at the eardrum relative to the open ear.",
             "Scoring: the insertion gain is applied to speech clips as a linear zero-phase filter and"
             f" HASPI v2 (pyclarity {described['dependencies']['pyclarity']}) is computed with the supplied audiogram.",
+            "What the model shows about this family: with the concha filled, no bore that fits reaches the"
+            " open ear at 2 to 4 kHz. The shell removes the concha's own boost there, and the added bore"
+            " length moves the ear canal resonance down, which can add a few dB at 1 to 2 kHz.",
             "Stated simplifications:",
             "the eardrum is a series resistance-mass-compliance with values picked in the published adult range;",
             "the concha is one resonance bump approximating an average ear, removed in full because the shell fills it;",
             "the ear canal is not in the mesh, so its opening is placed at the deepest point of the concha with an"
             f" assumed {canal['assumed_diameter_mm']:g} mm diameter, and the residual canal volume is sampled from"
             f" {low:g} to {high:g} cc rather than measured;",
+            "the gap around the canal tip is not modeled, so the tip is treated as sealed;",
             "speech is synthetic text-to-speech, and babble is synthetic talkers;",
+            "HASPI on one two-second clip swings with level, so only the mean over a scenario's clips is"
+            " meant for ranking designs;",
             "HASPI's internal noise is fixed with one seed so scores repeat.",
             "The model is linear and level-independent, has no head, room, or directional effects, and has not"
             " been validated against measurements on a printed device.",
@@ -411,12 +436,8 @@ def _model_description(described: Mapping[str, Any]) -> str:
 
 
 def parameter_bounds(described: Mapping[str, Any]) -> dict[str, dict[str, float]]:
-    """Bounds and defaults of the server's AidDesign model, narrowed to what hornsim.aid can build."""
-    fields = {name: dict(bounds) for name, bounds in described["aid_design_fields"].items()}
-    for name, floor in _VERIFIED_MINIMUMS.items():
-        if name in fields:
-            fields[name]["minimum"] = max(fields[name].get("minimum", floor), floor)
-    return fields
+    """Bounds and defaults of the server's AidDesign model, as the installed backend reports them."""
+    return {name: dict(bounds) for name, bounds in described["aid_design_fields"].items()}
 
 
 def build_capabilities(described: Mapping[str, Any]) -> dict[str, Any]:
@@ -448,14 +469,17 @@ def build_capabilities(described: Mapping[str, Any]) -> dict[str, Any]:
             {
                 "family_id": FAMILY_ID,
                 "description": (
-                    "In-ear shell that fills the concha of the configured ear, with a conical spiral bore "
-                    "whose area flares exponentially from the throat at the canal tip to the mouth on the "
-                    "faceplate, and a straight vent beside it. The builder searches for the longest spiral "
-                    "that fits, so bore length is an output, not an input. mouth_mm2 must be larger than "
+                    "In-ear shell that fills the concha of the configured ear, with a bore whose area "
+                    "flares exponentially from the throat at the canal tip to the mouth on the faceplate, "
+                    "and an optional straight vent beside it. The builder keeps the longest route that "
+                    "fits: a coiled spiral for a narrow bore, a short uncoiled funnel for a wide one. Bore "
+                    "length is therefore an output, not an input. mouth_mm2 must be larger than "
                     "throat_mm2. Not every combination fits: a design that cannot be routed in this ear "
-                    "comes back as a failed case, which makes that design ineligible. When that happens "
-                    "hornsim's advice is to reduce the mouth area or the wall. The hornsim defaults are a "
-                    "known starting point. Building one design takes about two minutes."
+                    "comes back as a failed case with hornsim's reason, which makes that design "
+                    "ineligible. The usual reasons are a throat too wide for the canal tip at the chosen "
+                    "wall and tip clearance, a mouth too large for the concha, and a vent with no room "
+                    "beside the bore. The hornsim defaults are a narrow, heavily attenuating starting "
+                    "point. Building one design takes about ten seconds."
                 ),
                 "parameters": parameters,
             }
@@ -505,12 +529,15 @@ def build_capabilities(described: Mapping[str, Any]) -> dict[str, Any]:
         "calibration": {
             "calibration_ref": CALIBRATION_REF,
             "description": (
-                "hornsim.scoring convention: the clean reference clip has RMS 1, and HASPI's level1 is "
-                "set to the scenario's presentation level, so RMS 1 stands for that many dB SPL."
+                "hornsim.scoring convention: the clean reference clip has RMS 1 and always stands for "
+                f"{described['reference_db_spl']:g} dB SPL, the level HASPI's ear model expects its "
+                "normal-hearing reference at."
             ),
             "source_level_convention": (
-                "Each scenario's source_level_db_spl is passed to HASPI as level1. In babble it is the "
-                "level of the talker, with the babble added on top at the stated signal-to-noise ratio."
+                "Each scenario's source_level_db_spl sets what the listener hears: hornsim scales the heard "
+                f"signal by (level - {described['reference_db_spl']:g}) dB before HASPI and leaves the "
+                "reference alone. In babble it is the level of the talker, with the babble added on top at "
+                "the stated signal-to-noise ratio."
             ),
             "normalization": (
                 "None by the adapter or bridge. Insertion gain is applied to what the listener hears, "
@@ -673,9 +700,9 @@ class HornsimEvaluator:
                     )
                 vent_wall = _number(build["design"].get("vent_wall_to_bore_mm"))
                 if vent_wall is not None and vent_wall < 0:
-                    # hornsim.aid keeps the best vent route it finds even when that route overlaps the
-                    # bore. The acoustic model then scores two separate channels that the printed part
-                    # would not have, so the score would describe a different object.
+                    # hornsim.aid now refuses a vent it cannot route clear of the bore. This guards a
+                    # backend that still keeps an overlapping route: the acoustic model would score two
+                    # separate channels that the printed part does not have.
                     return finish(
                         "failed",
                         used_version=build["version"],
@@ -712,7 +739,7 @@ class HornsimEvaluator:
         """Run one bridge step. An error it reports becomes a failed case, never a number.
 
         Reported context and build errors are remembered with the step, so an
-        identical two-minute build is not repeated for every scenario only to
+        identical build is not repeated for every scenario only to
         fail the same way. A process that dies is not remembered (see _Once).
         """
         answer = self._run(step, payload)
