@@ -1,7 +1,8 @@
 # horn-study: research and experiment-planning agents
 
 This package is the agent workstream for the passive acoustic hearing device project.
-It takes a profile with existing hearing-test results and optional needs, researches the question in three parallel branches, forms hypotheses, freezes one finite experiment plan, sends that plan to the team's evaluator, explains the returned results, and stops.
+It takes a profile with existing hearing-test results and optional needs.
+One orchestrator, a LangChain Deep Agent, then runs the study: it assigns three investigators to research the question in parallel, checks their evidence, forms hypotheses, freezes one finite experiment plan, has the team's evaluator run it, has the results explained, and stops.
 
 The product starts after hearing testing.
 Users supply their existing results.
@@ -26,6 +27,8 @@ uv run horn-study replay dev_with_needs_001                     # re-emit a reco
 `run` needs a chat model key.
 The default model is `anthropic:claude-sonnet-5-5`, so set `ANTHROPIC_API_KEY`.
 Any `provider:model` string that LangChain's `init_chat_model` understands works through `HORN_STUDY_MODEL`.
+Each role can have its own model: `HORN_STUDY_COORDINATOR_MODEL` sets the orchestrator's, `HORN_STUDY_RESEARCH_MODEL` the investigators', and `HORN_STUDY_INTERPRETER_MODEL` the interpreter's.
+The orchestrator reads the most and decides the most, so it is the role to give the strongest model.
 `validate`, `capabilities`, `follow-up` (without `--run`), and `replay` need no keys.
 
 Exit codes: `0` completed, `1` failed, `2` input rejected, `3` configuration problem.
@@ -35,37 +38,71 @@ Exit codes: `0` completed, `1` failed, `2` input rejected, `3` configuration pro
 ```mermaid
 flowchart TD
     I["Validate input, read capabilities, create study"]
-    I --> H["hearing_research"]
-    I --> U["use_context_research"]
-    I --> A["acoustic_design_research"]
-    H --> S["synthesize_evidence"]
-    U --> S
-    A --> S
-    S --> P["plan_experiments (coordinator)"]
-    P --> V["validate_and_freeze_plan"]
-    V -- "validation errors, before freezing" --> P
-    V --> E["evaluate_batch"]
-    E --> R["interpret_results"]
-    R --> D["COMPLETED"]
+    I --> O["study_orchestrator (Deep Agent)"]
+    O -- "task" --> H["hearing_research"]
+    O -- "task" --> U["use_context_research"]
+    O -- "task" --> A["acoustic_design_research"]
+    H -- "report, findings, source texts" --> O
+    U -- "report, findings, source texts" --> O
+    A -- "report, findings, source texts" --> O
+    O -- "submit_plan" --> V["validate and freeze (code)"]
+    V -- "validation errors, before freezing" --> O
+    O -- "run_experiments" --> E["evaluate the frozen cases (code)"]
+    O -- "write_report" --> R["compute, select, interpret"]
+    O --> C["complete_study (code): finish what a frozen plan is owed"]
+    C --> D["COMPLETED"]
 ```
 
 States: `CREATED -> RESEARCHING -> PLANNING -> PLAN_FROZEN -> EVALUATING -> INTERPRETING -> COMPLETED`, with terminal `FAILED` and `CANCELLED`.
 
-The only cycle is between planning and validation, and it closes before the plan is frozen.
-No edge leads from evaluation or interpretation back to planning.
+A study moves forward only.
+The orchestrator may revise a plan that failed validation, and that is the only repetition.
+Submitting a plan closes research, and once a plan is frozen nothing can be researched or planned again, so results can never start more experiments.
+
+### The orchestrator
+
+`study_orchestrator` is the one Deep Agent that manages a study, built with `create_deep_agent` in `orchestrator.py`.
+It uses the framework's subagents, file system, and permissions:
+
+| It has | What for |
+| --- | --- |
+| `task` | Assigns research to an investigator, with a direction of its own. The three investigators are its subagents. It assigns all three in one turn so they run at the same time. |
+| File system, read | `/research/<investigator>.json` holds each report with its findings, and `/sources/<source_id>.txt` holds the full text of every source an investigator read. The orchestrator can open a source to check what a quoted passage supports before it builds a hypothesis on it. |
+| File system, write | Only under `/work/`, for its own notes. They are saved in `results.json` and labelled as model notes. |
+| `submit_plan` | Hands the plan to code for validation and freezing. |
+| `run_experiments` | Has code run the frozen cases. |
+| `write_report` | Has code compute the comparison and the selection, and the interpreter explain them. |
+
+Every one of these is a gate that code controls:
+
+- `task` reaches investigators only. The framework's general-purpose helper, shell, and file deletion are not offered and are refused if called.
+- An investigator can be assigned again only as a follow-up, and `budget.max_research_follow_ups` (default 1) caps follow-ups for the whole study.
+- `submit_plan` is refused until every investigator has reported. The first submission closes research.
+- `run_experiments` works once, only on a frozen plan, and runs exactly its cases.
+- `write_report` works once, only after the experiments.
+- A tool used out of turn is refused and says what the next step is.
+
+The investigators, the interpreter, and the earpiece designer are unchanged.
+The orchestrator never holds the evaluator or another role's model: they sit behind the gates.
+
+If the orchestrator stops early, `complete_study` takes over.
+With a frozen plan it runs the cases or the report that are still owed, lists them under `orchestrator.phases_completed_by_workflow` in `results.json`, and adds a limitation to the report.
+Without a frozen plan the study fails with `planning_failed`, and nothing is evaluated.
 
 | Phase | Who | Can do | Cannot do |
 | --- | --- | --- | --- |
-| Research | Three Deep Agents, run concurrently by LangGraph | Search literature, read sources, record findings, read saved source text | Run the evaluator, write files, run shell commands, spawn subagents |
-| Planning | Coordinator model with no tools | Propose hypotheses, candidates, scenarios, and a selection rule | Freeze its own plan, skip the coverage the evaluator requires, or relax the per-scenario rule. Code validates the plan against capabilities and budget. |
-| Evaluation | Bounded runner (code) | Evaluate each frozen spec, retry the identical spec after a transient failure | Change a spec, add a case, turn a failure into a number |
-| Interpretation | Model with no tools | Explain the computed comparison, judge hypotheses, suggest follow-ups | Change scores or the selection, run anything |
+| Whole study | The orchestrator, a Deep Agent | Assign investigators, read reports and source texts, keep notes, submit a plan, ask for the experiments and the report | Skip an investigator, change a frozen plan, run a case that is not in it, run anything twice, write outside `/work/`, change a number |
+| Research | Three investigators, Deep Agents run as the orchestrator's subagents | Search literature, read sources, record findings, read saved source text | Run the evaluator, write files, run shell commands, spawn subagents |
+| Planning | The orchestrator proposes, code validates | Propose hypotheses, candidates, scenarios, and a selection rule | Freeze its own plan, skip the coverage the evaluator requires, or relax the per-scenario rule. Code validates the plan against capabilities and budget. |
+| Evaluation | Bounded runner (code), started by `run_experiments` | Evaluate each frozen spec, retry the identical spec after a transient failure | Change a spec, add a case, turn a failure into a number |
+| Interpretation | Model with no tools, started by `write_report` | Explain the computed comparison, judge hypotheses, suggest follow-ups | Change scores or the selection, run anything |
 
 ### What code decides, not a model
 
 - Whether supplied hearing data is usable (`intake.py`).
 - Whether a finding is accepted: its source must have been read in this study, and its quoted passage must appear in the text that was read (`research.py`).
 - Whether a plan is executable and within budget (`planner.py`).
+- Which phase may run now, and that each runs once (`orchestrator.py`).
 - Whether a plan covers what the evaluator requires of every study: enough scenarios, and at least one of each required kind (`planner.py`).
 - Every aggregate, the candidate ranking, and `selected_candidate_id` (`reporting.py`).
 - A hypothesis verdict is forced to `inconclusive` when any of its cases did not complete.
@@ -81,7 +118,7 @@ A design is eligible only if all of these hold:
 - Its primary-metric mean over all cases is better than the control's.
 
 The per-scenario check is always on.
-The coordinator cannot turn it off, and `selection_rule.require_not_worse_than_reference_in_every_scenario` is always `true`.
+The orchestrator cannot turn it off, and `selection_rule.require_not_worse_than_reference_in_every_scenario` is always `true`.
 "Not worse" allows for metric noise: a design may fall short of the control in a scenario by at most `selection_rule.scenario_tolerance`.
 That tolerance is the primary metric's declared `resolution`, copied into the plan when it is built, and it is 0 when the evaluator declares none.
 A design that only equals the control in a scenario, for example where both sit at the metric's ceiling, is not disqualified by that scenario.
@@ -124,7 +161,7 @@ Request fields that matter:
 | `status` | `measured`, `no_response`, `missing`, or `unreadable`. A marker never carries a numeric threshold. |
 | `demo_profile_id` | Name of a synthetic profile from the capabilities. Demo mode only. |
 | `needs_profile` | Optional. Without it the study uses the named context `default_everyday_listening`. |
-| `budget` | Caps on evaluation cases, parallel evaluations, research calls per agent, retries, plan revisions, and run time. |
+| `budget` | Caps on evaluation cases, parallel evaluations, research calls per agent, follow-up research assignments, retries, plan revisions, and run time. |
 
 Only target-ear measurements of a supported type are used.
 Other-ear and unsupported-type values are kept under `retained_but_unused` and never substituted.
@@ -157,9 +194,20 @@ Each study appends to `events.jsonl`, one JSON object per line, in strict `seque
 }
 ```
 
-Event types: `study.started`, `study.state_changed`, `research.agent_started`, `research.source_read`, `research.finding_added`, `research.agent_completed`, `research.agent_failed`, `hypothesis.created`, `plan.revision_requested`, `plan.frozen`, `experiment.started`, `experiment.retried`, `experiment.completed`, `experiment.failed`, `report.completed`, `study.completed`, `study.failed`, `study.cancelled`.
+Event types: `study.started`, `study.state_changed`, `orchestrator.assigned`, `orchestrator.evidence_opened`, `orchestrator.note_written`, `research.agent_started`, `research.source_read`, `research.finding_added`, `research.agent_completed`, `research.agent_failed`, `hypothesis.created`, `plan.revision_requested`, `plan.frozen`, `experiment.started`, `experiment.retried`, `experiment.completed`, `experiment.failed`, `report.completed`, `study.completed`, `study.failed`, `study.cancelled`.
 
-Events carry summaries and IDs, not model reasoning and not binary assets.
+What the orchestrator did is in three of them, all with `component` set to `study_orchestrator`:
+
+| Event | When | `data` |
+| --- | --- | --- |
+| `orchestrator.assigned` | It assigned an investigator. Comes just before that investigator's `research.agent_started`. | `investigator`, `follow_up`, `direction` (the orchestrator's own words) |
+| `orchestrator.evidence_opened` | It read or searched a report or a source text. | `tool`, `path`, `pattern`, and `sources[]` with `source_id`, `title`, `url` for each source it touched |
+| `orchestrator.note_written` | It wrote a note under `/work/`. | `path`, `tool` |
+
+`hypothesis.created` events now carry the component `study_orchestrator`, where earlier versions said `study_coordinator`.
+
+Events carry summaries and IDs, not binary assets.
+The `direction` of an assignment is the one place an event carries a model's own words.
 
 ### Artifacts
 
@@ -179,6 +227,8 @@ An existing study is never overwritten.
 In `results.json`:
 
 - `selected_candidate_id` is a candidate ID, or `null` when no selection is justified. It is never an array index.
+- `orchestrator.notes` maps each note file the orchestrator wrote to its text. They are a model's working notes, not results.
+- `orchestrator.phases_completed_by_workflow` lists `run_experiments` or `write_report` when the workflow had to run them because the orchestrator stopped early. It is normally empty.
 - `selected_candidate` is that candidate's record, with its geometry family and parameters.
 - `experiments[]` lists every evaluation case with its `experiment_id`, `candidate_id`, scenario, outcome, metrics, and asset references.
 - `report.candidates[]` has the per-candidate aggregates, eligibility, reasons, and rank.
@@ -229,10 +279,10 @@ All four fields are optional:
 | --- | --- | --- |
 | `required_scenario_tags` | A plan must include at least one scenario carrying each listed tag. Tags are the ones on `scenarios[].tags`. | none |
 | `minimum_scenarios` | A plan must include at least this many scenarios. | 1 |
-| `planning_notes` | Short sentences the coordinator reads before it plans, such as which of candidates and scenarios is the expensive one. | none |
+| `planning_notes` | Short sentences the orchestrator reads before it plans, such as which of candidates and scenarios is the expensive one. | none |
 | `metrics[].resolution` | The smallest difference in that metric that is meaningful, in the metric's unit. | 0 |
 
-A draft that misses the coverage is sent back to the coordinator, with the scenarios it can add, before anything is frozen.
+A draft that misses the coverage is sent back to the orchestrator, with the scenarios it can add, before anything is frozen.
 Capabilities whose coverage no plan could meet are rejected when they are read: a required tag that no scenario carries, or a minimum above the number of scenarios.
 The primary metric's `resolution` becomes the per-scenario tolerance of the selection rule.
 Set it to the metric's run-to-run noise, because a design may fall that far below the unaided control in a scenario and still be selected.
@@ -248,7 +298,7 @@ To request a retry of the identical spec, return `status: "failed"` with `error.
 
 An evaluator may also provide an optional third call, `check_buildable(spec)`.
 It returns `None` when the candidate can be built, or `{"code", "message"}` with the reason when it cannot, and it never scores anything.
-When it exists, plan validation test-builds every design before the plan is frozen and sends each rejection back to the coordinator to correct.
+When it exists, plan validation test-builds every design before the plan is frozen and sends each rejection back to the orchestrator to correct.
 This catches designs whose dials are each in range but do not fit together, which would otherwise fail in every scenario after the plan was locked.
 A rejected draft uses one of the plan's `max_plan_revisions`, so a request for a real evaluator should allow a few more than the default of 2.
 Any other failure is recorded once as a failed case.
@@ -464,10 +514,13 @@ It requires at least two scenarios in every study, one tagged `quiet` and one ta
 Set `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` (plus `LANGSMITH_PROJECT`, and `LANGSMITH_ENDPOINT` outside the US region).
 Each study is one root trace named `study <study_id>`, with these children:
 
-- `hearing_research`, `use_context_research`, `acoustic_design_research`: each agent run with its model calls and tool calls.
-- `synthesize_evidence`, `plan_experiments` (the `study_coordinator` run), `validate_and_freeze_plan`.
-- `evaluate_batch`: one `evaluate_experiment` run per attempt, tagged with `experiment_id`, `candidate_id`, `spec_hash`, `plan_hash`, `attempt`, and `evaluator_version`.
-- `interpret_results`: the `results_interpreter` run.
+- `orchestrate_study`, which holds the `study_orchestrator` run. Everything the study did is nested under it:
+  - one `task` call per assignment, holding `hearing_research`, `use_context_research`, or `acoustic_design_research` with that agent's model calls and tool calls;
+  - `read_file`, `grep`, and `write_file` calls where the orchestrator checked evidence or kept notes;
+  - `submit_plan`, with a `check_buildable` run per design when the evaluator offers one;
+  - `run_experiments`, with one `evaluate_experiment` run per attempt, tagged with `experiment_id`, `candidate_id`, `spec_hash`, `plan_hash`, `attempt`, and `evaluator_version`;
+  - `write_report`, holding the `results_interpreter` run.
+- `complete_study`, which is empty unless the orchestrator stopped early.
 
 The root run ID is in every event's `trace.run_id`.
 
@@ -513,6 +566,9 @@ Tests drive the real workflow with a scripted stand-in model and offline sources
 | Missing or unusable results are rejected before anything runs | `test_intake.py`, `test_invalid_input_is_rejected_before_anything_is_saved_or_evaluated` |
 | No silent demo data, other-ear data, or invented thresholds | `test_intake.py` |
 | Three research branches overlap | `test_three_research_branches_overlap_and_return_identifiable_evidence` |
+| The orchestrator holds only its study tools, assigns only investigators, and writes only its own notes | `test_orchestrator.py` |
+| A plan is refused until every investigator has reported, and research closes once a plan is submitted | `test_a_plan_is_refused_until_every_investigator_has_reported`, `test_research_is_closed_once_a_plan_has_been_submitted` |
+| Follow-up assignments are bounded by the budget | `test_one_follow_up_assignment_is_allowed_and_its_direction_reaches_the_investigator`, `test_a_request_can_forbid_follow_up_assignments` |
 | Findings need a read source and a verbatim passage | `test_research.py` |
 | Investigators and the interpreter cannot reach the evaluator | `test_investigators_hold_evidence_tools_only`, `test_the_interpreter_cannot_change_the_selection_or_run_anything` |
 | Plans respect capabilities, controls, and budget | `test_planner.py` |
@@ -524,9 +580,10 @@ Tests drive the real workflow with a scripted stand-in model and offline sources
 | Reported numbers are the evaluator's numbers | `test_reported_numbers_are_the_evaluators_numbers`, `test_per_scenario_numbers_in_the_report_are_the_evaluators_numbers` |
 | The real evaluator never fills in a threshold, builds each design once, and reports a misfit as a failure | `test_hornsim_evaluator.py` |
 | Both device families can share one plan, an earpiece the builder rejects is a failed case with its reasons, and a selected earpiece carries the names the final step locks | `test_a_plan_with_candidates_from_both_families_is_valid`, `test_an_earpiece_the_builder_rejects_is_a_failed_case_with_its_reasons`, `test_a_study_with_both_families_completes_and_can_select_an_earpiece` |
-| No path from results back to planning or evaluation | `test_nothing_leads_from_results_back_to_planning_or_evaluation` |
+| No path from results back to research, planning, or evaluation | `test_nothing_can_be_researched_planned_or_rerun_once_the_plan_is_frozen`, `test_experiments_and_the_report_cannot_be_asked_for_before_a_plan_is_frozen` |
+| A frozen plan is always finished, and a study without one fails | `test_the_workflow_finishes_the_phases_an_orchestrator_leaves_undone`, `test_an_orchestrator_that_never_freezes_a_plan_fails_the_study` |
 | A follow-up runs nothing until requested, and keeps the parent record | `test_a_suggested_follow_up_causes_no_evaluation_until_requested`, `test_a_follow_up_is_a_new_study_and_the_parent_record_is_kept` |
-| The trace shows branches, planning, evaluation attempts, and the report | `test_the_trace_exposes_branches_planning_evaluation_and_report` |
+| The trace nests branches, planning, evaluation attempts, and the report under the orchestrator | `test_the_trace_exposes_branches_planning_evaluation_and_report` |
 
 ## Module map
 
@@ -536,13 +593,14 @@ Tests drive the real workflow with a scripted stand-in model and offline sources
 | `intake.py` | Input validation and normalization against evaluator capabilities |
 | `sources.py` | Literature search, source reading, passage selection, quote verification |
 | `research.py` | The three investigators, their tools, budget, and evidence ledger |
-| `planner.py` | Coordinator prompt, plan validation, deterministic expansion, freezing |
+| `orchestrator.py` | The orchestrator Deep Agent, its tools, the phase gates, and the completion guarantee |
+| `planner.py` | Plan rules, plan validation, deterministic expansion, freezing |
 | `evaluator_adapter.py` | Evaluator protocol, real-evaluator loader, labeled development fixture |
 | `hornsim_evaluator.py` | The real evaluator: capabilities and results from the backend's hornsim pipeline |
 | `bridges/hornsim_bridge.py` | Runs hornsim steps in the backend interpreter. Not part of the package. |
 | `runner.py` | Bounded execution, identical retries, result checks, evaluation cache |
 | `reporting.py` | Aggregation, selection rule, needs outcomes, interpretation, report |
-| `workflow.py` | LangGraph wiring, state machine, artifacts, terminal handling |
+| `workflow.py` | Study setup, the two-step graph, state machine, artifacts, terminal handling |
 | `events.py` | Event schema, ordered event bus, artifact store |
 | `followup.py` | Building a user-requested follow-up study from a saved one |
 | `llm.py` | Model selection from the environment |
