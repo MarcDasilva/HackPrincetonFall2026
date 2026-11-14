@@ -1142,7 +1142,8 @@ class HornsimEvaluator:
         if answer["ok"]:
             return answer
         message = f"hornsim {step} step failed: {answer['error']['message']}"[:800]
-        return {"ok": False, "error": {"code": f"{step}_failed", "message": message}}
+        # Both build steps report `build_failed`. The message names which one.
+        return {"ok": False, "error": {"code": f"{step.partition('-')[0]}_failed", "message": message}}
 
     def _unsupported_reason(
         self, spec: Mapping[str, Any], described: Mapping[str, Any], scenario: Mapping[str, Any] | None
