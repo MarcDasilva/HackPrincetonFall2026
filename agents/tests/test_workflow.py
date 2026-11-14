@@ -921,6 +921,31 @@ async def test_hypotheses_get_per_scenario_data_and_needs_say_how_they_were_met(
     )
 
 
+async def test_a_need_is_judged_on_the_studys_measure_of_benefit_not_on_a_side_metric(tmp_path):
+    """A need tied to the primary metric and to a secondary one is met when the primary improves.
+    A need tied only to a metric that did not improve is not."""
+    draft = valid_draft()
+    draft["selection"]["constraints"] = []
+    coverage = {entry["need"]: entry for entry in draft["needs_coverage"]}
+    coverage["speech_clarity"]["metric_names"] = [
+        "fixture_audible_speech_fraction",
+        "fixture_device_length_mm",
+    ]
+    coverage["compact_size"]["metric_names"] = ["fixture_device_length_mm"]
+    harness = Harness(tmp_path, coordinator=coordinator_responder(draft))
+    outcome = await run_study(make_request(), harness.deps)
+
+    assert outcome.report is not None
+    needs = {n.need: n for n in outcome.report.needs}
+    assert needs["speech_clarity"].status == "addressed"
+    assert (
+        "fixture_audible_speech_fraction improved on the reference control"
+        in needs["speech_clarity"].explanation
+    )
+    assert "Not improved: fixture_device_length_mm did not improve" in needs["speech_clarity"].explanation
+    assert needs["compact_size"].status == "evaluated_unsuccessfully"
+
+
 async def test_reported_numbers_are_the_evaluators_numbers(tmp_path):
     harness = Harness(tmp_path)
     outcome = await run_study(make_request(), harness.deps)

@@ -78,6 +78,12 @@ def describe_dials() -> dict[str, Any]:
 COLLECTOR_REACH = "collector_reach_mm"
 COLLECTOR_OPENING = "collector_mouth_mm2"
 PROTRUSION = "protrusion_mm"
+# With no size limit in the study, the built piece may stand out this much further than the tested
+# one: enough for the builder's rounding and a slight turn toward the talker, not for a bigger part.
+SIZE_ALLOWANCE_MM = 1.5
+# Fit sizes. S and L are the same design with the cast shrunk or grown. The full step is tried
+# first, then smaller ones, because a wide bore leaves little wall for the cast to give up.
+SIZE_OFFSETS_MM = {"S": (-0.5, -0.4, -0.3, -0.2), "L": (0.5, 0.4, 0.3, 0.2)}
 SECTION_POINTS = 12
 MIN_OUTWARD = 0.5  # a collector must grow away from the head: at least this share of its reach
 # The dials the acoustic score responds to. A study that did not set one evaluated the builder's
@@ -194,7 +200,7 @@ def departures(
         and stands_out > size_limit_mm + 0.05
     ):
         found.append(
-            f"size: stands out {float(stands_out):g} mm, over the study's limit of {size_limit_mm:g} mm"
+            f"size: stands out {float(stands_out):g} mm, over the limit of {size_limit_mm:g} mm from the study"
         )
 
     def compare(label: str, built: Any, wanted: float, tolerance: float, unit: str) -> None:
@@ -303,7 +309,12 @@ def brief(results: dict[str, Any], patient_dir: Path, locked: dict[str, float], 
                 k: results["selected_candidate"].get(k) for k in ("candidate_id", "label", "rationale")
             },
             "fixed_by_study": fixed_by_study,
-            "size_in_study_mm": {"stood_out": stood_out, "limit": size_limit},
+            "size_in_study_mm": {
+                "stood_out": stood_out,
+                "limit": size_limit
+                if size_limit is not None
+                else (None if stood_out is None else round(float(stood_out) + SIZE_ALLOWANCE_MM, 2)),
+            },
             "patient_context": results.get("study_context"),
             "ear": ear,
             "dials_you_set": shaping,
@@ -333,6 +344,14 @@ def produce_earpiece(
     locked = locked_params(selected.get("parameters", {}), dials)
     studied = study_collector(selected.get("parameters", {}))
     stood_out, size_limit = study_size(results)
+    limit_source = "study" if size_limit is not None else None
+    if size_limit is None and stood_out is not None:
+        # The study set no limit, so its own tested size is the reference: shaping may not turn the
+        # verified design into a noticeably bigger part.
+        size_limit, limit_source = (
+            round(float(stood_out) + SIZE_ALLOWANCE_MM, 2),
+            "tested_size_plus_allowance",
+        )
     study_id = results.get("study_id", study_dir.name)
     builds: list[dict[str, Any]] = []
     chosen: dict[str, Any] = {}
@@ -444,12 +463,19 @@ def produce_earpiece(
         # code's job, outside the model's build budget, and a size that fails is reported, not hidden.
         base = next(b for b in builds if b["design_id"] == chosen["design_id"])
         sizes["M"] = {"design_id": base["design_id"], "ok": True}
-        for size, offset in (("S", -0.5), ("L", 0.5)):
+        for size, offsets in SIZE_OFFSETS_MM.items():
             size_id = f"{base['design_id']}-{size}"
-            report = build(patient_dir, {**base["shaping"], **locked, "fit_offset_mm": offset}, size_id)
+            report: dict[str, Any] = {}
+            used = offsets[0]
+            for used in offsets:
+                report = build(patient_dir, {**base["shaping"], **locked, "fit_offset_mm": used}, size_id)
+                if report.get("ok"):
+                    break
             sizes[size] = {
                 "design_id": size_id,
                 "ok": bool(report.get("ok")),
+                "fit_offset_mm": used if report.get("ok") else None,
+                "full_step": bool(report.get("ok")) and used == offsets[0],
                 "reasons": report.get("reasons", []),
             }
     record = {
@@ -460,7 +486,8 @@ def produce_earpiece(
         "study_collector": (None if studied is None else {"reach_mm": studied[0], "opening_mm2": studied[1]}),
         "size_mm": {
             "stood_out_in_study": stood_out,
-            "study_limit": size_limit,
+            "limit": size_limit,
+            "limit_source": limit_source,
             "built": next(
                 (
                     (b["report"].get("geometry") or {}).get("proud_of_concha_mm")
