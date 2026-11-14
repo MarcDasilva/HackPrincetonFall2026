@@ -84,7 +84,7 @@
     "free_text": "I want to hear people during activities."
   },
   "budget": {
-    "max_evaluation_cases": 6,
+    "max_evaluation_cases": 30,
     "max_parallel_evaluations": 2,
     "max_research_tool_calls_per_agent": 6,
     "max_run_seconds": 3600
