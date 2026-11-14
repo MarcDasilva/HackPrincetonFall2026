@@ -23,6 +23,9 @@ from horn_study.contracts import Contract, StudyState
 EventType = Literal[
     "study.started",
     "study.state_changed",
+    "orchestrator.assigned",
+    "orchestrator.evidence_opened",
+    "orchestrator.note_written",
     "research.agent_started",
     "research.source_read",
     "research.finding_added",

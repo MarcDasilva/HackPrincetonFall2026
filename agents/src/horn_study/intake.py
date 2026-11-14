@@ -282,7 +282,7 @@ def validate_request(
     """Check a request against the evaluator's declared inputs.
 
     Raises InputRejected listing every problem. On success returns the
-    immutable package shared by all investigators and the coordinator.
+    immutable package shared by all investigators and the orchestrator.
     """
     issues: list[InputIssue] = []
 

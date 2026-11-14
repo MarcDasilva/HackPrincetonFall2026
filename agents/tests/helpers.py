@@ -283,13 +283,60 @@ def valid_draft(needs: bool = True) -> dict[str, Any]:
     }
 
 
+INVESTIGATOR_NAMES = ("hearing_research", "use_context_research", "acoustic_design_research")
+
+
+def tool_results(messages: list[BaseMessage]) -> list[tuple[str, str]]:
+    """(tool name, result text) for every answered tool call, in the order the answers arrived."""
+    names = {
+        tool_call["id"]: tool_call["name"]
+        for message in messages
+        if isinstance(message, AIMessage)
+        for tool_call in message.tool_calls
+    }
+    return [
+        (names.get(message.tool_call_id, message.name or ""), str(message.content))
+        for message in messages
+        if isinstance(message, ToolMessage)
+    ]
+
+
+def delegate(*names: str, direction: str = "Research your question for this study.") -> AIMessage:
+    """One turn that assigns research to each named investigator at once."""
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "task",
+                "args": {"description": direction, "subagent_type": name},
+                "id": f"assign-{name}",
+            }
+            for name in names
+        ],
+    )
+
+
 def coordinator_responder(*drafts: dict[str, Any]) -> Responder:
-    """Return each draft in turn, one per planning round."""
+    """Script the orchestrator through a whole study.
+
+    It assigns all three investigators in one turn, submits each draft in turn until one is
+    frozen, runs the experiments, asks for the report, and stops.
+    """
 
     def respond(messages: list[BaseMessage], bound: list[str]) -> AIMessage:
-        rounds = sum(1 for m in messages if isinstance(m, AIMessage) and m.tool_calls)
-        draft = drafts[min(rounds, len(drafts) - 1)]
-        return call("PlanDraft", copy.deepcopy(draft), f"plan-{rounds}")
+        results = tool_results(messages)
+        done = [name for name, _ in results]
+        if not any(name == "task" and not text.startswith("Not assigned") for name, text in results):
+            return delegate(*INVESTIGATOR_NAMES)
+        submitted = [text for name, text in results if name == "submit_plan"]
+        if not any(text.startswith("Plan frozen") for text in submitted):
+            draft = drafts[min(len(submitted), len(drafts) - 1)]
+            return call("submit_plan", copy.deepcopy(draft), f"plan-{len(submitted)}")
+        if "run_experiments" not in done:
+            return call("run_experiments", {}, "run-1")
+        if "write_report" not in done:
+            return call("write_report", {}, "report-request-1")
+        return AIMessage(content="The study is complete.")
 
     return respond
 

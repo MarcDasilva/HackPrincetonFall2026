@@ -34,11 +34,8 @@ from horn_study.events import ARTIFACT_NAMES, ArtifactStore, EventBus, StudyExis
 from horn_study.followup import follow_up_request
 from horn_study.intake import InputRejected
 from horn_study.workflow import (
-    NODE_EVALUATE,
-    NODE_FREEZE,
-    NODE_INTERPRET,
-    NODE_PLAN,
-    NODE_SYNTHESIZE,
+    NODE_COMPLETE,
+    NODE_ORCHESTRATE,
     RESEARCH_NODES,
     IllegalTransition,
     StudyStateMachine,
@@ -150,7 +147,7 @@ async def test_investigators_hold_evidence_tools_only(tmp_path):
 
     for offered in harness.research_model.log.bound_tool_sets:
         assert set(offered) == EVIDENCE_TOOLS | READ_ONLY_FILE_TOOLS | {"InvestigatorOutput"}
-    assert harness.coordinator_model.log.bound_tool_sets == [["PlanDraft"]]
+    assert all("submit_plan" in offered for offered in harness.coordinator_model.log.bound_tool_sets)
     assert harness.interpreter_model.log.bound_tool_sets == [["ReportNarrative"]]
 
 
@@ -309,7 +306,8 @@ async def test_no_evidence_means_no_plan_and_no_evaluation(tmp_path):
     assert outcome.state is StudyState.FAILED
     assert outcome.failure["kind"] == "no_evidence"
     assert harness.evaluator.calls == []
-    assert harness.coordinator_model.log.calls == 0
+    assert "plan.frozen" not in types(outcome)
+    assert "plan.revision_requested" not in types(outcome)
     assert load(outcome, "results.json")["state"] == "FAILED"
 
 
@@ -350,7 +348,7 @@ async def test_a_draft_is_corrected_before_freezing_and_never_after(tmp_path):
     revision = first(outcome, "plan.revision_requested")
     assert "Over budget" in revision.data["errors"][0]
     assert revision.sequence < first(outcome, "plan.frozen").sequence
-    assert harness.coordinator_model.log.calls == 2
+    assert [e.data["revision"] for e in outcome.events.history if e.type == "plan.revision_requested"] == [1]
     assert load(outcome, "plan.json")["plan_version"] == 2
     assert len(harness.evaluator.calls) == 12
 
@@ -364,9 +362,10 @@ async def test_a_plan_that_stays_invalid_fails_without_evaluating(tmp_path):
     assert outcome.state is StudyState.FAILED
     assert outcome.failure["kind"] == "plan_invalid"
     assert "Over budget" in outcome.failure["details"][0]
-    assert harness.coordinator_model.log.calls == 1 + make_request().get("budget", {}).get(
-        "max_plan_revisions", 2
-    )
+    assert [e.data["revision"] for e in outcome.events.history if e.type == "plan.revision_requested"] == [
+        1,
+        2,
+    ]
     assert harness.evaluator.calls == []
     assert "plan.frozen" not in types(outcome)
 
@@ -1111,14 +1110,7 @@ def test_the_lifecycle_only_moves_forward():
         machine.transition(StudyState.CREATED)
 
 
-async def test_nothing_leads_from_results_back_to_planning_or_evaluation(tmp_path):
-    captured = {}
-
-    class Capture(BaseTracer):
-        def _persist_run(self, run: Run) -> None:
-            captured["root"] = run
-
-    harness = Harness(tmp_path, callbacks=[Capture()])
+async def test_the_workflow_only_moves_from_the_orchestrator_to_the_completion_check(tmp_path):
     from horn_study import workflow
 
     built = {}
@@ -1130,26 +1122,16 @@ async def test_nothing_leads_from_results_back_to_planning_or_evaluation(tmp_pat
 
     workflow.build_graph = spy
     try:
-        await run_study(make_request(), harness.deps)
+        await run_study(make_request(), Harness(tmp_path).deps)
     finally:
         workflow.build_graph = original
 
     edges = {(edge.source, edge.target) for edge in built["graph"].get_graph().edges}
-
-    def reachable(start: str) -> set[str]:
-        seen, frontier = set(), [start]
-        while frontier:
-            node = frontier.pop()
-            for source, target in edges:
-                if source == node and target not in seen:
-                    seen.add(target)
-                    frontier.append(target)
-        return seen
-
-    assert reachable(NODE_EVALUATE) == {NODE_INTERPRET, "__end__"}
-    assert reachable(NODE_INTERPRET) == {"__end__"}
-    assert (NODE_FREEZE, NODE_PLAN) in edges
-    assert all((name, NODE_SYNTHESIZE) in edges for name in RESEARCH_NODES)
+    assert edges == {
+        ("__start__", NODE_ORCHESTRATE),
+        (NODE_ORCHESTRATE, NODE_COMPLETE),
+        (NODE_COMPLETE, "__end__"),
+    }
 
 
 async def test_the_trace_exposes_branches_planning_evaluation_and_report(tmp_path):
@@ -1165,15 +1147,7 @@ async def test_the_trace_exposes_branches_planning_evaluation_and_report(tmp_pat
     (root,) = roots
     assert root.name == f"study {outcome.study_id}"
     assert str(root.id) == outcome.events.history[0].trace.run_id
-    children = {child.name: child for child in root.child_runs}
-    assert set(children) >= {
-        *RESEARCH_NODES,
-        NODE_SYNTHESIZE,
-        NODE_PLAN,
-        NODE_FREEZE,
-        NODE_EVALUATE,
-        NODE_INTERPRET,
-    }
+    assert [child.name for child in root.child_runs] == [NODE_ORCHESTRATE, NODE_COMPLETE]
 
     def names(run: Run) -> set[str]:
         found = {run.name}
@@ -1181,20 +1155,37 @@ async def test_the_trace_exposes_branches_planning_evaluation_and_report(tmp_pat
             found |= names(child)
         return found
 
-    assert "hearing_research_agent" in names(children["hearing_research"])
-    assert "search_literature" in names(children["hearing_research"])
-    assert "study_coordinator" in names(children[NODE_PLAN])
-    assert "results_interpreter" in names(children[NODE_INTERPRET])
+    def find(run: Run, name: str) -> list[Run]:
+        found = [run] if run.name == name else []
+        for child in run.child_runs:
+            found += find(child, name)
+        return found
 
-    attempts = [run for run in children[NODE_EVALUATE].child_runs if run.name == "evaluate_experiment"]
+    # Everything the study did hangs under the one orchestrator run.
+    (orchestrator,) = find(root, "study_orchestrator")
+    everything = names(orchestrator)
+    assert {*RESEARCH_NODES, "submit_plan", "run_experiments", "write_report"} <= everything
+    assert (
+        names(root.child_runs[1]) & {"evaluate_experiment", "results_interpreter", *RESEARCH_NODES} == set()
+    )
+
+    (hearing,) = find(orchestrator, "hearing_research")
+    assert "hearing_research_agent" in names(hearing)
+    assert "search_literature" in names(hearing)
+    (report,) = find(orchestrator, "write_report")
+    assert "results_interpreter" in names(report)
+    assert "evaluate_experiment" not in names(report)
+
+    (run_experiments,) = find(orchestrator, "run_experiments")
+    attempts = find(run_experiments, "evaluate_experiment")
     assert len(attempts) == 12
+    assert len(find(root, "evaluate_experiment")) == 12
     metadata = attempts[0].extra["metadata"]
     assert metadata["study_id"] == outcome.study_id
     assert metadata["attempt"] == 1
     assert metadata["evaluator_version"] == "fixture-0.1"
     assert metadata["plan_hash"] == load(outcome, "plan.json")["plan_hash"]
     assert {run.extra["metadata"]["experiment_id"] for run in attempts} == set(harness.evaluator.calls)
-    assert "evaluate_experiment" not in names(children[NODE_INTERPRET])
     assert root.extra["metadata"]["evaluator_version"] == "fixture-0.1"
 
 

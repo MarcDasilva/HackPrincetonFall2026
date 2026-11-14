@@ -1,6 +1,6 @@
-"""The study coordinator: evidence in, one validated frozen plan out.
+"""Plan validation: a draft in, one validated frozen plan out.
 
-A model proposes the plan. Code decides whether it is executable: every
+The orchestrator proposes the plan. Code decides whether it is executable: every
 candidate, scenario, metric, and case count is checked against the evaluator
 capabilities and the budget before the plan is frozen. Corrections happen
 here, before any result exists.
@@ -8,16 +8,11 @@ here, before any result exists.
 
 from __future__ import annotations
 
-import json
 import math
 import re
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from langchain.agents import create_agent
-from langchain.agents.middleware import ModelRetryMiddleware
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import BaseMessage, HumanMessage
 from pydantic import BaseModel, Field, ValidationError
 
 from horn_study.contracts import (
@@ -31,13 +26,11 @@ from horn_study.contracts import (
     MetricConstraint,
     NeedCoverage,
     ParameterValue,
-    ResearchRecord,
     SelectionRule,
     StartingPackage,
     StudyPlan,
 )
 from horn_study.intake import normalize_token, user_needs
-from horn_study.research import render_package
 
 _ID = re.compile(ID_PATTERN)
 
@@ -102,7 +95,7 @@ class DraftSelection(BaseModel):
 
 
 class PlanDraft(BaseModel):
-    """The coordinator's proposal. Not executable until validated and frozen."""
+    """The orchestrator's proposal. Not executable until validated and frozen."""
 
     rationale: str
     hypotheses: list[DraftHypothesis]
@@ -117,13 +110,8 @@ class PlanDraft(BaseModel):
     future_work: list[str]
 
 
-COORDINATOR_PROMPT = """\
-You are the study coordinator for a study of a passive, battery-free hearing device: a \
-printed horn whose geometry shapes its acoustic response. Three investigators have researched \
-the hearing profile, the use context, and the acoustic design space. Your job is to turn their \
-findings into one coherent, executable study: hypotheses, controls, candidate designs, fixed \
-comparison settings, and the reason for each choice.
-
+PLAN_RULES = """\
+The plan
 The plan is fixed before anything is evaluated. Once it is frozen, exactly these cases run \
 and the study ends with a report. Nothing can be added after results exist, so include what \
 you want compared now, as far as the evaluation budget allows: controls, a spread across a \
@@ -187,68 +175,12 @@ the complete plan.\
 """
 
 
-def coordinator_brief(package: StartingPackage, research: ResearchRecord) -> str:
-    research_view = {
-        "investigators": [
-            {
-                "investigator": branch.investigator,
-                "status": branch.status,
-                "error": branch.error,
-                "report": branch.output.model_dump(mode="json") if branch.output else None,
-            }
-            for branch in research.branches
-        ],
-        "findings": [finding.model_dump(mode="json") for finding in research.findings],
-    }
-    return (
-        "Starting package (the same one every investigator received):\n\n"
-        + render_package(package)
-        + "\n\nResearch results:\n\n"
-        + json.dumps(research_view, indent=1, ensure_ascii=False)
-        + "\n\nDesign the study plan."
-    )
-
-
 def revision_request(errors: list[str]) -> str:
     listed = "\n".join(f"- {error}" for error in errors)
     return (
         "The plan cannot be frozen yet. No experiment has run. "
         f"Fix these validation errors and resubmit the complete plan:\n{listed}"
     )
-
-
-async def propose_plan(
-    model: BaseChatModel, messages: list[BaseMessage], *, study_id: str, revision: int
-) -> tuple[PlanDraft, list[BaseMessage]]:
-    """Ask the coordinator for a draft. It has no tools of any kind."""
-    agent = create_agent(
-        model,
-        tools=[],
-        system_prompt=COORDINATOR_PROMPT,
-        middleware=[ModelRetryMiddleware(max_retries=2, on_failure="error")],
-        response_format=PlanDraft,
-        name="study_coordinator",
-    )
-    conversation: Any = {"messages": messages}
-    result = await agent.ainvoke(
-        conversation,
-        config={
-            "run_name": "study_coordinator",
-            "recursion_limit": 12,
-            "tags": ["planning"],
-            "metadata": {"study_id": study_id, "component": "study_coordinator", "plan_revision": revision},
-        },
-    )
-    draft = result.get("structured_response")
-    if not isinstance(draft, PlanDraft):
-        raise PlanningFailed(["The coordinator did not return a structured plan."])
-    return draft, list(result["messages"])
-
-
-class PlanningFailed(Exception):
-    def __init__(self, errors: list[str]) -> None:
-        self.errors = errors
-        super().__init__("; ".join(errors))
 
 
 # --------------------------------------------------------------------------
@@ -361,7 +293,7 @@ def build_plan(
     """Validate a draft against capabilities and budget.
 
     Returns (plan, []) when executable, or (None, errors) describing every
-    problem in terms the coordinator can act on.
+    problem in terms the orchestrator can act on.
     """
     caps: EvaluatorCapabilities = package.capabilities
     errors: list[str] = []
@@ -694,7 +626,3 @@ def freeze_plan(plan: StudyPlan) -> StudyPlan:
     if plan.is_frozen:
         raise ValueError("The plan is already frozen.")
     return plan.model_copy(update={"plan_hash": plan.compute_hash(), "frozen_at": datetime.now(UTC)})
-
-
-def initial_messages(package: StartingPackage, research: ResearchRecord) -> list[BaseMessage]:
-    return [HumanMessage(content=coordinator_brief(package, research))]

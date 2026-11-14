@@ -134,6 +134,12 @@ class Budget(Contract):
     max_evaluation_cases: int = Field(default=12, ge=1, le=500)
     max_parallel_evaluations: int = Field(default=2, ge=1, le=32)
     max_research_tool_calls_per_agent: int = Field(default=6, ge=1, le=40)
+    max_research_follow_ups: int = Field(
+        default=1,
+        ge=0,
+        le=6,
+        description="How many times in total the orchestrator may send an investigator back for more.",
+    )
     max_attempts_per_experiment: int = Field(default=2, ge=1, le=5)
     max_plan_revisions: int = Field(default=2, ge=0, le=5)
     max_run_seconds: float = Field(default=1800, gt=0, le=6 * 3600)
@@ -379,7 +385,7 @@ class PriorStudyContext(Contract):
 
 
 class StartingPackage(Contract):
-    """The immutable context every investigator and the coordinator receive."""
+    """The immutable context every investigator and the orchestrator receive."""
 
     study_id: str
     parent_study_id: str | None
