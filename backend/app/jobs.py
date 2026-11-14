@@ -1,7 +1,9 @@
 """Background pipeline jobs: photo -> ear mesh -> patient context -> 3D aid.
 
 State lives on disk (DATA_DIR/patients/<id>/job.json) so the server can restart and
-the frontend can poll. One worker by default: the models share one device.
+the frontend can poll. Two workers by default, so a patient's two ears are processed side by side:
+the networks still take turns (earrecon's model lock), but the slow CPU steps (HASPI references,
+waves, aid search) overlap. A restart re-queues jobs it interrupted (resume_interrupted).
 """
 import json
 import os
@@ -16,6 +18,7 @@ _pool = ThreadPoolExecutor(max_workers=settings.workers)
 _write_lock = threading.Lock()
 
 STEPS = ["ear", "context", "waves", "aid", "acoustics", "score"]
+SIDE_CHECK_MARGIN = 0.04   # fit difference below which the side check has no opinion
 WAVE_DIRECTIONS = [0, 45, 90, 135, 180]   # azimuths on the ear's side; the flat head plane cannot model the far side
 
 
@@ -86,9 +89,16 @@ def run_full(pid, request):
     log = _logger(pid)
     try:
         _update(pid, status="running", step="ear")
+        try:      # second opinion on the side: the model (right ears only) fits the photo better one way round
+            sc = er.classify_side(os.path.join(d, "photo.jpg"), request["box"])
+            sc["agrees"] = sc["side"] == request["side"] or sc["margin"] < SIDE_CHECK_MARGIN
+            _update(pid, results={"side_check": sc})
+            log(f"side check: fits {sc['fit']}, " + ("agrees" if sc["agrees"] else f"looks like a {sc['side']} ear"))
+        except Exception as e:
+            log(f"side check skipped: {e}")
         ear = er.reconstruct(os.path.join(d, "photo.jpg"), os.path.join(d, "ear"), request["box"],
                              left=request["side"] == "left", height_mm=request["ear_height_mm"], log=log)
-        _update(pid, results={"ear": ear}, step="context")
+        _update(pid, results={**read_job(pid).get("results", {}), "ear": ear}, step="context")
 
         cfg = context.load_defaults()
         cfg["patient"].update({"id": pid, "ear_mesh": os.path.join(d, "ear", "ear.ply"),
@@ -155,3 +165,19 @@ def run_aid(pid, overrides):
 
 def submit(fn, *args):
     _pool.submit(fn, *args)
+
+
+def resume_interrupted():
+    """Re-queue photo jobs a restart cut off (status queued/running on disk). Their partial outputs are
+    overwritten by the rerun. Returns the ids re-queued."""
+    root = os.path.join(settings.data_dir, "patients")
+    out = []
+    for pid in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        job = read_job(pid)
+        if not job or job.get("status") not in ("queued", "running") or "box" not in job.get("request", {}):
+            continue
+        job.update(status="queued", step=None, log=job.get("log", []) + [f"{time.strftime('%H:%M:%S')} re-queued after a server restart"])
+        write_job(pid, job)
+        submit(run_full, pid, job["request"])
+        out.append(pid)
+    return out

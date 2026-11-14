@@ -1,10 +1,12 @@
 // Backend calls for the scene grid (backend/app/sim_api.py), proxied under /api by next.config.ts.
-import type { EarGrid } from "./fdtd";
+import type { HeadGrid, Side } from "./fdtd";
 
-export const AVERAGE_ID = "000000000000";
+/** The average ear (AudioEar's mean, not anyone's ear) as a right ear, and mirrored as a left ear. */
+export const AVERAGE_IDS: Record<Side, string> = { right: "000000000000", left: "000000000001" };
+export const isAverage = (pid: string) => pid === AVERAGE_IDS.right || pid === AVERAGE_IDS.left;
 
-export type PatientInfo = { id: string; average_ear: boolean; side: "left" | "right"; audiogram_db_hl: Record<string, number>; audiogram_is_example: boolean };
-export type GridWithPatient = EarGrid & { patient?: PatientInfo };
+export type PatientInfo = { id: string; average_ear: boolean; side: Side; audiogram_db_hl: Record<string, number>; audiogram_is_example: boolean };
+export type HeadWithPatients = HeadGrid & { patients?: Record<Side, PatientInfo> };
 
 export type DesignResult = {
   freqs_hz: number[]; target_db: number[]; reach_db: number[]; share: number[];
@@ -30,7 +32,23 @@ async function json<T>(r: Response): Promise<T> {
   return r.json();
 }
 
-export const fetchGrid = (pid: string) => fetch(`/api/sim/patients/${pid}/grid`).then((r) => json<GridWithPatient>(r));
+/** Both ears on the dummy head; each id must be a patient scanned for that side. `shape`: the head shape
+ * fitted from a front photo (createHeadShape); null = the average head. */
+export const fetchHead = (ids: Record<Side, string>, shape: string | null) =>
+  fetch(`/api/sim/head?left=${ids.left}&right=${ids.right}${shape ? `&shape=${shape}` : ""}`).then((r) => json<HeadWithPatients>(r));
+
+export type HeadShapeMeta = {
+  measured: boolean; breadth_mm: number; bizygomatic_mm: number; length_mm: number; chin_mm: number; crown_mm: number;
+  eye_line_mm: number; ipd_mm: number; mm_per_px: number; roll_deg: number; yaw_deg: number | null;
+};
+export type HeadShapeFit = {
+  id: string; meta: HeadShapeMeta; warnings: string[];
+  overlay: { silhouette_px: number[][]; face_oval_px: number[][]; canal_line_px: number[][]; measured_to_px: number };
+};
+/** Fit the head from a front photo's face landmarks (the photo itself stays in the browser). */
+export const createHeadShape = (face: { landmarks: number[][]; image_w: number; image_h: number; yaw_deg: number | null }) =>
+  fetch("/api/sim/head_shapes", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(face) })
+    .then((r) => json<HeadShapeFit>(r));
 export const startDesign = (pid: string, audiogram_db_hl: Record<string, number>, scenes: DesignScene[]) =>
   fetch(`/api/sim/patients/${pid}/design`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ audiogram_db_hl, scenes }) })
     .then((r) => json<{ status_url: string }>(r));
