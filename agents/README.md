@@ -24,7 +24,7 @@ uv run horn-study replay dev_with_needs_001                     # re-emit a reco
 ```
 
 `run` needs a chat model key.
-The default model is `anthropic:claude-opus-5-5`, so set `ANTHROPIC_API_KEY`.
+The default model is `anthropic:claude-sonnet-5-5`, so set `ANTHROPIC_API_KEY`.
 Any `provider:model` string that LangChain's `init_chat_model` understands works through `HORN_STUDY_MODEL`.
 `validate`, `capabilities`, `follow-up` (without `--run`), and `replay` need no keys.
 

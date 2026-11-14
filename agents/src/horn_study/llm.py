@@ -13,7 +13,7 @@ from typing import Any, Literal
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
 
-DEFAULT_MODEL = "anthropic:claude-opus-5-5"
+DEFAULT_MODEL = "anthropic:claude-sonnet-5-5"
 MODEL_ENV = "HORN_STUDY_MODEL"
 MAX_TOKENS_ENV = "HORN_STUDY_MAX_TOKENS"
 DEFAULT_MAX_TOKENS = 16000
