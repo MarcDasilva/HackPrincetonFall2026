@@ -17,7 +17,16 @@ export async function GET(request: NextRequest) {
         },
       },
     );
-    await supabase.auth.exchangeCodeForSession(code);
+    const { error } = await supabase.auth.exchangeCodeForSession(code);
+    // The popup flow (components/GoogleSignIn.tsx) sets this cookie. Its window must NOT navigate to /dashboard — it tells the landing page and closes, so the landing page stays loaded and plays the outro.
+    if (request.cookies.get("auris_popup")) {
+      const res = new NextResponse(
+        `<!doctype html><script>try{opener.postMessage(${error ? '"auris-failed"' : '"auris-signed-in"'},location.origin)}catch(e){}close()</script>You can close this window.`,
+        { headers: { "content-type": "text/html" } },
+      );
+      res.cookies.delete("auris_popup");
+      return res;
+    }
   }
   return NextResponse.redirect(`${origin}/dashboard`);
 }

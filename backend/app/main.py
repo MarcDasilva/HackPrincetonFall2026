@@ -23,11 +23,12 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
-from . import jobs
+from . import jobs, sim_api
 from .settings import settings
 
 app = FastAPI(title="Horn aid API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_methods=["*"], allow_headers=["*"])
+app.include_router(sim_api.router)
 
 ID_RE = re.compile(r"^[a-f0-9]{12}$")
 FILES = {
@@ -109,7 +110,34 @@ def get_patient(pid: str):
     job = jobs.read_job(pid)
     d = jobs.patient_dir(pid)
     job["files"] = {k: f"/api/patients/{pid}/files/{k}" for k, v in FILES.items() if os.path.exists(os.path.join(d, v))}
+    if os.path.exists(os.path.join(d, "waves", "runs.json")):
+        job["files"]["waves"] = f"/api/patients/{pid}/waves/index.html"
     return job
+
+
+WAVE_FILE_RE = re.compile(r"^[A-Za-z0-9_.+-]+\.(html|json|png|wav)$")
+
+
+@app.post("/api/patients/{pid}/waves", status_code=202)
+def rerun_waves(pid: str):
+    _check_id(pid)
+    if jobs.read_job(pid)["status"] in ("queued", "running"):
+        raise HTTPException(409, "this patient is still being processed")
+    jobs.submit(jobs.run_waves, pid)
+    return {"id": pid, "status_url": f"/api/patients/{pid}"}
+
+
+@app.get("/api/patients/{pid}/waves/{name}")
+def get_wave_file(pid: str, name: str):
+    """The wave viewer and its frames. Names are flat and pattern-checked, so a request can NEVER
+    leave the patient's waves folder."""
+    _check_id(pid)
+    if not WAVE_FILE_RE.match(name):
+        raise HTTPException(404, "unknown file")
+    p = os.path.join(jobs.patient_dir(pid), "waves", name)
+    if not os.path.isfile(p):
+        raise HTTPException(404, "file not ready")
+    return FileResponse(p)
 
 
 class AidDesign(BaseModel):

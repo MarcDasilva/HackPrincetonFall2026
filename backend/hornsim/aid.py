@@ -47,12 +47,17 @@ def frames(path):
     return t, n, np.cross(t, n)
 
 
-def tube(path, radii, seg=28):
-    """Closed (capped) tube mesh with varying radius."""
-    _, n, b = frames(path)
+def tube(path, radii, seg=28, fr=None):
+    """Closed (capped) tube mesh. `radii` is per station, or [station, angle] for a shaped section
+    whose angle j points along cos(a_j)·n + sin(a_j)·b of `frames(path)`. Pass `fr` (sliced from a
+    longer path's frames) when this tube must line up angle-for-angle with a tube on that path."""
+    _, n, b = fr if fr is not None else frames(path)
+    if radii.ndim == 2:
+        seg = radii.shape[1]
     ang = np.linspace(0, 2 * np.pi, seg, endpoint=False)
     ring = np.cos(ang)[None, :, None] * n[:, None, :] + np.sin(ang)[None, :, None] * b[:, None, :]
-    verts = (path[:, None, :] + radii[:, None, None] * ring).reshape(-1, 3)
+    r = radii[:, :, None] if radii.ndim == 2 else radii[:, None, None]
+    verts = (path[:, None, :] + r * ring).reshape(-1, 3)
     faces = []
     for i in range(len(path) - 1):
         for j in range(seg):
@@ -120,9 +125,11 @@ def solid_edt(world, tip_r, tip_len):
     return ndimage.distance_transform_edt(vox) * g
 
 
-def clearance(path, world, edt, tip_r, tip_len, top_n):
+def clearance(path, world, edt, tip_r, tip_len, top_n, entry_slack_mm=0.0):
     """Distance (mm) from each point to the outside of the solid: shell space or canal tip.
-    `edt` comes from solid_edt. Points above `top_n` (the mouth breaking through the faceplate) count as clear."""
+    `edt` comes from solid_edt. Points above `top_n` (the mouth breaking through the faceplate) count as clear.
+    `entry_slack_mm` > 0 also treats the last stretch above the canal opening as tip, so a bore that
+    ends AT the opening (no stem into the canal, tip_len 0) is not failed for the hole it opens into."""
     idx = np.round((path - world.origin) @ world.axes.T / world.voxel_mm).astype(int)
     idx[:, 2] += edt.shape[2] - world.voxels.shape[2]
     ok = np.all((idx >= 0) & (idx < edt.shape), axis=1)
@@ -132,13 +139,15 @@ def clearance(path, world, edt, tip_r, tip_len, top_n):
     ax_d = rel @ world.canal_axis
     rad_d = np.linalg.norm(rel - ax_d[:, None] * world.canal_axis, axis=1)
     d = np.where((ax_d >= 0) & (ax_d < tip_len), tip_r - rad_d, d)     # inside the canal only the tip is solid: exact
+    if entry_slack_mm > 0:
+        d = np.where((ax_d > -entry_slack_mm) & (ax_d < 0), np.maximum(d, tip_r - rad_d), d)
     above = (path - world.rim_center) @ world.axes[2] > top_n
     return np.where(above, 99.0, d)
 
 
-def check(path, radii, world, edt, wall, tip_r, tip_len, top_n):
+def check(path, radii, world, edt, wall, tip_r, tip_len, top_n, entry_slack_mm=0.0):
     """Smallest clearance (mm) to the outside and between neighbouring turns. >= 0 means it fits."""
-    d = clearance(path, world, edt, tip_r, tip_len, top_n)
+    d = clearance(path, world, edt, tip_r, tip_len, top_n, entry_slack_mm)
     surf = np.min(d - radii - wall)
     s = np.r_[0, np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]
     i, j = cKDTree(path).query_pairs(r=2 * radii.max() + wall + 1, output_type="ndarray").T

@@ -18,7 +18,7 @@ MODEL_ENV = "HORN_STUDY_MODEL"
 MAX_TOKENS_ENV = "HORN_STUDY_MAX_TOKENS"
 DEFAULT_MAX_TOKENS = 16000
 
-Role = Literal["research", "coordinator", "interpreter"]
+Role = Literal["research", "coordinator", "interpreter", "designer"]
 
 
 def model_name(role: Role) -> str:

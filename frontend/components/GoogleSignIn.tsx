@@ -1,9 +1,11 @@
 "use client";
 
 import { supabase } from "@/lib/supabase";
-import { useState } from "react";
-import { MetalFx } from "metal-fx";
-import { useMounted } from "@/lib/useMounted";
+import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import gsap from "gsap";
+import { useMounted } from "./useMounted";
+import { MetalFx } from "@/components/metal";
 
 const buttonStyle: React.CSSProperties = {
   display: "inline-flex",
@@ -17,8 +19,6 @@ const buttonStyle: React.CSSProperties = {
   borderRadius: 999,
   background: "transparent",
   color: "#ffffff",
-  // Transparent fill means the waves/grid show through — the shadow keeps the label readable over bright bars.
-  textShadow: "0 1px 3px rgba(0,0,0,0.9), 0 0 10px rgba(0,0,0,0.8)",
   font: "inherit",
   fontSize: "clamp(16px, 1.5vw, 22px)",
   letterSpacing: "0.06em",
@@ -34,52 +34,95 @@ const GoogleG = () => (
   </svg>
 );
 
+const clearPopupFlag = () => {
+  document.cookie = "auris_popup=; path=/; max-age=0";
+};
+
 export default function GoogleSignIn() {
   const [open, setOpen] = useState(false);
+  const router = useRouter();
+  const leaving = useRef(false);
   const mounted = useMounted();
 
-  const signIn = () =>
+  // Google sign-in runs in a POPUP so this page never reloads: a full-page OAuth redirect lands on a cold page that must rebuild the title, waves and every WebGL ring from scratch — that rebuild is the lag and the jagged intro. Here the landing page stays warm, plays the outro, then navigates client-side. app/auth/callback/route.ts owns the popup's other half (the postMessage).
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      if (e.origin !== location.origin || e.data !== "auris-signed-in" || leaving.current) return;
+      leaving.current = true;
+      router.prefetch("/dashboard");
+      // Hero fades while the waves slide off the bottom; the dashboard's own intro takes over from the bare grid.
+      gsap
+        .timeline({ onComplete: () => router.push("/dashboard") })
+        .to("[data-landing-hero]", { opacity: 0, duration: 0.7, ease: "power1.in" })
+        .to("[data-landing-waves]", { yPercent: 100, duration: 1.3, ease: "power2.in" }, 0.2);
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [router]);
+
+  const signIn = async () => {
+    if (!supabase) return;
     // redirectTo must be listed in Supabase Auth > URL Configuration > Redirect URLs — otherwise Supabase falls back to the Site URL and /auth/callback never exchanges the code.
-    supabase?.auth.signInWithOAuth({
-      provider: "google",
-      options: { redirectTo: `${location.origin}/auth/callback` },
-    });
+    const redirectTo = `${location.origin}/auth/callback`;
+    // Open synchronously inside the click or the browser blocks it; the URL is filled in once Supabase returns it.
+    const popup = window.open("", "auris-login", "width=500,height=650");
+    if (!popup) {
+      // Popup blocked: fall back to the full-page redirect (plain dashboard intro, no outro).
+      clearPopupFlag();
+      supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo } });
+      return;
+    }
+    document.cookie = "auris_popup=1; path=/; max-age=300; samesite=lax";
+    const { data, error } = await supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo, skipBrowserRedirect: true } });
+    if (error || !data.url) {
+      popup.close();
+      clearPopupFlag();
+      return;
+    }
+    popup.location.href = data.url;
+    // A popup closed without finishing must not leave the flag behind — a later full-page login would hit the popup branch.
+    const watch = setInterval(() => {
+      if (popup.closed) {
+        clearInterval(watch);
+        clearPopupFlag();
+      }
+    }, 500);
+  };
 
+  // The button has no fill so the grid shows through; the metal ring is the only chrome.
+  // The ring mounts after hydration (see useMounted); until then the same button renders bare, so nothing shifts.
   const button = (
-      <button
-        type="button"
-        aria-label="Sign in with Google"
-        onClick={signIn}
-        onMouseEnter={() => setOpen(true)}
-        onMouseLeave={() => setOpen(false)}
-        onFocus={() => setOpen(true)}
-        onBlur={() => setOpen(false)}
-        disabled={!supabase}
-        title={supabase ? "Sign in with Google" : "Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in .env.local"}
-        style={{ ...buttonStyle, cursor: supabase ? "pointer" : "not-allowed", opacity: supabase ? 1 : 0.6 }}
+    <button
+      type="button"
+      aria-label="Sign in with Google"
+      onClick={signIn}
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+      onFocus={() => setOpen(true)}
+      onBlur={() => setOpen(false)}
+      disabled={!supabase}
+      title={supabase ? "Sign in with Google" : "Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in .env.local"}
+      style={{ ...buttonStyle, cursor: supabase ? "pointer" : "not-allowed", opacity: supabase ? 1 : 0.6 }}
+    >
+      <GoogleG />
+      {/* Width animates via max-width — auto widths can't transition. MetalFx re-measures through its ResizeObserver, so the ring follows the slide. */}
+      <span
+        aria-hidden="true"
+        style={{
+          overflow: "hidden",
+          whiteSpace: "nowrap",
+          maxWidth: open ? 120 : 0,
+          marginLeft: open ? 14 : 0,
+          opacity: open ? 1 : 0,
+          transition: "max-width 0.8s ease, margin-left 0.8s ease, opacity 0.6s ease",
+        }}
       >
-        <GoogleG />
-        {/* Width animates via max-width — auto widths can't transition. MetalFx re-measures through its ResizeObserver, so the ring follows the slide. */}
-        <span
-          aria-hidden="true"
-          style={{
-            overflow: "hidden",
-            whiteSpace: "nowrap",
-            maxWidth: open ? 120 : 0,
-            marginLeft: open ? 14 : 0,
-            opacity: open ? 1 : 0,
-            transition: "max-width 0.8s ease, margin-left 0.8s ease, opacity 0.6s ease",
-          }}
-        >
-          sign in
-        </span>
-      </button>
+        sign in
+      </span>
+    </button>
   );
-
-  // MetalFx renders differently on the server (no WebGL) and in the browser; add the ring
-  // only after hydration so the server HTML matches the first client render.
   return mounted ? (
-    <MetalFx preset="silver" variant="button" innerShadow>
+    <MetalFx preset="silver" variant="button" innerShadow normalizeHostStyles={false}>
       {button}
     </MetalFx>
   ) : (

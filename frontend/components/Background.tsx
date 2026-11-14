@@ -2,7 +2,7 @@ import ShapeGrid from "@/components/ShapeGrid";
 import SlicedWaves from "@/components/SlicedWaves";
 
 /** ONE source for the Auris backdrop — the splash and the dashboard both render this, so they cannot drift apart. Fixed so it stays put while the dashboard scrolls. */
-export default function Background() {
+export default function Background({ waves = true }: { waves?: boolean }) {
   return (
     <div style={{ position: "fixed", inset: 0, background: "#000", pointerEvents: "none" }}>
       {/* mouseInteraction off: pointer never lights cells; clickCascade off: clicks do nothing */}
@@ -28,7 +28,15 @@ export default function Background() {
         mouseInteraction={false}
         intro={false}
       />
-      <div style={{ position: "absolute", inset: 0 }}>
+      {waves && <Waves />}
+    </div>
+  );
+}
+
+/** The wave layer. data-landing-waves is the handle the post-login outro (components/GoogleSignIn.tsx) slides off screen — rename BOTH or the waves stay put. */
+function Waves() {
+  return (
+    <div data-landing-waves style={{ position: "absolute", inset: 0 }}>
         <SlicedWaves
           color1="#10b981"
           color2="#ff5fa2"
@@ -57,6 +65,5 @@ export default function Background() {
           lightMode={false}
         />
       </div>
-    </div>
   );
 }
