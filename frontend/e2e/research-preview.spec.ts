@@ -10,6 +10,8 @@ test("research preview: four agent boxes show their study events around the lead
     await expect(box).toBeVisible();
     await expect(box.getByTestId("traces").locator("> div")).not.toHaveCount(0);
     await expect(box.getByTestId("summary")).not.toBeEmpty();
+    // The subtitle counts the agent's OWN submit_finding posts (one each in the mock), not the whole board's.
+    await expect(box.getByTestId("sent")).toHaveText("1 finding sent");
   }
   await expect(page.getByTestId("lead").getByRole("status")).toHaveText("Four agents are researching your aid. Ask me anything.");
   // Events land in their OWN agent's box, and a finished agent's footer is its own summary.

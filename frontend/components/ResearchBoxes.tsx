@@ -162,6 +162,8 @@ function AgentBox({ agent, events, onSearch }: { agent: Agent; events: StudyEven
   const traces = events.flatMap((e, i) => toTrace(e, events[i + 1]) ?? []);
   useEffect(() => { list.current?.scrollTo({ top: list.current.scrollHeight, behavior: "smooth" }); }, [traces.length]);
   const summary = summarize(events);
+  // Info-board posts (submit_finding), the SAME events that fly a dot to the center orb.
+  const sent = events.filter((e) => e.type === "research.board_posted").length;
 
   return (
     // Starts invisible: ResearchBoxes fades it in once its orb has flown into the slot.
@@ -176,7 +178,7 @@ function AgentBox({ agent, events, onSearch }: { agent: Agent; events: StudyEven
             <div data-orb-slot={agent.key} style={{ width: ORB_PX, height: ORB_PX, flex: "none" }} />
             <div style={{ minWidth: 0 }}>
               <div style={{ fontSize: 16, color: "#e6e8eb" }}>{agent.title}</div>
-              <div style={{ fontSize: 11, color: "#757575", letterSpacing: "0.04em" }}>{agent.key}</div>
+              <div data-testid="sent" style={{ fontSize: 11, color: "#757575", letterSpacing: "0.04em" }}>{sent} {sent === 1 ? "finding" : "findings"} sent</div>
             </div>
           </header>
           {/* Scrolls, but with NO visible scrollbar (scrollbarWidth; the WebKit rule is in the <style> below). */}
