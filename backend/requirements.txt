@@ -1,0 +1,25 @@
+# API
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+pillow>=10
+pillow-heif>=0.16
+# ear reconstruction (AudioEar + SAM 2)
+torch>=2.2
+torchvision>=0.17
+ultralytics>=8.3
+opencv-python-headless>=4.9
+gdown>=5
+# hornsim
+pyclarity>=0.9
+trimesh>=4.4
+manifold3d>=2.4
+scikit-image>=0.22
+rtree>=1.2
+scipy>=1.11
+numpy>=1.26
+pandas>=2
+openpyxl>=3.1
+pyyaml>=6
+soundfile>=0.12
+matplotlib>=3.8

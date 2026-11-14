@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Horn Aid Builder</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg width="26" height="26" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 11h4l14-7v20L7 17H3z"></path></svg>
+    <div><strong>Horn Aid Builder</strong><span>Photo + hearing test → a passive in-ear aid that fits</span></div>
+  </div>
+  <span class="api" id="apiStatus">checking server…</span>
+</header>
+
+<main class="layout">
+  <section class="panel" id="formPanel" aria-labelledby="newTitle">
+    <h2 id="newTitle">New patient</h2>
+    <form id="form">
+      <div class="field">
+        <label for="photo">Ear photo</label>
+        <input type="file" id="photo" accept="image/*,.heic" required>
+        <p class="help">Straight side-on, ear filling the frame, hair tucked back.</p>
+      </div>
+      <div class="photoBox" id="photoBox" hidden>
+        <canvas id="photoCanvas" aria-label="Photo preview. Drag a box around the ear."></canvas>
+        <p class="help" id="boxText">Drag a box tightly around the ear.</p>
+      </div>
+      <div class="row2">
+        <fieldset class="field">
+          <legend>Which ear</legend>
+          <div class="seg">
+            <input type="radio" name="side" id="sideR" value="right" checked><label for="sideR">Right</label>
+            <input type="radio" name="side" id="sideL" value="left"><label for="sideL">Left</label>
+          </div>
+        </fieldset>
+        <div class="field">
+          <label for="height">Ear height (mm)</label>
+          <input type="number" id="height" min="40" max="90" step="0.5" value="62">
+        </div>
+      </div>
+      <fieldset class="field">
+        <legend>Hearing test (dB HL)</legend>
+        <div class="audio" id="audiogram"></div>
+        <p class="help">Prefilled with the example audiogram from the handoff doc. Replace with a real test.</p>
+      </fieldset>
+      <button type="submit" class="primary" id="go" disabled>Build aid</button>
+      <p class="error" id="formError" role="alert"></p>
+    </form>
+  </section>
+
+  <section class="panel results" id="results" aria-labelledby="resTitle" hidden>
+    <div class="resHead">
+      <h2 id="resTitle">Patient <span id="pid" class="mono"></span></h2>
+      <span class="pill" id="status">queued</span>
+    </div>
+    <ol class="steps" id="steps">
+      <li data-step="ear">Ear mesh from the photo</li>
+      <li data-step="context">Fit space, canals, hearing references</li>
+      <li data-step="aid">Shell with coiled horn bore</li>
+    </ol>
+    <div class="viewerWrap">
+      <canvas id="viewer" aria-label="3D view of the aid in the ear"></canvas>
+      <div class="viewerTools">
+        <label><input type="checkbox" id="showEar" checked> Ear</label>
+        <label class="grow">Shell <input type="range" id="opacity" min="0.03" max="1" step="0.01" value="0.18" aria-label="Shell opacity"></label>
+        <label class="grow">Cut <input type="range" id="cut" min="0" max="1" step="0.005" value="1" aria-label="Cut-away position"></label>
+      </div>
+      <p class="viewerEmpty" id="viewerEmpty">The 3D aid appears here when it's built.</p>
+    </div>
+    <div class="grid2">
+      <div>
+        <h3>Design</h3>
+        <dl id="design"></dl>
+        <div class="downloads" id="downloads"></div>
+      </div>
+      <div>
+        <h3>Hearing references (HASPI v2)</h3>
+        <div class="tbl"><table id="refs"><thead><tr><th>Clip</th><th>Level</th><th>Unaided</th><th>Best linear aid</th></tr></thead><tbody></tbody></table></div>
+        <p class="help">The reward for each design is the share of the gap between these two columns it closes.</p>
+      </div>
+    </div>
+    <details class="redesign">
+      <summary>Try other design numbers</summary>
+      <form id="aidForm" class="row4">
+        <label>Throat mm² <input type="number" id="throat" step="0.1" value="1.0" min="0.3" max="10"></label>
+        <label>Mouth mm² <input type="number" id="mouth" step="0.5" value="22.2" min="2" max="60"></label>
+        <label>Vent mm <input type="number" id="vent" step="0.1" value="0.8" min="0" max="2.5"></label>
+        <button type="submit" class="secondary">Rebuild aid</button>
+      </form>
+    </details>
+    <details>
+      <summary>Log</summary>
+      <pre id="log"></pre>
+    </details>
+  </section>
+</main>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module" src="app.js"></script>
+</body>
+</html>

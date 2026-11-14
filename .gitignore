@@ -23,3 +23,13 @@ studies/
 
 # Workspace scratch
 .context/
+CLAUDE.local.md
+.claude/settings.local.json
+
+# third-party clones and local leftovers
+repos/
+buildinggym/
+
+# personal photos
+IMG_*.jpg
+IMG_*.HEIC
