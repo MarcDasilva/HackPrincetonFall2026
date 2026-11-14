@@ -1,0 +1,39 @@
+{
+  "schema_version": "1",
+  "study_id": "demo_profile_001",
+  "parent_study_id": null,
+  "mode": "demo",
+  "evaluation_mode": "development_fixture",
+  "start": {
+    "initiated_by": "user",
+    "action": "start_study"
+  },
+  "anatomy": {
+    "ear_mesh_ref": null,
+    "source": "not_supplied"
+  },
+  "needs_profile": {
+    "activities": [
+      "sports",
+      "busy_restaurants"
+    ],
+    "goals": [
+      "follow_conversation",
+      "hear_coach"
+    ],
+    "priorities": [
+      "speech_clarity",
+      "compact_size"
+    ],
+    "requirements": [
+      "secure_retention"
+    ],
+    "free_text": "I want to hear people during activities."
+  },
+  "budget": {
+    "max_evaluation_cases": 12,
+    "max_parallel_evaluations": 2,
+    "max_research_tool_calls_per_agent": 6
+  },
+  "demo_profile_id": "demo_sloping_high_frequency"
+}

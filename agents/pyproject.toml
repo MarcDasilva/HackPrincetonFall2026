@@ -1,0 +1,60 @@
+[project]
+name = "horn-study"
+version = "0.1.0"
+description = "Research and experiment-planning agent system for the passive acoustic hearing device project"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "deepagents",
+    "langchain",
+    "langchain-anthropic",
+    "langgraph",
+    "langsmith",
+    "pydantic>=2",
+    "httpx",
+    "pypdf>=7.1.0",
+    "python-dotenv>=1.2.4",
+]
+
+[project.scripts]
+horn-study = "horn_study.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "pyright",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/horn_study"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ASYNC", "PT"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# These files deliberately contain typographic characters as test data and match tables.
+"tests/test_research.py" = ["RUF001"]
+"src/horn_study/sources.py" = ["RUF001"]
+
+[tool.pyright]
+include = ["src"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
