@@ -53,9 +53,10 @@ EARPIECE_FAMILY_ID = "concha_horn_earpiece"
 # spine and cross-sections, which `earpiece_builder_parameters` writes from these.
 COLLECTOR_REACH = "collector_reach_mm"
 COLLECTOR_MOUTH = "collector_mouth_mm2"
-# Dials a study sets on hornsim.earpiece under the builder's own names. Every other dial of the
-# builder shapes or holds the piece without changing what the acoustic model is given, and stays
-# at the builder's default.
+# Dials a study sets on hornsim.earpiece under the builder's own names. The rest stay at the builder's
+# defaults. Most of them shape or hold the piece without changing the area along the bore. The two
+# flare dials do change it, and are held to keep the family small: hornsim.target also caps them at
+# the defaults, because a faster flare broke through the seat wall.
 _EARPIECE_BUILDER_DIALS = ("throat_mm2", "mouth_mm2", "canal_stem_mm")
 # Radii per cross-section in hornsim.earpiece's collector format.
 _COLLECTOR_SECTION_POINTS = 12

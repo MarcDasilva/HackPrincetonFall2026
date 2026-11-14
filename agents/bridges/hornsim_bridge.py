@@ -369,7 +369,6 @@ def describe_earpiece(payload: dict[str, Any]) -> dict[str, Any]:
             # The whole canal is a canal sample plus this, the coiled aid's tip length. See
             # earpiece_acoustic.
             "whole_canal_is_sample_plus_mm": aid.DEFAULT["tip_length_mm"],
-            "probe_seconds": record["seconds"],
         }
     except Exception as error:
         traceback.print_exc()
