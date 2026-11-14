@@ -28,7 +28,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.tracers.base import BaseTracer
 from langchain_core.tracers.schemas import Run
 
-from horn_study.contracts import StudyState, allowed_transitions
+from horn_study.contracts import ErrorInfo, StudyState, allowed_transitions
 from horn_study.evaluator_adapter import DevelopmentFixtureEvaluator, TransientEvaluatorError
 from horn_study.events import ARTIFACT_NAMES, ArtifactStore, EventBus, StudyExists, read_events
 from horn_study.followup import follow_up_request
@@ -388,6 +388,65 @@ async def test_a_plan_that_stays_invalid_fails_without_evaluating(tmp_path):
         "max_plan_revisions", 2
     )
     assert harness.evaluator.calls == []
+    assert "plan.frozen" not in types(outcome)
+
+
+class PickyEvaluator(CountingEvaluator):
+    """An evaluator that can say, before anything is scored, that some designs cannot be built."""
+
+    def __init__(self, unbuildable: set[str]) -> None:
+        super().__init__()
+        self.unbuildable = unbuildable
+        self.checked: list[str] = []
+
+    def check_buildable(self, spec):
+        self.checked.append(spec.candidate_id)
+        if spec.candidate_id in self.unbuildable:
+            return ErrorInfo(
+                code="geometry_does_not_fit",
+                message="the bore breaks out of the seat; reduce mouth_mm2 or throat_mm2",
+            )
+        return None
+
+
+async def test_an_unbuildable_design_is_sent_back_before_the_plan_is_frozen(tmp_path):
+    corrected = valid_draft()
+    corrected["candidates"][3] = design("len60", 60)
+    corrected["hypotheses"][0]["candidate_ids"] = ["len30", "len45", "len60"]
+    evaluator = PickyEvaluator({"len90"})
+    harness = Harness(
+        tmp_path, evaluator=evaluator, coordinator=coordinator_responder(valid_draft(), corrected)
+    )
+    outcome = await run_study(make_request(), harness.deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    revision = first(outcome, "plan.revision_requested")
+    assert revision.data["errors"] == [
+        "candidate 'len90' cannot be built (geometry_does_not_fit): "
+        "the bore breaks out of the seat; reduce mouth_mm2 or throat_mm2"
+    ]
+    assert (
+        revision.sequence
+        < first(outcome, "plan.frozen").sequence
+        < first(outcome, "experiment.started").sequence
+    )
+    assert "unaided" not in evaluator.checked
+    assert set(evaluator.checked) == {"len30", "len45", "len90", "len60"}
+    assert len(evaluator.calls) == 12
+    assert not any(call.startswith("len90") for call in evaluator.calls)
+    assert outcome.report is not None
+    assert outcome.report.experiments_not_completed == ()
+
+
+async def test_a_plan_whose_designs_never_build_fails_without_evaluating(tmp_path):
+    evaluator = PickyEvaluator({"len90"})
+    outcome = await run_study(make_request(), Harness(tmp_path, evaluator=evaluator).deps)
+
+    assert outcome.state is StudyState.FAILED
+    assert outcome.failure is not None
+    assert outcome.failure["kind"] == "plan_invalid"
+    assert "candidate 'len90' cannot be built" in outcome.failure["details"][0]
+    assert evaluator.calls == []
     assert "plan.frozen" not in types(outcome)
 
 
@@ -880,6 +939,31 @@ async def test_hypotheses_get_per_scenario_data_and_needs_say_how_they_were_met(
     assert "fixture_audible_speech_fraction improved on the reference control in distant_talker" in (
         needs["hear_coach"].explanation
     )
+
+
+async def test_a_need_is_judged_on_the_studys_measure_of_benefit_not_on_a_side_metric(tmp_path):
+    """A need tied to the primary metric and to a secondary one is met when the primary improves.
+    A need tied only to a metric that did not improve is not."""
+    draft = valid_draft()
+    draft["selection"]["constraints"] = []
+    coverage = {entry["need"]: entry for entry in draft["needs_coverage"]}
+    coverage["speech_clarity"]["metric_names"] = [
+        "fixture_audible_speech_fraction",
+        "fixture_device_length_mm",
+    ]
+    coverage["compact_size"]["metric_names"] = ["fixture_device_length_mm"]
+    harness = Harness(tmp_path, coordinator=coordinator_responder(draft))
+    outcome = await run_study(make_request(), harness.deps)
+
+    assert outcome.report is not None
+    needs = {n.need: n for n in outcome.report.needs}
+    assert needs["speech_clarity"].status == "addressed"
+    assert (
+        "fixture_audible_speech_fraction improved on the reference control"
+        in needs["speech_clarity"].explanation
+    )
+    assert "Not improved: fixture_device_length_mm did not improve" in needs["speech_clarity"].explanation
+    assert needs["compact_size"].status == "evaluated_unsuccessfully"
 
 
 async def test_reported_numbers_are_the_evaluators_numbers(tmp_path):

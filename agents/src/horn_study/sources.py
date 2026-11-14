@@ -13,11 +13,14 @@ import ipaddress
 import logging
 import os
 import re
+import time
 import unicodedata
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any, Protocol
 from urllib.parse import urlparse
+from xml.etree import ElementTree
 
 import httpx
 
@@ -27,6 +30,10 @@ USER_AGENT = "horn-study-research/0.1 (literature research agent)"
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MIN_USEFUL_CHARS = 400
 MIN_ABSTRACT_RECORD_CHARS = 200
+# NCBI allows three E-utilities requests per second from one address without an API key, and
+# answers HTTP 429 at exactly that rate. Two per second leaves room for its counting window.
+EUTILS_MIN_INTERVAL_SECONDS = 0.5
+EUTILS_MAX_BACKOFF_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -405,6 +412,51 @@ def extract_html_text(html: str) -> tuple[str, str]:
     return title, text
 
 
+# Parts of a JATS article that are not its prose: the reference list, tables, figures, and maths.
+_JATS_SKIP = frozenset(
+    {"ref-list", "table-wrap", "fig", "supplementary-material", "disp-formula", "inline-formula", "fn-group"}
+)
+_JATS_BLOCKS = frozenset({"p", "title"})
+
+
+def _jats_inline(element: ElementTree.Element) -> str:
+    parts = [element.text or ""]
+    for child in element:
+        if child.tag not in _JATS_SKIP:
+            parts.append(_jats_inline(child))
+        parts.append(child.tail or "")
+    return "".join(parts)
+
+
+def _jats_lines(element: ElementTree.Element | None) -> list[str]:
+    if element is None or element.tag in _JATS_SKIP:
+        return []
+    if element.tag in _JATS_BLOCKS:
+        line = " ".join(_jats_inline(element).split())
+        return [line] if line else []
+    return [line for child in element for line in _jats_lines(child)]
+
+
+def _parse_jats(xml: str) -> tuple[str, list[str], list[str]]:
+    """Return (title, abstract lines, body lines) of the first article in a JATS document."""
+    root = ElementTree.fromstring(xml)
+    article = root if root.tag == "article" else root.find(".//article")
+    if article is None:
+        return "", [], []
+    heading = article.find("./front/article-meta/title-group/article-title")
+    title = " ".join(_jats_inline(heading).split()) if heading is not None else ""
+    abstract = [
+        line for part in article.findall("./front/article-meta/abstract") for line in _jats_lines(part)
+    ]
+    return title, abstract, _jats_lines(article.find("./body"))
+
+
+def extract_jats_text(xml: str) -> tuple[str, str]:
+    """Return (title, readable text) from a JATS article, the XML format PubMed Central serves."""
+    title, abstract, body = _parse_jats(xml)
+    return title, "\n".join([*abstract, *body])
+
+
 def extract_pdf_text(data: bytes) -> tuple[str, str]:
     """Return (title, text) from a PDF. The title is empty when the file declares none."""
     from pypdf import PdfReader
@@ -433,7 +485,41 @@ def check_url_allowed(url: str) -> None:
 
 
 _PUBMED_RECORD = re.compile(r"^https?://(?:www\.)?pubmed\.ncbi\.nlm\.nih\.gov/(\d+)/?(?:[?#].*)?$")
+_PMC_ARTICLE = re.compile(
+    r"^https?://(?:pmc\.ncbi\.nlm\.nih\.gov|(?:www\.)?ncbi\.nlm\.nih\.gov/pmc)/articles/(?:PMC)?(\d+)/?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
 _EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+
+
+class Pacer:
+    """Keeps calls at least `interval` seconds apart, however many tasks ask at once."""
+
+    def __init__(
+        self,
+        interval: float,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self._interval = interval
+        self._clock = clock
+        self._sleep = sleep
+        self._lock = asyncio.Lock()
+        self._next_at: float | None = None
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = self._clock()
+            if self._next_at is not None and now < self._next_at:
+                await self._sleep(self._next_at - now)
+                now = self._clock()
+            self._next_at = now + self._interval
+
+    async def hold(self, seconds: float) -> None:
+        """Push the next call at least `seconds` into the future, for every task."""
+        async with self._lock:
+            self._next_at = max(self._next_at or 0.0, self._clock() + seconds)
 
 
 def _unwrap(text: str) -> str:
@@ -443,14 +529,21 @@ def _unwrap(text: str) -> str:
 
 
 class HttpReader:
-    def __init__(self, client: httpx.AsyncClient) -> None:
+    def __init__(self, client: httpx.AsyncClient, *, pacer: Pacer | None = None) -> None:
         self._client = client
+        # One pace for every E-utilities call, shared by all investigators reading at once.
+        self._pacer = pacer or Pacer(EUTILS_MIN_INTERVAL_SECONDS)
 
     async def fetch(self, url: str) -> FetchedSource:
         check_url_allowed(url)
         pubmed = _PUBMED_RECORD.match(url)
         if pubmed:
             return await self._fetch_pubmed_record(url, pubmed.group(1))
+        pmc = _PMC_ARTICLE.match(url)
+        if pmc:
+            article = await self._fetch_pmc_article(url, pmc.group(1))
+            if article is not None:
+                return article
         try:
             async with self._client.stream("GET", url, follow_redirects=True) as response:
                 check_url_allowed(str(response.url))
@@ -485,11 +578,46 @@ class HttpReader:
             raise SourceUnavailable("The page returned too little readable text.")
         return FetchedSource(url=url, final_url=final_url, title=title, content_type=kind, text=text)
 
+    async def _eutils_get(self, params: dict[str, str]) -> httpx.Response:
+        """One paced E-utilities call. A rate-limit answer is waited out and tried once more."""
+        await self._pacer.wait()
+        response = await self._client.get(_EFETCH, params=params)
+        if response.status_code != 429:
+            return response
+        try:
+            delay = float(response.headers.get("retry-after", ""))
+        except ValueError:
+            delay = 2.0
+        await self._pacer.hold(min(max(delay, 0.0), EUTILS_MAX_BACKOFF_SECONDS))
+        await self._pacer.wait()
+        return await self._client.get(_EFETCH, params=params)
+
+    async def _fetch_pmc_article(self, url: str, pmcid: str) -> FetchedSource | None:
+        """Read a PubMed Central article's full text through NCBI E-utilities.
+
+        The article web page answers automated clients with a browser check after a few quick
+        requests, which several investigators reading at once soon trigger. Returns None when
+        the API has no full text for the article, so the caller can try the page itself.
+        """
+        try:
+            response = await self._eutils_get({"db": "pmc", "id": pmcid, "retmode": "xml"})
+            response.raise_for_status()
+            if len(response.content) > MAX_DOWNLOAD_BYTES:
+                return None
+            title, abstract, body = _parse_jats(response.text)
+        except (httpx.HTTPError, ElementTree.ParseError):
+            return None
+        if len("\n".join(body)) < MIN_USEFUL_CHARS:
+            return None
+        return FetchedSource(
+            url=url, final_url=url, title=title, content_type="xml", text="\n".join([*abstract, *body])
+        )
+
     async def _fetch_pubmed_record(self, url: str, pmid: str) -> FetchedSource:
         """PubMed pages refuse automated clients, so read the record through NCBI E-utilities."""
         try:
-            response = await self._client.get(
-                _EFETCH, params={"db": "pubmed", "id": pmid, "rettype": "abstract", "retmode": "text"}
+            response = await self._eutils_get(
+                {"db": "pubmed", "id": pmid, "rettype": "abstract", "retmode": "text"}
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:

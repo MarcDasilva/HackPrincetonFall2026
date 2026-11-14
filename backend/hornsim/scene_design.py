@@ -174,8 +174,9 @@ def run(patient_dir, request, log=print):
         # "design" stays the best option: /sim's Aggregate and the wave check read it.
         "design": options[0], "options": options,
         "attempts": attempts, "swept": int(len(J)),
-        "notes": ["Deficits come from the browser's coarse wave sim (2.5 mm, speakers at 45 mm) and the ANSI standard "
-                  "speech spectrum; hornsim.runner on the full wavesim is the reference.",
+        "notes": ["Deficits come from the browser's coarse dummy-head wave sim (hornsim.head_grid, both ears, far "
+                  "talkers as plane waves) and the ANSI standard speech spectrum; hornsim.runner on the full wavesim "
+                  "is the reference.",
                   "Gain is insertion gain over the open ear from hornsim.acoustics, averaged (mean) or worst over the "
                   "sampled canals."],
     }

@@ -183,6 +183,65 @@ def mean_ear(out, height_mm=62.0):
     return path
 
 
+def _fit(dev, fcrn, enc, m, img, mask, left, pad):
+    """The networks on one ear photo: a left ear is mirrored first (the model is of right ears). Returns
+    the crop, the posed model's vertices projected into it, and which of them land inside the ear mask."""
+    if left:
+        img, mask = img[:, ::-1].copy(), mask[:, ::-1].copy()
+    crop, cmask = square_crop(img, mask, pad)
+    crop = cv2.resize(crop, (IMG, IMG), interpolation=cv2.INTER_CUBIC).astype(np.float32) / 255.0
+    cmask = cv2.resize(cmask, (IMG, IMG), interpolation=cv2.INTER_NEAREST).astype(np.float32)
+    x = crop * cmask[..., None]
+    with torch.no_grad():
+        t = torch.from_numpy(x).permute(2, 0, 1)[None].to(dev)
+        _, feats = fcrn(t)
+        pos, _, shape = enc(t, feats)
+    pos, shape = pos[0].cpu().numpy(), shape[0].cpu().numpy()
+    verts, faces = _canonical(m, shape)
+    # posed verts -> pixels (pytorch3d look_at_view_transform(10, 0, pi/2) + orthographic camera)
+    f = pos[5]
+    posed = (euler_xyz(pos[:3]) @ (verts * f).T).T
+    posed[:, 1:] += pos[3:5] * f
+    px = np.stack([IMG / 2 - IMG / 2 * posed[:, 2], IMG / 2 - IMG / 2 * posed[:, 1]], 1)
+    pxi = np.clip(px.round().astype(int), 0, IMG - 1)
+    inside = cmask[pxi[:, 1], pxi[:, 0]] > 0
+    return {"crop": crop, "cmask": cmask, "x": x, "pos": pos, "shape": shape, "verts": verts, "faces": faces,
+            "pxi": pxi, "inside": inside}
+
+
+def mask_for(photo, box):
+    """The photo (RGB, EXIF already applied by the API) and SAM 2's ear mask inside `box`."""
+    img = cv2.imread(photo)
+    if img is None:
+        raise ValueError("could not read the photo")
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = [int(v) for v in box]
+    x0, x1 = max(0, min(x0, x1)), min(w - 1, max(x0, x1))
+    y0, y1 = max(0, min(y0, y1)), min(h - 1, max(y0, y1))
+    if x1 - x0 < 20 or y1 - y0 < 20:
+        raise ValueError("box is too small; draw it tightly around the ear")
+    with _lock:
+        _, _, _, _, sam = models_()
+        mask = sam_mask(sam, img, [x0, y0, x1, y1], ((x0 + x1) // 2, (y0 + y1) // 2))
+    if mask.sum() < 400:
+        raise ValueError("could not find the ear inside the box")
+    return img, mask
+
+
+def classify_side(photo, box, pad=0.15):
+    """Which ear is this? The model only knows right ears, so fit the photo as it is (a right ear) and
+    mirrored (a left ear): the reading whose posed model lands better inside the ear's outline wins.
+    Returns {"side", "fit": {"right", "left"}, "margin"}; a small margin means the photo cannot tell."""
+    img, mask = mask_for(photo, box)
+    with _lock:
+        dev, fcrn, enc, m, _ = models_()
+        fit = {side: float(_fit(dev, fcrn, enc, m, img, mask, side == "left", pad)["inside"].mean())
+               for side in ("right", "left")}
+    side = max(fit, key=fit.get)
+    return {"side": side, "fit": {k: round(v, 3) for k, v in fit.items()}, "margin": round(abs(fit["right"] - fit["left"]), 3)}
+
+
 def reconstruct(photo, out, box, left=False, height_mm=62.0, pad=0.15, mask_path=None, log=print):
     """Photo -> ear mesh in `out`. `box` = [x0, y0, x1, y1] around the ear in full-resolution pixels.
 
@@ -234,7 +293,6 @@ def reconstruct(photo, out, box, left=False, height_mm=62.0, pad=0.15, mask_path
     px = np.stack([IMG / 2 - IMG / 2 * posed[:, 2], IMG / 2 - IMG / 2 * posed[:, 1]], 1)
     pxi = np.clip(px.round().astype(int), 0, IMG - 1)
     colors = crop[pxi[:, 1], pxi[:, 0]]
-    inside = cmask[pxi[:, 1], pxi[:, 0]] > 0
     if inside.any():
         colors[~inside] = colors[inside].mean(0)
     ov = (crop * 255).astype(np.uint8).copy()

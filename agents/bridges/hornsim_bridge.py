@@ -12,6 +12,7 @@ Commands
     describe       what the installed hornsim code supports (bounds, levels, clips, version)
     context        build the patient context once per (ear mesh, audiogram)
     build          build one aid and its acoustics once per (context, design numbers)
+    build-earpiece build one in-concha earpiece and its acoustics once per (context, design numbers)
     score          HASPI v2 for one listening condition, aided or unaided
     template-ear   write AudioEar's average ear as a mesh, for runs without a photo
 
@@ -20,6 +21,13 @@ hornsim's own functions, called the way backend/app/jobs.py and
 hornsim/score.py call them. Nothing here rescales a level or fills in a
 hearing threshold. A clip type with several clips (three clean, four in
 babble) is scored clip by clip and averaged, the same way for both types.
+
+Two devices are built here. The coiled aid (hornsim.aid) writes its own
+acoustic description and hornsim.acoustics.evaluate reads it. The in-concha
+earpiece (hornsim.earpiece) reports the area along its bore and no acoustics,
+so this file hands that area profile to the same acoustic model (see
+`earpiece_acoustic` for exactly what is passed) and repeats the band summary
+of hornsim.acoustics.evaluate on the answer.
 """
 
 from __future__ import annotations
@@ -42,7 +50,19 @@ from typing import Any
 
 BUILD_MARKER = "bridge_build.json"
 CONTEXT_MARKER = "bridge_context.json"
+EAR_MARKER = "bridge_ear.json"
 CLIP_TYPES = ("clean", "babble")
+EARPIECE_FAMILY = "concha_horn_earpiece"
+EARPIECE_DESIGN_ID = "earpiece"
+# Part of the earpiece build key. Raise it when this file changes what it saves for an earpiece.
+EARPIECE_RECORD = 1
+# Band averages of hornsim.acoustics.evaluate, in Hz.
+GAIN_BANDS = (
+    ("mean_ig_500_1k_db", 500, 1000),
+    ("mean_ig_1k_2k_db", 1000, 2000),
+    ("mean_ig_2k_4k_db", 2000, 4000),
+    ("mean_ig_4k_8k_db", 4000, 8000),
+)
 
 
 class BridgeError(Exception):
@@ -136,6 +156,31 @@ def number_key(value: float) -> int | float:
     return int(value) if float(value) == int(value) else float(value)
 
 
+def stored_mesh(work: str, mesh: str, sha256: str) -> str:
+    """Our own copy of the ear mesh. hornsim reads it again from the path saved in context.json."""
+    stored = os.path.join(work, "meshes", sha256[:16] + os.path.splitext(mesh)[1])
+    if not os.path.isfile(stored):
+        os.makedirs(os.path.dirname(stored), exist_ok=True)
+        shutil.copyfile(mesh, stored + ".tmp")
+        os.replace(stored + ".tmp", stored)
+    return stored
+
+
+def protrusion_mm(context_dir: str, print_stl: str) -> float:
+    """How far a printed part stands out past the concha rim plane, along the rim normal.
+
+    The same measure hornsim.earpiece reports as proud_of_concha_mm, taken from the print solid, so
+    it means the same thing for both devices.
+    """
+    import numpy as np
+    import trimesh
+
+    world = read_json(os.path.join(context_dir, "context.json"))["ear_world"]
+    solid = trimesh.load(print_stl, process=False)
+    heights = (np.asarray(solid.vertices) - np.asarray(world["rim_center"])) @ np.asarray(world["axes"][2])
+    return round(float(heights.max()), 1)
+
+
 # --------------------------------------------------------------------------
 # describe
 # --------------------------------------------------------------------------
@@ -207,7 +252,127 @@ def cmd_describe(payload: dict[str, Any]) -> dict[str, Any]:
     }
     if payload.get("ear_mesh"):
         described["ear_mesh"] = mesh_info(payload["ear_mesh"])
+        if payload.get("work_dir"):
+            described["earpiece"] = describe_earpiece(payload)
     return described
+
+
+# --------------------------------------------------------------------------
+# The in-concha earpiece: what the builder accepts, and what this ear can hold
+# --------------------------------------------------------------------------
+
+
+def ear_record(work: str, mesh: str, ear_height_mm: float | None) -> dict[str, Any]:
+    """This ear's ear_params and earpiece limits, once per (mesh, height, code version).
+
+    Both come from hornsim: `target.load_ear_params` (the numbers the acoustic model takes about the
+    patient's ear) and `target.earpiece_boxes` (two probe builds that find the largest mouth and
+    throat this ear holds, with and without a canal stem). Neither depends on the audiogram, so
+    they are kept beside the contexts and shared by all of them.
+    """
+    from hornsim import context, target
+
+    started = time.time()
+    info = mesh_info(mesh)
+    cfg = context.load_defaults()
+    cfg["ear_world"]["landmarks_xlsx"] = os.path.normpath(
+        os.path.join(context.HERE, cfg["ear_world"]["landmarks_xlsx"])
+    )
+    identity = {
+        "version": hornsim_version(backend_dir()),
+        "ear_mesh_sha256": info["sha256"],
+        "ear_height_mm": ear_height_mm,
+        "ear_world": cfg["ear_world"],
+    }
+    key = key_of(identity)
+    folder = os.path.join(work, "ears", key)
+    marker = os.path.join(folder, EAR_MARKER)
+    with locked(os.path.join(work, "ears", f"{key}.lock")):
+        if not os.path.isfile(marker):
+            shutil.rmtree(folder, ignore_errors=True)
+            os.makedirs(os.path.join(folder, "context"))
+            # The geometry code reads only the configuration from context.json. The side stays at
+            # the default: it mirrors the removal tab and nothing these limits depend on.
+            cfg["patient"].update(
+                {
+                    "id": key,
+                    "ear_mesh": stored_mesh(work, mesh, info["sha256"]),
+                    "ear_height_mm": ear_height_mm,
+                }
+            )
+            write_json_atomic(os.path.join(folder, "context", "context.json"), {"config": cfg})
+            ear_params = target.load_ear_params(folder)
+            boxes = target.earpiece_boxes(ear_params, folder)
+            write_json_atomic(
+                marker,
+                {
+                    "identity": identity,
+                    "ear_params": ear_params,
+                    "earpiece_boxes": [{name: list(span) for name, span in box.items()} for box in boxes],
+                    "seconds": round(time.time() - started, 3),
+                },
+            )
+    return read_json(marker)
+
+
+def collector_radius_limits(earpiece: Any) -> list[float]:
+    """The smallest and largest section radius hornsim.earpiece.validate_collector accepts, in mm.
+
+    The builder states these limits only inside its validator, so they are found by asking it.
+    """
+
+    def accepted(radius: float) -> bool:
+        return not earpiece.validate_collector({"spine": [[1.0, 0.0, 0.0]], "sections": [[radius] * 12]})[1]
+
+    inside = 5.0
+    if not accepted(inside):
+        raise BridgeError("collector_limits", "hornsim.earpiece rejects a plain 5 mm collector section.")
+    limits = []
+    for outside in (0.0, 1000.0):
+        good, bad = inside, outside
+        for _ in range(60):
+            middle = (good + bad) / 2
+            good, bad = (middle, bad) if accepted(middle) else (good, middle)
+        limits.append(round(good, 6))
+    return limits
+
+
+def describe_earpiece(payload: dict[str, Any]) -> dict[str, Any]:
+    """The earpiece builder's dials, and the limits of the configured ear.
+
+    A backend without the earpiece, or an ear the probe builds cannot use, is reported as
+    unavailable with the reason. It never stops the coiled aid from being described.
+    """
+    try:
+        from hornsim import aid, earpiece
+
+        record = ear_record(payload["work_dir"], payload["ear_mesh"], payload.get("ear_height_mm"))
+        ear = record["ear_params"]
+        return {
+            "available": True,
+            "family": EARPIECE_FAMILY,
+            "params": {
+                name: {"minimum": low, "maximum": high, "default": default, "meaning": meaning}
+                for name, (low, high, default, meaning) in earpiece.PARAMS.items()
+            },
+            "collector": {
+                "max_reach_mm": earpiece.MAX_REACH_MM,
+                "section_radius_mm": collector_radius_limits(earpiece),
+                "clearance_mm": earpiece.CLEAR_MM,
+            },
+            "stem_wall_mm": earpiece.STEM_WALL_MM,
+            "boxes": record["earpiece_boxes"],
+            "ear": {
+                name: ear[name]
+                for name in ("opening_area_mm2", "concha_depth_mm", "bowl_volume_cc", "canal_diameter_mm")
+            },
+            # The whole canal is a canal sample plus this, the coiled aid's tip length. See
+            # earpiece_acoustic.
+            "whole_canal_is_sample_plus_mm": aid.DEFAULT["tip_length_mm"],
+        }
+    except Exception as error:
+        traceback.print_exc()
+        return {"available": False, "reason": f"{type(error).__name__}: {error}"[:600]}
 
 
 # --------------------------------------------------------------------------
@@ -240,12 +405,7 @@ def cmd_context(payload: dict[str, Any]) -> dict[str, Any]:
     with locked(os.path.join(work, "contexts", f"{key}.lock")):
         reused = os.path.isfile(marker)
         if not reused:
-            # Keep our own copy of the mesh: hornsim.aid reads it again from the path in context.json.
-            stored = os.path.join(work, "meshes", info["sha256"][:16] + os.path.splitext(mesh)[1])
-            if not os.path.isfile(stored):
-                os.makedirs(os.path.dirname(stored), exist_ok=True)
-                shutil.copyfile(mesh, stored + ".tmp")
-                os.replace(stored + ".tmp", stored)
+            stored = stored_mesh(work, mesh, info["sha256"])
             shutil.rmtree(out, ignore_errors=True)
 
             cfg = context.load_defaults()
@@ -354,6 +514,7 @@ def cmd_build(payload: dict[str, Any]) -> dict[str, Any]:
         return result
     result["design"] = record["design"]
     result["acoustics_summary"] = record["acoustics_summary"]
+    result["protrusion_mm"] = protrusion_mm(context_dir, os.path.join(aid_dir, "aid_print.stl"))
     result["assets"] = {
         "design_json": os.path.join(aid_dir, "design.json"),
         "aid_glb": os.path.join(aid_dir, "aid.glb"),
@@ -361,6 +522,224 @@ def cmd_build(payload: dict[str, Any]) -> dict[str, Any]:
         "aid_print_stl": os.path.join(aid_dir, "aid_print.stl"),
         "acoustics_json": os.path.join(aid_dir, "acoustics.json"),
         "insertion_gain_png": os.path.join(aid_dir, "insertion_gain.png"),
+    }
+    return result
+
+
+# --------------------------------------------------------------------------
+# build-earpiece
+# --------------------------------------------------------------------------
+
+
+def earpiece_acoustic(report: dict[str, Any], ear_params: dict[str, Any]) -> dict[str, Any]:
+    """What the acoustic model is told about one built earpiece.
+
+    Profile door when the builder reports the area along its bore: that profile as built, from
+    the outer opening (the collector's rim when there is one) to the seat floor, followed by the
+    canal stem at the throat area, which is how `Design.from_dials` adds a stem. Dial door
+    otherwise, which can describe the flare inside the seat but no collector.
+
+    The settings are the unified defaults with one field set: the whole canal is a canal sample
+    plus the coiled aid's tip length. That is the canal the coiled aid's open ear already has, so
+    both devices are compared with the same open canal, and a shorter stem leaves more of that
+    canal behind it. Left unset, each stem length would stand for a different canal.
+    """
+    from hornsim import aid
+
+    geometry, params = report["geometry"], report["params"]
+    stem = float(geometry["canal_stem_mm"])
+    acoustic: dict[str, Any] = {
+        "ear_params": ear_params,
+        "whole_canal_is_sample_plus_mm": aid.DEFAULT["tip_length_mm"],
+        "tip_length_mm": stem,
+    }
+    profile = report.get("area_profile_mm2")
+    if profile:
+        opening = geometry.get("collector_mouth_mm2")
+        if opening is not None and abs(float(profile[-1][1]) - float(opening)) > 0.11:
+            # An earlier hornsim.earpiece sampled the profile at whole millimetres and left the end out.
+            raise BridgeError(
+                "profile_incomplete",
+                f"hornsim.earpiece's area profile ends at {profile[-1][1]:g} mm^2, but the outer opening it "
+                f"built is {opening:g} mm^2. The profile stops short of the end, so the built shape cannot "
+                "be scored.",
+            )
+        length = float(profile[-1][0])
+        s_mm = [round(length - along, 3) for along, _ in reversed(profile)]
+        area_mm2 = [float(area) for _, area in reversed(profile)]
+        if stem > 0:
+            s_mm.append(round(length + stem, 3))
+            area_mm2.append(float(geometry["throat_mm2"]))
+        return {**acoustic, "door": "profile", "s_mm": s_mm, "area_mm2": area_mm2}
+    if geometry.get("collector"):
+        raise BridgeError(
+            "collector_not_modelled",
+            "This hornsim.earpiece reports no area profile, and the dial door cannot describe a collector.",
+        )
+    dials = {
+        "throat_mm2": geometry["throat_mm2"],
+        "mouth_mm2": geometry["mouth_mm2"],
+        "flare_mid1": params["flare_mid1"],
+        "flare_mid2": params["flare_mid2"],
+        "length_mm": geometry["bore_length_mm"],
+        "canal_stem_mm": stem,
+    }
+    return {**acoustic, "door": "dial", "dials": dials}
+
+
+def earpiece_gain_db(
+    acoustic: dict[str, Any], sampled: list[dict[str, Any]], diameter_mm: float, freqs: Any
+) -> Any:
+    """Insertion gain [canals, frequencies] of a built earpiece, for these rows of canals.json."""
+    import numpy as np
+    from hornsim import acoustics as ac
+
+    settings = ac.UNIFIED.replace(canal_sample_tip_mm=acoustic["whole_canal_is_sample_plus_mm"])
+    ear = acoustic["ear_params"]
+    if acoustic["door"] == "profile":
+        design = ac.Design(
+            np.asarray(acoustic["s_mm"], float),
+            np.asarray(acoustic["area_mm2"], float),
+            vent_count=0,
+            concha_fill=1.0,
+            tip_length_mm=acoustic["tip_length_mm"],
+        )
+        canals = [ac.Canal(row["volume_cc"], diameter_mm) for row in sampled]
+        return ac.insertion_gain_db(design, canals, freqs, settings=settings, ear_params=ear)
+    lengths = np.array([row["length_mm"] for row in sampled], float)
+    return ac.insertion_gain(acoustic["dials"], ear, {"length_mm": lengths}, freqs, settings=settings)
+
+
+def gain_summary(gains: Any, freqs: Any) -> dict[str, Any]:
+    """The summary block of hornsim.acoustics.evaluate, computed the same way."""
+    import numpy as np
+
+    median = np.median(gains, 0)
+    summary: dict[str, Any] = {
+        key: round(float(np.mean(median[(freqs >= low) & (freqs <= high)])), 1)
+        for key, low, high in GAIN_BANDS
+    }
+    summary["peak_ig_db"] = round(float(median.max()), 1)
+    summary["peak_ig_hz"] = round(float(freqs[median.argmax()]))
+    return summary
+
+
+def cmd_build_earpiece(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build one in-concha earpiece and model its acoustics, once per (context, dials, code version).
+
+    `parameters` are hornsim.earpiece's own: any of its dials, and an optional collector. A design
+    its checks reject is remembered as a build that does not fit, with the builder's reasons.
+    """
+    import numpy as np
+    from hornsim import acoustics, earpiece
+
+    started = time.time()
+    work, context_dir = payload["work_dir"], payload["context_dir"]
+    require_context(context_dir)
+    requested = payload["parameters"]
+    version = hornsim_version(backend_dir())
+    key = key_of(
+        {
+            "version": version,
+            "context": os.path.basename(context_dir),
+            "family": EARPIECE_FAMILY,
+            "record": EARPIECE_RECORD,
+            "design": requested,
+            "defaults": {name: spec[2] for name, spec in earpiece.PARAMS.items()},
+        }
+    )
+    patient = os.path.join(work, "candidates", key)
+    out = os.path.join(patient, "aid", EARPIECE_DESIGN_ID)
+    marker = os.path.join(patient, BUILD_MARKER)
+
+    with locked(os.path.join(work, "candidates", f"{key}.lock")):
+        reused = os.path.isfile(marker)
+        if not reused:
+            shutil.rmtree(patient, ignore_errors=True)
+            os.makedirs(patient)
+            # The layout of `python -m hornsim.earpiece <patient_dir>`: context and aid side by side.
+            os.symlink(os.path.abspath(context_dir), os.path.join(patient, "context"))
+            record: dict[str, Any] = {
+                "version": version,
+                "candidate_key": key,
+                "family": EARPIECE_FAMILY,
+                "parameters": requested,
+            }
+            report = earpiece.build(
+                os.path.join(patient, "context"),
+                os.path.join(patient, "aid"),
+                requested,
+                EARPIECE_DESIGN_ID,
+                log=log,
+            )
+            record["fits"] = bool(report["ok"])
+            if not report["ok"]:
+                record["reasons"] = report["reasons"]
+                record["warnings"] = report.get("warnings", [])
+            else:
+                patient_cfg = read_json(os.path.join(context_dir, "context.json"))["config"]["patient"]
+                ear = ear_record(work, patient_cfg["ear_mesh"], patient_cfg["ear_height_mm"])["ear_params"]
+                acoustic = earpiece_acoustic(report, ear)
+                canal_file = read_json(os.path.join(context_dir, "canals.json"))
+                freqs = acoustics.DEFAULT_FREQS
+                gains = earpiece_gain_db(
+                    acoustic, canal_file["canals"], canal_file["assumed_diameter_mm"], freqs
+                )
+                summary = gain_summary(gains, freqs)
+                write_json_atomic(
+                    os.path.join(out, "acoustics.json"),
+                    {
+                        "freqs_hz": np.round(freqs, 1).tolist(),
+                        "insertion_gain_db": {
+                            "median": np.round(np.median(gains, 0), 2).tolist(),
+                            "min": np.round(gains.min(0), 2).tolist(),
+                            "max": np.round(gains.max(0), 2).tolist(),
+                        },
+                        "summary": summary,
+                        "model_input": acoustic,
+                        "notes": [
+                            "hornsim.acoustics, unified settings, with the patient's ear_params.",
+                            "The whole canal is each canal sample plus whole_canal_is_sample_plus_mm.",
+                            "Model output, not a measurement.",
+                        ],
+                    },
+                )
+                # The outline is for drawing. Everything else in the builder's report is kept.
+                record["report"] = {
+                    name: value for name, value in report.items() if name != "mouth_outline_mm"
+                }
+                record["acoustic"] = acoustic
+                record["acoustics_summary"] = summary
+            record["build_seconds"] = round(time.time() - started, 3)
+            write_json_atomic(marker, record)
+
+    record = read_json(marker)
+    result: dict[str, Any] = {
+        "version": record["version"],
+        "candidate_key": key,
+        "candidate_dir": patient,
+        "family": EARPIECE_FAMILY,
+        "reused": reused,
+        "fits": record["fits"],
+        "seconds": round(time.time() - started, 3),
+        "build_seconds": record["build_seconds"],
+    }
+    if not record["fits"]:
+        result["reasons"] = record["reasons"]
+        return result
+    report = record["report"]
+    result["design"] = report
+    result["acoustics_summary"] = record["acoustics_summary"]
+    result["acoustic_door"] = record["acoustic"]["door"]
+    result["bore_length_mm"] = report["geometry"]["bore_length_mm"]
+    result["protrusion_mm"] = report["geometry"]["proud_of_concha_mm"]
+    result["assets"] = {
+        "design_json": os.path.join(out, "design.json"),
+        "earpiece_glb": os.path.join(out, "earpiece.glb"),
+        "earpiece_in_ear_glb": os.path.join(out, "earpiece_in_ear.glb"),
+        "earpiece_print_stl": os.path.join(out, "earpiece_print.stl"),
+        "earpiece_preview_png": os.path.join(out, "preview.png"),
+        "acoustics_json": os.path.join(out, "acoustics.json"),
     }
     return result
 
@@ -417,8 +796,16 @@ def cmd_score(payload: dict[str, Any]) -> dict[str, Any]:
     if candidate_dir is not None:
         if not os.path.isfile(os.path.join(candidate_dir, BUILD_MARKER)):
             raise BridgeError("candidate_missing", f"No finished aid build at '{candidate_dir}'.")
-        design = ac.Design.from_design_json(read_json(os.path.join(candidate_dir, "aid", "design.json")))
-        gains = ac.insertion_gain_db(design, canals, freqs)
+        built = read_json(os.path.join(candidate_dir, BUILD_MARKER))
+        if built.get("family") == EARPIECE_FAMILY:
+            if not built["fits"]:
+                raise BridgeError("candidate_missing", f"The earpiece at '{candidate_dir}' was not built.")
+            gains = earpiece_gain_db(
+                built["acoustic"], [sampled[i] for i in picks], canal_file["assumed_diameter_mm"], freqs
+            )
+        else:
+            design = ac.Design.from_design_json(read_json(os.path.join(candidate_dir, "aid", "design.json")))
+            gains = ac.insertion_gain_db(design, canals, freqs)
 
     unaided_dir = os.path.join(context_dir, "bridge_unaided")
     os.makedirs(unaided_dir, exist_ok=True)
@@ -547,6 +934,7 @@ COMMANDS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "describe": cmd_describe,
     "context": cmd_context,
     "build": cmd_build,
+    "build-earpiece": cmd_build_earpiece,
     "score": cmd_score,
     "template-ear": cmd_template_ear,
 }

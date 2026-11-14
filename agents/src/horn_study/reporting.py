@@ -419,6 +419,27 @@ def hypothesis_data(
     return output
 
 
+def _primary_improved(
+    plan: StudyPlan,
+    by_experiment: dict[str, ExperimentRecord],
+    directions: dict[str, str],
+    selected: str,
+    scenarios: tuple[str, ...],
+) -> bool:
+    """Whether the selected design beats the control on the plan's primary metric in these scenarios."""
+    rule = plan.selection_rule
+
+    def values(candidate_id: str) -> list[float]:
+        specs = [e for e in plan.experiments if e.candidate_id == candidate_id and e.scenario_id in scenarios]
+        return _metric_values(specs, by_experiment, rule.primary_metric)
+
+    chosen, control = values(selected), values(rule.reference_candidate_id)
+    if not chosen or not control:
+        return False
+    direction = directions.get(rule.primary_metric, rule.direction)
+    return _signed(direction, fmean(chosen)) > _signed(direction, fmean(control))
+
+
 def need_outcomes(
     plan: StudyPlan,
     records: list[ExperimentRecord],
@@ -488,7 +509,24 @@ def need_outcomes(
                     f"{metric} improved on the reference control in {where} "
                     f"({fmean(chosen):.4g} against {fmean(control):.4g})"
                 )
-        if shortfalls:
+        if (
+            shortfalls
+            and achieved
+            and _primary_improved(plan, by_experiment, directions, selected, scenarios)
+        ):
+            # The study's own measure of benefit improved here and so did part of what the need was
+            # tied to. A secondary metric that did not improve is stated, not counted as failure.
+            outcomes.append(
+                NeedOutcome(
+                    need=coverage.need,
+                    status="addressed",
+                    explanation=(
+                        f"For the selected design '{selected}': {'; '.join(achieved)} (modeled result). "
+                        f"Not improved: {'; '.join(shortfalls)}."
+                    ),
+                )
+            )
+        elif shortfalls:
             outcomes.append(
                 NeedOutcome(
                     need=coverage.need,

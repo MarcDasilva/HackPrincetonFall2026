@@ -2,9 +2,12 @@
 
     horn-study earpiece <study_id> --patient-dir <backend patient dir>
 
-The selected candidate's acoustic numbers (throat and mouth area) are LOCKED: the model only
-sets the shaping and retention dials (talker side, hood, mouth outline, flare, canal stem, tab
-position), which the acoustic score does not see. Once the model chooses, code builds the S and L
+Everything the study evaluated is LOCKED: throat and mouth area, the canal stem length, the bore
+flare, and whether there is a collector with its reach and opening area. A study verifies one
+specific shape against the unaided ear, so changing any of these afterwards would print a design
+nobody tested. The model only sets what the acoustic score does not see: which way the collector
+faces and its outline, the talker side, the hood on a flush piece, how the mouth follows the
+concha, and the removal tab. Once the model chooses, code builds the S and L
 sizes of that same design: nobody yet knows how far a photo-built ear is off, so the patient tries
 all three. The bore length is not a dial: the horn is carved inside the concha, so the depth of the
 bowl sets it.
@@ -72,15 +75,154 @@ def describe_dials() -> dict[str, Any]:
     return json.loads(out.stdout)
 
 
-def locked_params(parameters: dict[str, Any]) -> dict[str, float]:
-    """Acoustic numbers from the selected candidate, converted to the builder's names."""
+COLLECTOR_REACH = "collector_reach_mm"
+COLLECTOR_OPENING = "collector_mouth_mm2"
+PROTRUSION = "protrusion_mm"
+# With no size limit in the study, the built piece may stand out this much further than the tested
+# one: enough for the builder's rounding and a slight turn toward the talker, not for a bigger part.
+SIZE_ALLOWANCE_MM = 1.5
+# Fit sizes. S and L are the same design with the cast shrunk or grown. The full step is tried
+# first, then smaller ones, because a wide bore leaves little wall for the cast to give up.
+SIZE_OFFSETS_MM = {"S": (-0.5, -0.4, -0.3, -0.2), "L": (0.5, 0.4, 0.3, 0.2)}
+SECTION_POINTS = 12
+MIN_OUTWARD = 0.5  # a collector must grow away from the head: at least this share of its reach
+# The dials the acoustic score responds to. A study that did not set one evaluated the builder's
+# default for it, so that default is what gets locked.
+ACOUSTIC_DIALS = ("canal_stem_mm", "flare_mid1", "flare_mid2")
+
+
+def locked_params(parameters: dict[str, Any], dials: dict[str, Any] | None = None) -> dict[str, float]:
+    """Every number the study evaluated, converted to the builder's names.
+
+    Throat and mouth always. The canal stem and the flare too: from the study when it set them,
+    otherwise the builder's default, which is what the study's evaluation used.
+    """
     out: dict[str, float] = {}
     for part in ("throat", "mouth"):
         if f"{part}_mm2" in parameters:
             out[f"{part}_mm2"] = float(parameters[f"{part}_mm2"])
         elif f"{part}_diameter_mm" in parameters:
             out[f"{part}_mm2"] = round(math.pi * (float(parameters[f"{part}_diameter_mm"]) / 2) ** 2, 2)
+    for name in ACOUSTIC_DIALS:
+        if name in parameters:
+            out[name] = float(parameters[name])
+        elif dials and isinstance(dials.get(name), dict) and "default" in dials[name]:
+            out[name] = float(dials[name]["default"])
     return out
+
+
+def study_collector(parameters: dict[str, Any]) -> tuple[float, float] | None:
+    """(reach mm, opening mm^2) of the collector the study evaluated.
+
+    None when the study's family has no collector dials. (0, 0) when it has them and the selected
+    design is flush.
+    """
+    if COLLECTOR_REACH not in parameters and COLLECTOR_OPENING not in parameters:
+        return None
+    return float(parameters.get(COLLECTOR_REACH, 0.0)), float(parameters.get(COLLECTOR_OPENING, 0.0))
+
+
+def lock_collector(
+    requested: dict[str, Any] | None, studied: tuple[float, float] | None
+) -> dict[str, Any] | None:
+    """The collector to build: the model's direction and outline at the study's reach and opening.
+
+    The acoustic model sees a collector only as area along its length, so the model may turn it
+    toward the talker and shape its rim, while its length and opening area stay the ones the study
+    tested. With no collector in the study, none is built. When the study's family has no
+    collector dials at all, the model's own collector passes through unchanged.
+    """
+    if studied is None:
+        return requested
+    reach, opening = studied
+    if reach <= 0 or opening <= 0:
+        return None
+    spine = (requested or {}).get("spine") or [[1.0, 0.0, 0.0]]
+    sections = (requested or {}).get("sections") or [[1.0] * SECTION_POINTS]
+    try:
+        end = [float(v) for v in spine[-1]][:3]
+        radii = [abs(float(r)) for r in sections[-1]][:SECTION_POINTS]
+    except (TypeError, ValueError, IndexError):
+        end, radii = [1.0, 0.0, 0.0], [1.0] * SECTION_POINTS
+    end += [0.0] * (3 - len(end))
+    radii += [radii[-1] if radii else 1.0] * (SECTION_POINTS - len(radii))
+    length = math.sqrt(sum(v * v for v in end))
+    unit = [v / length for v in end] if length > 0 else [1.0, 0.0, 0.0]
+    if unit[0] < MIN_OUTWARD:
+        side = math.sqrt(unit[1] ** 2 + unit[2] ** 2) or 1.0
+        keep = math.sqrt(1 - MIN_OUTWARD**2) / side
+        unit = [MIN_OUTWARD, unit[1] * keep, unit[2] * keep]
+    mean_square = sum(r * r for r in radii) / SECTION_POINTS
+    scale = math.sqrt(opening / (math.pi * mean_square)) if mean_square > 0 else 0.0
+    if scale <= 0:
+        radii, scale = [1.0] * SECTION_POINTS, math.sqrt(opening / math.pi)
+    return {
+        "spine": [[round(reach * u, 3) for u in unit]],
+        "sections": [[round(r * scale, 3) for r in radii]],
+    }
+
+
+def study_size(results: dict[str, Any]) -> tuple[float | None, float | None]:
+    """(how far the selected design stood out in the study, the plan's limit on that), in mm."""
+    selected = results.get("selected_candidate_id") or (results.get("selected_candidate") or {}).get(
+        "candidate_id"
+    )
+    stood_out = None
+    for candidate in (results.get("report") or {}).get("candidates", []):
+        if candidate.get("candidate_id") == selected:
+            stood_out = next(
+                (m.get("mean") for m in candidate.get("metrics", []) if m.get("name") == PROTRUSION), None
+            )
+    rule = (results.get("plan") or {}).get("selection_rule") or {}
+    limit = next(
+        (
+            c.get("value")
+            for c in rule.get("constraints", [])
+            if c.get("metric") == PROTRUSION and c.get("bound") == "max"
+        ),
+        None,
+    )
+    return stood_out, limit
+
+
+def departures(
+    geometry: dict[str, Any],
+    locked: dict[str, float],
+    studied: tuple[float, float] | None,
+    size_limit_mm: float | None = None,
+) -> list[str]:
+    """Where a built piece differs from what the study evaluated. Empty means it matches."""
+    found: list[str] = []
+    stands_out = geometry.get("proud_of_concha_mm")
+    if (
+        size_limit_mm is not None
+        and isinstance(stands_out, (int, float))
+        and stands_out > size_limit_mm + 0.05
+    ):
+        found.append(
+            f"size: stands out {float(stands_out):g} mm, over the limit of {size_limit_mm:g} mm from the study"
+        )
+
+    def compare(label: str, built: Any, wanted: float, tolerance: float, unit: str) -> None:
+        if not isinstance(built, (int, float)) or isinstance(built, bool):
+            return
+        if abs(float(built) - wanted) > tolerance:
+            found.append(f"{label}: built {float(built):g} {unit}, study evaluated {wanted:g} {unit}")
+
+    for name, unit in (("throat_mm2", "mm^2"), ("mouth_mm2", "mm^2"), ("canal_stem_mm", "mm")):
+        if name in locked:
+            compare(name, geometry.get(name), locked[name], max(0.02 * locked[name], 0.05), unit)
+    if studied is not None:
+        _, opening = studied
+        built_opening = geometry.get("collector_mouth_mm2")
+        if opening <= 0 and geometry.get("collector"):
+            found.append("collector: built one, but the study evaluated a flush piece")
+        elif opening > 0:
+            if not geometry.get("collector"):
+                found.append("collector: none built, but the study evaluated one")
+            else:
+                compare("collector opening", built_opening, opening, 0.03 * opening, "mm^2")
+    return found
 
 
 SYSTEM = """You design the 3D earpiece for one patient after the study has chosen its acoustic numbers.
@@ -104,16 +246,24 @@ last section larger than the front, so a lip shelters the side away from the tal
 replaces the hood (set hood_mm 0).
 
 You also set: where the main talker is (aim), the hood when there is no collector, how closely the
-mouth follows this concha's opening and its stretch, how the bore widens on the way up, the canal
-stem length, and where the removal tab sits. The acoustic numbers (throat and mouth area) are fixed
-by the study; never try to change them.
+mouth follows this concha's opening and its stretch, and where the removal tab sits.
+
+The study tested one specific shape against the unaided ear, and everything it tested is fixed:
+throat and mouth area, the canal stem length, how the bore widens (flare), and the collector's
+reach and opening area, or the absence of a collector. `fixed_by_study` in the brief lists them.
+Code applies those values whatever you send, so the printed piece is the one that was tested. For
+the collector you choose the direction it faces and the outline of its rim: code keeps your
+direction and the proportions of your last section, and sets its length and opening area to the
+study's. Only the last spine point and section are used. When the study chose a flush piece, no
+collector is built. A tilted or lipped collector stands out further than a straight round one: each
+build reports `proud_of_concha_mm`, and when the brief gives a size limit from the study, stay
+within it. If the patient's needs call for something the fixed values rule out, such as
+a stem for grip, do not work around it: say so in your explanation, so it can be tested in a new
+study.
 
 Each build returns its checks and a picture of the piece in the ear. Look at the picture. When a
 build fails, its reasons say what to move and which way; make the smallest change that fixes it.
-The stem is what keeps the piece in: its outside is the canal width and its LENGTH is how far it goes
-in, so a longer stem does not make room for a wider throat. Drop it (canal_stem_mm 0) only when the
-locked throat cannot fit inside it, and say so. Do not set the fit size; S, M and L prints are made
-after you finish.
+Do not set the fit size; S, M and L prints are made after you finish.
 
 Call build_earpiece for each attempt with a one-line reason. When a build succeeds and suits the
 patient, call finish with its design_id and one plain sentence for the screen. You have a fixed
@@ -142,13 +292,29 @@ def brief(results: dict[str, Any], patient_dir: Path, locked: dict[str, float], 
             "side": cfg.get("patient", {}).get("side"),
             "ear_height_mm": cfg.get("patient", {}).get("ear_height_mm"),
         }
-    shaping = {k: v for k, v in dials.items() if k not in ("throat_mm2", "mouth_mm2", "wall_mm")}
+    fixed = {"throat_mm2", "mouth_mm2", "wall_mm", *locked}
+    shaping = {k: v for k, v in dials.items() if k not in fixed}
+    studied = study_collector(results["selected_candidate"].get("parameters", {}))
+    stood_out, size_limit = study_size(results)
+    fixed_by_study: dict[str, Any] = dict(locked)
+    if studied is not None:
+        fixed_by_study["collector"] = (
+            {"reach_mm": studied[0], "opening_mm2": studied[1]}
+            if studied[0] > 0 and studied[1] > 0
+            else "none: the study chose a flush piece"
+        )
     return json.dumps(
         {
             "selected_candidate": {
                 k: results["selected_candidate"].get(k) for k in ("candidate_id", "label", "rationale")
             },
-            "locked_acoustic_numbers": locked,
+            "fixed_by_study": fixed_by_study,
+            "size_in_study_mm": {
+                "stood_out": stood_out,
+                "limit": size_limit
+                if size_limit is not None
+                else (None if stood_out is None else round(float(stood_out) + SIZE_ALLOWANCE_MM, 2)),
+            },
             "patient_context": results.get("study_context"),
             "ear": ear,
             "dials_you_set": shaping,
@@ -174,8 +340,18 @@ def produce_earpiece(
     selected = results.get("selected_candidate")
     if not selected or selected.get("kind") != "design":
         raise EarpieceError("The study selected no design, so there is nothing to build.")
-    locked = locked_params(selected.get("parameters", {}))
     dials = dials if dials is not None else describe_dials()
+    locked = locked_params(selected.get("parameters", {}), dials)
+    studied = study_collector(selected.get("parameters", {}))
+    stood_out, size_limit = study_size(results)
+    limit_source = "study" if size_limit is not None else None
+    if size_limit is None and stood_out is not None:
+        # The study set no limit, so its own tested size is the reference: shaping may not turn the
+        # verified design into a noticeably bigger part.
+        size_limit, limit_source = (
+            round(float(stood_out) + SIZE_ALLOWANCE_MM, 2),
+            "tested_size_plus_allowance",
+        )
     study_id = results.get("study_id", study_dir.name)
     builds: list[dict[str, Any]] = []
     chosen: dict[str, Any] = {}
@@ -207,14 +383,36 @@ def produce_earpiece(
             "flare_mid2": flare_mid2,
             "canal_stem_mm": canal_stem_mm,
             "tab_side_deg": tab_side_deg,
-            "collector": collector,
+            # The model's direction and outline, at the study's reach and opening area.
+            "collector": lock_collector(collector, studied),
         }
+        if shaping["collector"] is not None:
+            shaping["hood_mm"] = 0.0  # the builder takes a collector or a hood, never both
         design_id = f"{study_id}-e{len(builds) + 1}"
         # Locked numbers go in LAST so no shaping value can ever replace them.
-        report = build(patient_dir, {**shaping, **locked}, design_id)
-        builds.append({"design_id": design_id, "why": why, "shaping": shaping, "report": report})
+        sent = {**shaping, **locked}
+        report = build(patient_dir, sent, design_id)
+        differs = (
+            departures(report.get("geometry") or {}, locked, studied, size_limit) if report.get("ok") else []
+        )
+        builds.append(
+            {
+                "design_id": design_id,
+                "why": why,
+                "shaping": {k: v for k, v in sent.items() if k not in ("throat_mm2", "mouth_mm2")},
+                "report": report,
+                "departures_from_study": differs,
+            }
+        )
         keep = ("ok", "reasons", "warnings", "checks", "geometry")
-        return json.dumps({"design_id": design_id, **{k: report[k] for k in keep if k in report}})
+        return json.dumps(
+            {
+                "design_id": design_id,
+                "applied_from_study": {**locked, "collector": sent["collector"]},
+                "departures_from_study": differs,
+                **{k: report[k] for k in keep if k in report},
+            }
+        )
 
     @tool
     def finish(design_id: str, explanation: str) -> str:
@@ -222,6 +420,12 @@ def produce_earpiece(
         built = {b["design_id"]: b for b in builds if b["report"].get("ok")}
         if design_id not in built:
             return f"Rejected: {design_id} did not build. Builds that succeeded: {sorted(built) or 'none'}."
+        if built[design_id]["departures_from_study"] and len(builds) < max_builds:
+            # While builds remain, a piece that differs from the tested design must be reshaped.
+            return (
+                f"Rejected: {design_id} differs from the design the study tested: "
+                f"{'; '.join(built[design_id]['departures_from_study'])}. Build again within the study's values."
+            )
         chosen.update(design_id=design_id, explanation=explanation, chosen_by="agent")
         return "Done."
 
@@ -250,7 +454,8 @@ def produce_earpiece(
     ok = [b for b in builds if b["report"].get("ok")]
     if not chosen and ok:
         # Code picks when the model did not: the successful build with the most wall around the bore.
-        best = max(ok, key=lambda b: b["report"]["checks"]["bore_wall_mm"])
+        # A build that matches the study is preferred over one that differs from it.
+        best = max(ok, key=lambda b: (not b["departures_from_study"], b["report"]["checks"]["bore_wall_mm"]))
         chosen.update(design_id=best["design_id"], explanation="", chosen_by="code_fallback")
     sizes: dict[str, Any] = {}
     if chosen:
@@ -258,12 +463,19 @@ def produce_earpiece(
         # code's job, outside the model's build budget, and a size that fails is reported, not hidden.
         base = next(b for b in builds if b["design_id"] == chosen["design_id"])
         sizes["M"] = {"design_id": base["design_id"], "ok": True}
-        for size, offset in (("S", -0.5), ("L", 0.5)):
+        for size, offsets in SIZE_OFFSETS_MM.items():
             size_id = f"{base['design_id']}-{size}"
-            report = build(patient_dir, {**base["shaping"], **locked, "fit_offset_mm": offset}, size_id)
+            report: dict[str, Any] = {}
+            used = offsets[0]
+            for used in offsets:
+                report = build(patient_dir, {**base["shaping"], **locked, "fit_offset_mm": used}, size_id)
+                if report.get("ok"):
+                    break
             sizes[size] = {
                 "design_id": size_id,
                 "ok": bool(report.get("ok")),
+                "fit_offset_mm": used if report.get("ok") else None,
+                "full_step": bool(report.get("ok")) and used == offsets[0],
                 "reasons": report.get("reasons", []),
             }
     record = {
@@ -271,8 +483,26 @@ def produce_earpiece(
         "patient_dir": str(patient_dir),
         "selected_parameters": selected.get("parameters", {}),
         "locked": locked,
+        "study_collector": (None if studied is None else {"reach_mm": studied[0], "opening_mm2": studied[1]}),
+        "size_mm": {
+            "stood_out_in_study": stood_out,
+            "limit": size_limit,
+            "limit_source": limit_source,
+            "built": next(
+                (
+                    (b["report"].get("geometry") or {}).get("proud_of_concha_mm")
+                    for b in builds
+                    if chosen and b["design_id"] == chosen["design_id"]
+                ),
+                None,
+            ),
+        },
         "builds": builds,
         "chosen": chosen or None,
+        "departures_from_study": next(
+            (b["departures_from_study"] for b in builds if chosen and b["design_id"] == chosen["design_id"]),
+            [],
+        ),
         "sizes": sizes,
         "status": "built" if chosen else "no_buildable_design",
     }

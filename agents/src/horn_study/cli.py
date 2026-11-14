@@ -251,6 +251,13 @@ def cmd_earpiece(args: argparse.Namespace) -> int:
     for b in record["builds"]:
         reasons = "; ".join(r["message"] for r in b["report"].get("reasons", []))
         print(f"{b['design_id']}: {'built' if b['report'].get('ok') else 'rejected'}  {b['why']}  {reasons}")
+    for difference in record.get("departures_from_study", []):
+        print(f"differs from the study: {difference}")
+    for size, made in record.get("sizes", {}).items():
+        if not made["ok"]:
+            print(f"size {size}: could not be built")
+        elif not made.get("full_step", True):
+            print(f"size {size}: built at {made['fit_offset_mm']:+g} mm, a smaller step than usual")
     chosen = record["chosen"]
     print(
         f"chosen: {chosen['design_id']} ({chosen['chosen_by']}) {chosen['explanation']}"

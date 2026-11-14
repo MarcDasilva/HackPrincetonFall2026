@@ -2,17 +2,16 @@
 // A small Web Worker pool for FDTD runs. Jobs queue FIFO; each finished run resolves its promise,
 // and its frames stream to the job's onFrame. `cancel(owner)` drops queued jobs of one scene cell
 // (a run already in a worker finishes and its result is ignored by the caller).
-import type { EarGrid } from "./fdtd";
+import type { HeadGrid, Side } from "./fdtd";
 import type { JobOut } from "./fdtd.worker";
 
-export const N_STEPS = 2048;      // 8.5 ms at 2.5 mm: the eardrum ring has died down well before
-export const FRAME_EVERY = 4;       // frames cover the first FRAME_STEPS: the pulse crossing the box
-export const FRAME_STEPS = 480;
+export type EarSpectra = Record<Side, number[]>;
+export type RunResult = { spectrum: EarSpectra; tf: import("./binaural").EarTF };
 
 type Job = {
   id: number; owner: string; az: number; el: number;
   onFrame?: (step: number, slice: Float32Array) => void;
-  resolve: (spectrum: number[]) => void; reject: (e: Error) => void;
+  resolve: (r: RunResult) => void; reject: (e: Error) => void;
 };
 
 export class SimPool {
@@ -23,7 +22,7 @@ export class SimPool {
   private nextId = 1;
   private listeners = new Set<() => void>();
 
-  constructor(grid: EarGrid, size: number) {
+  constructor(grid: HeadGrid, size: number) {
     for (let i = 0; i < size; i++) {
       const w = new Worker(new URL("./fdtd.worker.ts", import.meta.url), { type: "module" });
       w.onmessage = (e: MessageEvent<JobOut>) => {
@@ -41,7 +40,7 @@ export class SimPool {
   subscribe(fn: () => void) { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; }
   private emit() { this.listeners.forEach((f) => f()); }
 
-  run(owner: string, az: number, el: number, onFrame?: Job["onFrame"]): Promise<number[]> {
+  run(owner: string, az: number, el: number, onFrame?: Job["onFrame"]): Promise<RunResult> {
     return new Promise((resolve, reject) => {
       this.queue.push({ id: this.nextId++, owner, az, el, onFrame, resolve, reject });
       this.pump();
@@ -59,7 +58,7 @@ export class SimPool {
     while (this.idle.length && this.queue.length) {
       const w = this.idle.pop()!, j = this.queue.shift()!;
       this.running.set(w, j);
-      w.postMessage({ type: "run", job: j.id, az: j.az, el: j.el, nSteps: N_STEPS, frameEvery: FRAME_EVERY, frameSteps: FRAME_STEPS });
+      w.postMessage({ type: "run", job: j.id, az: j.az, el: j.el });
     }
     this.emit();
   }
@@ -70,7 +69,7 @@ export class SimPool {
     if (m.type === "frame") { j.onFrame?.(m.step, m.slice); return; }
     this.running.delete(w);
     this.idle.push(w);
-    if (m.type === "done") j.resolve(m.spectrum);
+    if (m.type === "done") j.resolve({ spectrum: m.spectrum, tf: m.tf });
     else if (m.type === "error") j.reject(new Error(m.message));
     this.pump();
   }

@@ -8,10 +8,16 @@ through `bridges/hornsim_bridge.py`, one short process per step, with JSON in
 and JSON out. This module only decides which steps to run and maps their
 answers onto the contract:
 
-    describe   what the installed hornsim supports. Capabilities are built from it.
-    context    once per (ear mesh, audiogram): ear world, canals, clips, references.
-    build      once per (context, design numbers): the 3D aid and its insertion gain.
-    score      once per experiment: HASPI v2 for one listening condition.
+    describe         what the installed hornsim supports, and what the configured ear can hold.
+                     Capabilities are built from it.
+    context          once per (ear mesh, audiogram): ear world, canals, clips, references.
+    build            once per (context, design numbers): the coiled aid and its insertion gain.
+    build-earpiece   once per (context, design numbers): the in-concha earpiece and its insertion gain.
+    score            once per experiment: HASPI v2 for one listening condition.
+
+Two geometry families are declared: the coiled aid of `hornsim.aid` and the
+in-concha earpiece of `hornsim.earpiece`. Both go through the same scenarios,
+canal sample, HASPI call, and unaided control.
 
 Nothing here normalizes a level, rescales a metric, or fills in a threshold.
 """
@@ -25,7 +31,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -42,6 +48,18 @@ BRIDGE_ENV = "HORNSIM_BRIDGE"
 
 EVALUATOR_NAME = "hornsim"
 FAMILY_ID = "spiral_exponential_horn"
+EARPIECE_FAMILY_ID = "concha_horn_earpiece"
+# The two scalar dials a study uses to ask for a collector. hornsim.earpiece takes a collector as a
+# spine and cross-sections, which `earpiece_builder_parameters` writes from these.
+COLLECTOR_REACH = "collector_reach_mm"
+COLLECTOR_MOUTH = "collector_mouth_mm2"
+# Dials a study sets on hornsim.earpiece under the builder's own names. The rest stay at the builder's
+# defaults. Most of them shape or hold the piece without changing the area along the bore. The two
+# flare dials do change it, and are held to keep the family small: hornsim.target also caps them at
+# the defaults, because a faster flare broke through the seat wall.
+_EARPIECE_BUILDER_DIALS = ("throat_mm2", "mouth_mm2", "canal_stem_mm")
+# Radii per cross-section in hornsim.earpiece's collector format.
+_COLLECTOR_SECTION_POINTS = 12
 BASELINE_ID = "unaided"
 CANAL_CONFIG_ID = "sampled_canals"
 CALIBRATION_REF = "hornsim-reference-at-65-db-spl-v2"
@@ -55,6 +73,10 @@ HASPI_RESOLUTION = 0.02
 # A study must cover enough listening conditions that one noisy condition cannot decide it.
 MINIMUM_SCENARIOS = 4
 _PLANNING_NOTES = (
+    "Every design in a plan is test-built in this ear before the plan is frozen. Whether a design "
+    "fits depends on the combination of its dials, not on each dial's range alone, so a design can "
+    "be rejected even with every value in range. When one is rejected, change the dials the builder "
+    "names (for example a smaller mouth or a wider throat) instead of resubmitting the same values.",
     "Evaluations are cheap here: building a candidate's geometry and scoring one scenario each take "
     "seconds. Use the budget to cover clean speech and speech in babble at every presentation level, "
     "with a handful of candidates, in preference to many candidates in few scenarios.",
@@ -64,6 +86,23 @@ _PLANNING_NOTES = (
     "disqualify it.",
     "bore_length_mm is informational only. It is not a size, comfort, or quality measure and has no "
     "preferred direction.",
+    "protrusion_mm reports how far each built part stands out past the concha rim. It is informational "
+    "too. When the user wants a small or discreet device, put a max constraint on it: that is the only "
+    "way a size preference enters the selection.",
+)
+_EARPIECE_PLANNING_NOTES = (
+    "Two device families are declared. spiral_exponential_horn is a shell that fills the concha, with "
+    "a coiled or funnel bore and an optional vent, and its mouth sits flush on the faceplate. "
+    "concha_horn_earpiece is a seat with a short horn carved inside it, an optional canal stem, and an "
+    "optional collector that carries the horn outward past the faceplate. It is the only family that "
+    "can have an opening larger than the concha opening, and only through its two collector dials.",
+    "Model prediction, not a measured fact: on a template ear with one example sloping loss, every "
+    "spiral design that was evaluated fell below the unaided control in at least one scenario, and an "
+    "acoustic-only sweep of the 1D model (no builds, no HASPI) suggested that a wide throat with an "
+    "opening larger than the concha opening, a protruding collector of around 450 mm^2, stays at or "
+    "above the unaided ear in every listening condition. Nothing has been measured on a printed device. "
+    "A study can test this by comparing concha_horn_earpiece candidates that have canal_stem_mm 0, a "
+    "wide throat, and a collector with candidates that have none.",
 )
 
 DEFAULT_BRIDGE = Path(__file__).resolve().parents[2] / "bridges" / "hornsim_bridge.py"
@@ -131,6 +170,46 @@ _PARAMETER_NOTES = {
     ),
 }
 
+_EARPIECE_PARAMETER_NOTES = {
+    "throat_mm2": (
+        "mm^2",
+        "Bore area at the seat floor, the end toward the canal. Must be smaller than mouth_mm2. A wider "
+        "throat passes more of 2 to 8 kHz. With a canal stem the bore runs inside the stem, so on this ear "
+        "{stem_throat}",
+    ),
+    "mouth_mm2": (
+        "mm^2",
+        "Mouth area on the faceplate, with an outline that follows this ear's concha opening. Must be "
+        "larger than throat_mm2. The builder's own range reaches {builder_mouth_max:g}, but the mouth "
+        "has to fit the concha opening, and the maximum declared here is the largest that "
+        "hornsim.target found this ear holds. A large mouth on a narrow throat can still be rejected "
+        "when the flare breaks through the seat wall. For an opening larger than this, add a collector.",
+    ),
+    "canal_stem_mm": (
+        "mm",
+        "Length of the soft stem into the canal that holds the piece in. 0 means no stem: the piece then "
+        "relies on its fit in the concha alone, and the throat may be wider. In the acoustic model the "
+        "stem is a tube at the throat area, and a longer stem leaves less of the canal behind it.",
+    ),
+    COLLECTOR_REACH: (
+        "mm",
+        "How far out from the mouth centre the collector's one spine point sits, straight along the "
+        "faceplate normal. The builder rounds off the end of the path, so the rim it builds sits about "
+        "1 mm closer than this, and protrusion_mm reports where the print really ends. 0 together with "
+        "collector_mouth_mm2 0 means no collector and a flush faceplate. The "
+        "builder rejects a collector that touches the ear or the head, or that has any point more than "
+        "{max_reach:g} mm from the mouth centre, which counts the rim's radius and wall as well as this "
+        "distance.",
+    ),
+    COLLECTOR_MOUTH: (
+        "mm^2",
+        "Area of the collector's round outer opening. 0 together with collector_reach_mm 0 means no "
+        "collector. It may be larger than the concha opening, which is what a collector is for. The "
+        "builder takes a rim radius of {radius_low:g} to {radius_high:g} mm, so an area below "
+        "{area_low:.3g} is refused.",
+    ),
+}
+
 _CLIP_TYPE_NAMES = {"clean": "clean_speech", "babble": "speech_in_babble"}
 _LEVEL_TAGS = {50: "soft_speech", 65: "conversational_speech", 80: "loud_speech"}
 
@@ -147,10 +226,16 @@ _UNSUPPORTED = (
     ("sound_localization", "One ear and a 1D plane-wave model. No directional or binaural cues."),
     ("reverberation_and_distance", "Clips are dry speech at a set level. No room or distance model."),
     ("wind_noise", "No flow or wind model."),
-    ("compact_size", "The shell fills the concha for every design, so outer size does not vary."),
     ("glasses_compatibility", "No packaging model."),
     ("easy_removal", "No handling model."),
     ("durability", "No structural model beyond minimum wall thickness."),
+)
+
+# Declared only while the spiral family is the only one. With the earpiece, outer size varies and
+# protrusion_mm reports it.
+_COMPACT_SIZE_UNSUPPORTED = (
+    "compact_size",
+    "The shell fills the concha for every design, so outer size does not vary.",
 )
 
 BridgeRunner = Callable[[str, dict[str, Any]], dict[str, Any]]
@@ -354,6 +439,19 @@ def _scenarios(described: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 def _metrics(described: Mapping[str, Any]) -> list[dict[str, Any]]:
     canal = described["canal"]
+    earpiece = earpiece_available(described)
+    open_ear = (
+        " The open ear is an average concha resonance for spiral_exponential_horn and the configured "
+        "ear's own concha for concha_horn_earpiece."
+        if earpiece
+        else ""
+    )
+    earpiece_length = (
+        " For concha_horn_earpiece it is the flare inside the seat, from the seat floor to the faceplate "
+        "mouth, and counts neither the canal stem nor a collector."
+        if earpiece
+        else ""
+    )
     spread = f"{canal['scored']} of the {canal['samples']} sampled ear canals, smallest to largest"
     metrics = [
         {
@@ -396,7 +494,7 @@ def _metrics(described: Mapping[str, Any]) -> list[dict[str, Any]]:
             "description": (
                 f"Modeled insertion gain averaged over {band}: eardrum level with the aid relative to "
                 f"the open ear, median over all {canal['samples']} sampled canals. Negative means the "
-                "aid attenuates. The same for every scenario. 0 for the unaided control."
+                "aid attenuates. The same for every scenario. 0 for the unaided control." + open_ear
             ),
         }
         for _, name, band in _GAIN_BANDS
@@ -412,7 +510,21 @@ def _metrics(described: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "the path inside the concha only. Reported to describe the design, not as a goal: a longer "
                 "bore lowers the estimated horn cutoff, while a wide bore is routed short and keeps more "
                 "of the 2 to 4 kHz response. It is not a size or comfort measure: the shell fills the "
-                "concha either way. 0 for the unaided control."
+                "concha either way. 0 for the unaided control." + earpiece_length
+            ),
+        }
+    )
+    metrics.append(
+        {
+            "name": "protrusion_mm",
+            "unit": "mm",
+            "direction": "informational",
+            "description": (
+                "How far the built part stands out past the plane of the concha rim, along the rim normal, "
+                "measured on the print solid. hornsim.earpiece reports it as proud_of_concha_mm, and the "
+                "same measure is taken on the spiral family's print. It counts the removal tab and any "
+                "collector. It has no better or worse direction of its own, but a selection constraint can "
+                "cap it when the user wants a small or discreet device. 0 for the unaided control."
             ),
         }
     )
@@ -429,11 +541,21 @@ def _model_description(described: Mapping[str, Any]) -> str:
             "hornsim builds a passive in-ear aid in the configured ear mesh and models it.",
             "Geometry: a shell that fills the concha, a bore with exponential area flare that is coiled as a"
             " spiral when narrow and routed as a short uncoiled funnel when wide, and an optional straight vent.",
+            *(
+                [
+                    "A second device, the in-concha earpiece of hornsim.earpiece, is a seat with the horn carved"
+                    " inside it and an optional collector beyond the faceplate. It goes through the same acoustic"
+                    " model, clips, and HASPI call, with the configured ear's own concha as its open-ear"
+                    " reference. Its family description says what the model is given and what it does not see.",
+                ]
+                if earpiece_available(described)
+                else []
+            ),
             "Acoustics: a 1D plane-wave transmission-line model with viscous and thermal wall losses,"
             " giving insertion gain at the eardrum relative to the open ear.",
             "Scoring: the insertion gain is applied to speech clips as a linear zero-phase filter and"
             f" HASPI v2 (pyclarity {described['dependencies']['pyclarity']}) is computed with the supplied audiogram.",
-            "What the model shows about this family: with the concha filled, no bore that fits reaches the"
+            "What the model shows about the spiral family: with the concha filled, no bore that fits reaches the"
             " open ear at 2 to 4 kHz. The shell removes the concha's own boost there, and the added bore"
             " length moves the ear canal resonance down, which can add a few dB at 1 to 2 kHz.",
             "Stated simplifications:",
@@ -461,6 +583,184 @@ def parameter_bounds(described: Mapping[str, Any]) -> dict[str, dict[str, float]
     return {name: dict(bounds) for name, bounds in described["aid_design_fields"].items()}
 
 
+def earpiece_available(described: Mapping[str, Any]) -> bool:
+    """Whether the backend has the earpiece builder and the configured ear can hold an earpiece."""
+    earpiece = described.get("earpiece") or {}
+    return bool(earpiece.get("available") and earpiece.get("boxes"))
+
+
+def earpiece_bounds(described: Mapping[str, Any]) -> dict[str, dict[str, float]]:
+    """What hornsim.earpiece accepts on any ear, for the dials a study sets.
+
+    Read from the builder each time: its PARAMS table, its reach limit, and the section radii its
+    collector check accepts. The collector dials start at 0, which means no collector.
+    """
+    earpiece = described["earpiece"]
+    fields = {
+        name: {key: float(earpiece["params"][name][key]) for key in ("minimum", "maximum", "default")}
+        for name in _EARPIECE_BUILDER_DIALS
+    }
+    collector = earpiece["collector"]
+    fields[COLLECTOR_REACH] = {"minimum": 0.0, "maximum": float(collector["max_reach_mm"]), "default": 0.0}
+    fields[COLLECTOR_MOUTH] = {
+        "minimum": 0.0,
+        "maximum": _floor_tenth(math.pi * float(collector["section_radius_mm"][1]) ** 2),
+        "default": 0.0,
+    }
+    return fields
+
+
+def _floor_tenth(value: float) -> float:
+    """Round a limit down to one decimal, so a value read from its printed form is still inside it."""
+    return math.floor(float(value) * 10 + 1e-9) / 10
+
+
+@dataclass(frozen=True)
+class EarpieceEarLimits:
+    """What `hornsim.target.earpiece_boxes` found the configured ear can hold, rounded down to 0.1.
+
+    Each box is one variant that built in this ear: with a canal stem (the throat has to fit inside
+    it) or without one. `throat_with_stem_mm2` is None when no variant with a stem built.
+    """
+
+    mouth_mm2: float
+    throat_mm2: float
+    canal_stem_mm: float
+    throat_with_stem_mm2: float | None
+
+
+def earpiece_ear_limits(described: Mapping[str, Any]) -> EarpieceEarLimits:
+    boxes = described["earpiece"]["boxes"]
+    with_stem = [box["throat_mm2"][1] for box in boxes if box["canal_stem_mm"][1] > 0]
+    return EarpieceEarLimits(
+        mouth_mm2=_floor_tenth(max(box["mouth_mm2"][1] for box in boxes)),
+        throat_mm2=_floor_tenth(max(box["throat_mm2"][1] for box in boxes)),
+        canal_stem_mm=_floor_tenth(max(box["canal_stem_mm"][1] for box in boxes)),
+        throat_with_stem_mm2=_floor_tenth(max(with_stem)) if with_stem else None,
+    )
+
+
+def earpiece_fixed_dials(described: Mapping[str, Any]) -> dict[str, float]:
+    """The builder dials a study does not set, at the builder's defaults."""
+    return {
+        name: spec["default"]
+        for name, spec in described["earpiece"]["params"].items()
+        if name not in _EARPIECE_BUILDER_DIALS
+    }
+
+
+def earpiece_builder_parameters(parameters: Mapping[str, float]) -> dict[str, Any]:
+    """A study's earpiece parameters as hornsim.earpiece takes them.
+
+    The three builder dials pass through under their own names. The two collector dials become
+    the builder's collector: one spine point `collector_reach_mm` straight out from the mouth
+    centre along the faceplate normal, with a round cross-section of area `collector_mouth_mm2`.
+    The builder blends the mouth outline into that circle. Both 0 means no collector.
+    """
+    sent: dict[str, Any] = {name: float(parameters[name]) for name in _EARPIECE_BUILDER_DIALS}
+    reach, opening = float(parameters[COLLECTOR_REACH]), float(parameters[COLLECTOR_MOUTH])
+    if reach > 0 and opening > 0:
+        radius = math.sqrt(opening / math.pi)
+        sent["collector"] = {
+            "spine": [[reach, 0.0, 0.0]],
+            "sections": [[radius] * _COLLECTOR_SECTION_POINTS],
+        }
+    return sent
+
+
+def _earpiece_family(described: Mapping[str, Any]) -> dict[str, Any]:
+    earpiece = described["earpiece"]
+    bounds = earpiece_bounds(described)
+    limits = earpiece_ear_limits(described)
+    collector = earpiece["collector"]
+    radius_low, radius_high = collector["section_radius_mm"]
+    stem_limit = limits.throat_with_stem_mm2
+    if stem_limit is None:
+        stem_throat = "no stem fits and canal_stem_mm must be 0."
+    elif stem_limit < limits.throat_mm2:
+        stem_throat = (
+            f"the throat can be at most {stem_limit:g} with a stem, and a wider throat needs canal_stem_mm 0."
+        )
+    else:
+        stem_throat = f"the throat can be at most {stem_limit:g}."
+    words = {
+        "stem_throat": stem_throat,
+        "builder_mouth_max": bounds["mouth_mm2"]["maximum"],
+        "max_reach": collector["max_reach_mm"],
+        "radius_low": radius_low,
+        "radius_high": radius_high,
+        "area_low": math.pi * radius_low**2,
+    }
+    # The ear's own limits where it has them, and the builder's bounds for everything else.
+    declared_maximum = {
+        **{name: field["maximum"] for name, field in bounds.items()},
+        "mouth_mm2": min(bounds["mouth_mm2"]["maximum"], limits.mouth_mm2),
+        "throat_mm2": min(bounds["throat_mm2"]["maximum"], limits.throat_mm2),
+        "canal_stem_mm": min(bounds["canal_stem_mm"]["maximum"], limits.canal_stem_mm),
+    }
+    parameters = []
+    for name, field in bounds.items():
+        unit, note = _EARPIECE_PARAMETER_NOTES[name]
+        default = f" Builder default {field['default']:g}." if name in _EARPIECE_BUILDER_DIALS else ""
+        if field["default"] > declared_maximum[name]:
+            default += " That default is more than this ear holds."
+        parameters.append(
+            {
+                "name": name,
+                "kind": "float",
+                "unit": unit,
+                "minimum": field["minimum"],
+                "maximum": declared_maximum[name],
+                "description": note.format(**words) + default,
+            }
+        )
+    fixed = ", ".join(f"{name} {value:g}" for name, value in earpiece_fixed_dials(described).items())
+    whole_canal = earpiece["whole_canal_is_sample_plus_mm"]
+    return {
+        "family_id": EARPIECE_FAMILY_ID,
+        "description": (
+            "In-concha earpiece built by hornsim.earpiece: a seat cast from the concha of the configured "
+            "ear with the horn carved inside it, flaring from the throat at the seat floor to a mouth on "
+            "the faceplate, an optional soft stem into the canal, and an optional collector that carries "
+            "the horn outward past the faceplate. It has no vent. "
+            "What a study can ask for: the throat area, the faceplate mouth area, the stem length, and a "
+            "collector. mouth_mm2 is always the mouth on the faceplate, which this ear's concha opening "
+            f"limits to {declared_maximum['mouth_mm2']:g} mm^2. A larger opening is asked for with "
+            "collector_reach_mm and collector_mouth_mm2, which are written into the builder's collector as "
+            "one straight section: a spine point collector_reach_mm out from the mouth centre along the "
+            "faceplate normal, with a round cross-section of area collector_mouth_mm2, and the builder "
+            "blends the mouth outline into that circle. Both 0 means no collector. One without the other "
+            "is refused. "
+            "What a study cannot ask for: a bent or scooped collector, one that faces the talker, a "
+            "cross-section that is not round, more than one section, a hood, a vent, or any other dial "
+            f"of the builder. Those stay at the builder's defaults ({fixed}). "
+            "Every design is built once and checked by the builder. A design it rejects comes back as a "
+            "failed case with the builder's reasons and no score, which makes it ineligible: a mouth "
+            "larger than the faceplate allows, a throat too wide for the canal stem, a flare that breaks "
+            "through the seat wall, or a collector that touches the ear or the head or reaches too far. "
+            "Bounds say what the builder and this ear accept one dial at a time, so a design can be in "
+            "bounds and still be rejected. "
+            "Acoustics: the profile door of hornsim.acoustics with unified settings. The model is given "
+            "the area along the bore as it was built, from the collector's rim (or the faceplate mouth) to "
+            "the seat floor, then the stem as a tube at the throat area, with this ear's ear_params, so the "
+            "open-ear reference is this ear's own concha, and the same sampled canals as the other family. "
+            f"One setting is not the default: the whole canal is each canal sample plus {whole_canal:g} mm, "
+            "the canal the spiral family's open ear already has, so both families are compared with the "
+            "same open canal and a shorter stem leaves more of it behind the piece. If the builder reports "
+            "no area profile, the dial door is used with the same settings, and a collector cannot be scored. "
+            "What the model does not see: the direction a collector faces and any directional gain, the "
+            "shape of a cross-section (only its area), bends, the head and pinna around a protruding "
+            "collector, the open neck between the seat floor and the canal opening (the builder reports "
+            "its height as seat_floor_mm, and with a stem the bore runs through it), the removal tab, and "
+            "any leak around the seat, which is treated as sealed. "
+            "The spiral family's insertion gain is relative to an average concha resonance, not this "
+            "ear's concha, so read insertion gain across the two families with that in mind. "
+            "Building one design takes a few seconds."
+        ),
+        "parameters": parameters,
+    }
+
+
 def build_capabilities(described: Mapping[str, Any]) -> dict[str, Any]:
     """Turn what the installed hornsim reports about itself into the capability contract."""
     fields = parameter_bounds(described)
@@ -482,6 +782,38 @@ def build_capabilities(described: Mapping[str, Any]) -> dict[str, Any]:
     required = [float(f) for f in described["haspi_frequencies_hz"]]
     canal = described["canal"]
     scenarios = _scenarios(described)
+    earpiece = earpiece_available(described)
+    planning_notes: list[str] = list(_PLANNING_NOTES)
+    unsupported: list[tuple[str, str]] = list(_UNSUPPORTED)
+    earpiece_assets: list[str] = []
+    earpiece_record: dict[str, Any] = dict(described.get("earpiece") or {"available": False})
+    if earpiece:
+        limits = earpiece_ear_limits(described)
+        stem_limit = limits.throat_with_stem_mm2
+        planning_notes += list(_EARPIECE_PLANNING_NOTES)
+        planning_notes.append(
+            f"On the configured ear the earpiece's faceplate mouth can be at most {limits.mouth_mm2:g} "
+            "mm^2, and "
+            + (
+                "no canal stem fits."
+                if stem_limit is None
+                else f"a throat above {stem_limit:g} mm^2 needs canal_stem_mm 0."
+            )
+            + " A design the ear cannot hold comes back as a failed case, so keep at least one candidate "
+            "well inside these limits."
+        )
+        earpiece_assets = [
+            "earpiece_glb",
+            "earpiece_in_ear_glb",
+            "earpiece_print_stl",
+            "earpiece_preview_png",
+        ]
+        earpiece_record["ear_limits"] = asdict(limits)
+        earpiece_record["fixed_dials"] = earpiece_fixed_dials(described)
+    else:
+        unsupported.append(_COMPACT_SIZE_UNSUPPORTED)
+        if described.get("earpiece") and not earpiece_record.get("reason"):
+            earpiece_record["reason"] = "Neither probe build of hornsim.target.earpiece_boxes fits this ear."
     return {
         "evaluator_name": EVALUATOR_NAME,
         "evaluator_version": described["version"],
@@ -504,7 +836,8 @@ def build_capabilities(described: Mapping[str, Any]) -> dict[str, Any]:
                     "point. Building one design takes about ten seconds."
                 ),
                 "parameters": parameters,
-            }
+            },
+            *([_earpiece_family(described)] if earpiece else []),
         ],
         "baselines": [
             {
@@ -538,7 +871,7 @@ def build_capabilities(described: Mapping[str, Any]) -> dict[str, Any]:
             tag for tag in ("quiet", "babble") if any(tag in sc["tags"] for sc in scenarios)
         ],
         "minimum_scenarios": min(MINIMUM_SCENARIOS, len(scenarios)),
-        "planning_notes": list(_PLANNING_NOTES),
+        "planning_notes": planning_notes,
         "metrics": _metrics(described),
         "canal_configurations": [
             {
@@ -587,9 +920,10 @@ def build_capabilities(described: Mapping[str, Any]) -> dict[str, Any]:
             "insertion_gain_png",
             "references_json",
             "canals_json",
+            *earpiece_assets,
         ],
         "unsupported_requirements": [
-            {"requirement": requirement, "reason": reason} for requirement, reason in _UNSUPPORTED
+            {"requirement": requirement, "reason": reason} for requirement, reason in unsupported
         ],
         "references": [
             {
@@ -606,6 +940,7 @@ def build_capabilities(described: Mapping[str, Any]) -> dict[str, Any]:
         # Extra fields, kept with the capability snapshot.
         "haspi_seed": described["haspi_seed"],
         "fixed_design_values": fixed,
+        "earpiece": earpiece_record,
         "ear_mesh": described.get("ear_mesh"),
         "dependencies": described["dependencies"],
     }
@@ -622,12 +957,32 @@ def _number(value: Any) -> float | None:
     return float(value)
 
 
+def _reason_text(reason: Mapping[str, Any]) -> str:
+    """One of hornsim.earpiece's reasons as a sentence: the check, its message, and what it says to move."""
+    hints: list[str] = []
+    move = reason.get("move")
+    if isinstance(move, Mapping) and move.get("dial"):
+        hints.append(f"move {move['dial']} {move.get('direction') or ''}".strip())
+    for name in ("max_ok_mm2", "value_mm", "limit_mm"):
+        value = _number(reason.get(name))
+        if value is not None:
+            hints.append(f"{name} {value:g}")
+    if reason.get("alternatives"):
+        hints.append("or " + ", ".join(str(item) for item in reason["alternatives"]))
+    text = f"{reason.get('check', 'check')}: {reason.get('message', '')}".strip()
+    return f"{text} ({'; '.join(hints)})" if hints else text
+
+
+# Internal marker for a build-only check that found nothing wrong. Never returned to callers.
+_BUILDABLE = "buildable"
+
+
 class HornsimEvaluator:
     """`get_evaluator_capabilities` and `evaluate_experiment` over the hornsim bridge.
 
     Safe to call from several threads. A patient context is built once per
-    audiogram and an aid once per set of design numbers, however many
-    scenarios ask for them and however they interleave.
+    audiogram and a device once per family and set of design numbers, however
+    many scenarios ask for them and however they interleave.
     """
 
     def __init__(self, config: HornsimConfig, run_bridge: BridgeRunner | None = None) -> None:
@@ -643,7 +998,15 @@ class HornsimEvaluator:
     def _describe(self, *, refresh: bool) -> dict[str, Any]:
         with self._describe_lock:
             if refresh or self._described is None:
-                answer = self._run("describe", {"ear_mesh": str(self._config.ear_mesh)})
+                answer = self._run(
+                    "describe",
+                    {
+                        "ear_mesh": str(self._config.ear_mesh),
+                        # With these the bridge can also say what this ear's earpiece limits are.
+                        "work_dir": str(self._config.work_dir),
+                        "ear_height_mm": self._config.ear_height_mm,
+                    },
+                )
                 if not answer["ok"]:
                     raise EvaluatorNotConfigured(
                         f"hornsim could not describe itself: {answer['error']['message']}"
@@ -662,6 +1025,25 @@ class HornsimEvaluator:
     # -- evaluation --------------------------------------------------------
 
     def evaluate_experiment(self, spec: dict[str, Any]) -> dict[str, Any]:
+        return self._evaluate(spec, with_score=True)
+
+    def check_buildable(self, spec: dict[str, Any]) -> dict[str, str] | None:
+        """Say whether this candidate can be built in this ear, without scoring it.
+
+        Returns None when it can, or `{"code", "message"}` with the builder's reason when it
+        cannot. The build is the same one evaluation uses and is cached, so a design checked
+        here is not built again when its cases run.
+        """
+        outcome = self._evaluate(spec, with_score=False)
+        if outcome.get("status") == _BUILDABLE:
+            return None
+        error = outcome.get("error") or {}
+        return {
+            "code": str(error.get("code") or "not_buildable"),
+            "message": str(error.get("message") or "The evaluator could not build this design."),
+        }
+
+    def _evaluate(self, spec: dict[str, Any], *, with_score: bool) -> dict[str, Any]:
         started = time.perf_counter()
         described = self._describe(refresh=False)
         version = described["version"]
@@ -700,20 +1082,37 @@ class HornsimEvaluator:
             build: dict[str, Any] | None = None
             if spec["candidate_kind"] == "design":
                 parameters = {name: float(value) for name, value in spec["parameters"].items()}
+                is_earpiece = spec["family_id"] == EARPIECE_FAMILY_ID
+                step = "build-earpiece" if is_earpiece else "build"
+                payload = {
+                    "work_dir": str(self._config.work_dir),
+                    "context_dir": context["context_dir"],
+                    "parameters": earpiece_builder_parameters(parameters) if is_earpiece else parameters,
+                }
                 build = self._builds.get(
-                    (context["context_dir"], tuple(sorted(parameters.items()))),
-                    lambda: self._step(
-                        "build",
-                        {
-                            "work_dir": str(self._config.work_dir),
-                            "context_dir": context["context_dir"],
-                            "parameters": parameters,
-                        },
-                    ),
+                    (context["context_dir"], spec["family_id"], tuple(sorted(parameters.items()))),
+                    lambda: self._step(step, payload),
                 )
                 if not build["ok"]:
                     return finish(
                         "failed", used_version=context["version"], error=build["error"], context=context
+                    )
+                if is_earpiece and not build["fits"]:
+                    refused = any(reason.get("check") == "params" for reason in build["reasons"])
+                    reasons = "; ".join(_reason_text(reason) for reason in build["reasons"])
+                    return finish(
+                        "unsupported" if refused else "failed",
+                        used_version=build["version"],
+                        error={
+                            "code": "bad_parameter" if refused else "geometry_does_not_fit",
+                            "message": (
+                                f"hornsim.earpiece does not accept these values: {reasons}."
+                                if refused
+                                else f"This design cannot be built in this ear: {reasons}."
+                            )[:1500],
+                        },
+                        context=context,
+                        build=build,
                     )
                 if not build["fits"]:
                     return finish(
@@ -725,7 +1124,7 @@ class HornsimEvaluator:
                         },
                         context=context,
                     )
-                vent_wall = _number(build["design"].get("vent_wall_to_bore_mm"))
+                vent_wall = None if is_earpiece else _number(build["design"].get("vent_wall_to_bore_mm"))
                 if vent_wall is not None and vent_wall < 0:
                     # hornsim.aid now refuses a vent it cannot route clear of the bore. This guards a
                     # backend that still keeps an overlapping route: the acoustic model would score two
@@ -744,6 +1143,9 @@ class HornsimEvaluator:
                         context=context,
                         build=build,
                     )
+
+            if not with_score:
+                return {"status": _BUILDABLE}
 
             score = self._step(
                 "score",
@@ -773,7 +1175,8 @@ class HornsimEvaluator:
         if answer["ok"]:
             return answer
         message = f"hornsim {step} step failed: {answer['error']['message']}"[:800]
-        return {"ok": False, "error": {"code": f"{step}_failed", "message": message}}
+        # Both build steps report `build_failed`. The message names which one.
+        return {"ok": False, "error": {"code": f"{step.partition('-')[0]}_failed", "message": message}}
 
     def _unsupported_reason(
         self, spec: Mapping[str, Any], described: Mapping[str, Any], scenario: Mapping[str, Any] | None
@@ -805,13 +1208,19 @@ class HornsimEvaluator:
             if spec.get("baseline_id") != BASELINE_ID:
                 return no("unsupported_baseline", f"Unknown baseline '{spec.get('baseline_id')}'.")
             return None
-        if spec.get("family_id") != FAMILY_ID:
-            return no("unsupported_family", f"Unknown geometry family '{spec.get('family_id')}'.")
-        fields = parameter_bounds(described)
+        family_id = spec.get("family_id")
+        if family_id == FAMILY_ID:
+            fields = parameter_bounds(described)
+        elif family_id == EARPIECE_FAMILY_ID and earpiece_available(described):
+            # The builder's own bounds. A value inside them that this ear cannot hold goes to the
+            # builder and comes back as a failed case with its reasons.
+            fields = earpiece_bounds(described)
+        else:
+            return no("unsupported_family", f"Unknown geometry family '{family_id}'.")
         given = spec.get("parameters", {})
         unknown = sorted(set(given) - set(fields))
         if unknown:
-            return no("bad_parameter", f"Not parameters of '{FAMILY_ID}': {', '.join(unknown)}.")
+            return no("bad_parameter", f"Not parameters of '{family_id}': {', '.join(unknown)}.")
         for name, bounds in fields.items():
             value = _number(given.get(name))
             if value is None:
@@ -821,8 +1230,14 @@ class HornsimEvaluator:
             if "maximum" in bounds and value > bounds["maximum"]:
                 return no("out_of_bounds", f"{name}={value:g} is above the maximum {bounds['maximum']:g}.")
         if {"mouth_mm2", "throat_mm2"} <= set(fields) and given["mouth_mm2"] <= given["throat_mm2"]:
-            # The same rule the server applies before rebuilding an aid (backend/app/main.py).
+            # The same rule the server applies before rebuilding an aid (backend/app/main.py), and
+            # hornsim.earpiece before building an earpiece.
             return no("out_of_bounds", "mouth_mm2 must be larger than throat_mm2.")
+        if family_id == EARPIECE_FAMILY_ID and (given[COLLECTOR_REACH] > 0) != (given[COLLECTOR_MOUTH] > 0):
+            return no(
+                "bad_parameter",
+                f"{COLLECTOR_REACH} and {COLLECTOR_MOUTH} must both be 0 (no collector) or both be above 0.",
+            )
         return None
 
     @staticmethod
@@ -880,6 +1295,8 @@ class HornsimEvaluator:
             "ear_mesh_path": str(self._config.ear_mesh),
             "ear_height_mm": self._config.ear_height_mm,
         }
+        if spec.get("family_id") is not None:
+            config["family_id"] = spec["family_id"]
         assets: list[dict[str, str]] = []
         extra: dict[str, Any] = {}
         if context is not None:
@@ -892,6 +1309,13 @@ class HornsimEvaluator:
             assets = [{"kind": kind, "ref": ref} for kind, ref in build["assets"].items()] + assets
             extra["design"] = build["design"]
             extra["acoustics_summary"] = build["acoustics_summary"]
+            extra["build_seconds"] = build["build_seconds"]
+            if "acoustic_door" in build:
+                config["acoustic_door"] = build["acoustic_door"]
+        elif build is not None and "reasons" in build:
+            # The earpiece builder's own account of why it refused, as it gave it.
+            config["candidate_dir"] = build["candidate_dir"]
+            extra["build_reasons"] = build["reasons"]
             extra["build_seconds"] = build["build_seconds"]
         metrics: list[dict[str, Any]] = []
         if score is not None:
@@ -913,8 +1337,11 @@ class HornsimEvaluator:
             # With no device, insertion gain is 0 dB by definition and there is no bore.
             summary = build["acoustics_summary"] if build else {key: 0.0 for key, _, _ in _GAIN_BANDS}
             metrics += [{"name": name, "value": summary[key], "unit": "dB"} for key, name, _ in _GAIN_BANDS]
-            length = build["design"]["bore_length_mm"] if build else 0.0
+            # The earpiece's report nests its geometry, so the bridge names its bore length directly.
+            length = build.get("bore_length_mm", build["design"].get("bore_length_mm")) if build else 0.0
             metrics.append({"name": "bore_length_mm", "value": length, "unit": "mm"})
+            protrusion = build["protrusion_mm"] if build else 0.0
+            metrics.append({"name": "protrusion_mm", "value": protrusion, "unit": "mm"})
         mesh = described.get("ear_mesh", {})
         mesh_note = mesh.get("provenance", {}).get("source") or f"configured mesh {mesh.get('file_name')}"
         return {
@@ -967,3 +1394,7 @@ def get_evaluator_capabilities() -> dict[str, Any]:
 
 def evaluate_experiment(spec: dict[str, Any]) -> dict[str, Any]:
     return _evaluator().evaluate_experiment(spec)
+
+
+def check_buildable(spec: dict[str, Any]) -> dict[str, str] | None:
+    return _evaluator().check_buildable(spec)
