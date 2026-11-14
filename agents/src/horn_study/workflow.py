@@ -117,6 +117,8 @@ class StudyDependencies:
     listeners: tuple[EventListener, ...] = ()
     use_cache: bool = True
     callbacks: list[Any] = field(default_factory=list)
+    # The dashboard's lead stops here: it runs its own simulations and design (server.py), so no plan or evaluation.
+    research_only: bool = False
 
 
 @dataclass
@@ -165,6 +167,7 @@ def build_graph(
     store: ArtifactStore,
     machine: StudyStateMachine,
     progress: _Progress,
+    research_only: bool = False,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Wire the study. Each node receives only the capabilities its phase needs.
 
@@ -200,6 +203,8 @@ def build_graph(
         )
         progress.research = research
         store.write_json("research.json", research)
+        # The info board (submit_finding posts) — what the study lead reads at the end of the run.
+        store.write_json("board.json", list(ledger.board))
         if all(branch.status == "failed" for branch in branches):
             raise StudyFailed(
                 "research_failed",
@@ -211,6 +216,8 @@ def build_graph(
                 "no_evidence",
                 "Research produced no sourced findings, so no evidence-based plan can be made.",
             )
+        if research_only:
+            return {"research": research}
         machine.transition(StudyState.PLANNING)
         return {
             "research": research,
@@ -356,6 +363,9 @@ def build_graph(
     builder.add_node(NODE_EVALUATE, evaluate_batch)
     builder.add_node(NODE_INTERPRET, interpret_results)
     builder.add_edge(list(RESEARCH_NODES), NODE_SYNTHESIZE)
+    if research_only:
+        builder.add_edge(NODE_SYNTHESIZE, END)
+        return builder.compile(name="study")
     builder.add_edge(NODE_SYNTHESIZE, NODE_PLAN)
     builder.add_edge(NODE_PLAN, NODE_FREEZE)
     builder.add_conditional_edges(NODE_FREEZE, after_validation, [NODE_PLAN, NODE_EVALUATE])
@@ -528,6 +538,7 @@ async def run_study(raw_request: Mapping[str, Any], deps: StudyDependencies) -> 
         store=store,
         machine=machine,
         progress=progress,
+        research_only=deps.research_only,
     )
 
     failure: dict[str, Any] | None = None

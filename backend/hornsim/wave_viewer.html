@@ -56,6 +56,12 @@ input[type="range"] { flex: 1; accent-color: var(--accent); }
 svg text { font-family: var(--body); }
 button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 @media (max-width: 860px) { .app { grid-template-columns: 1fr; grid-template-rows: 62vh auto; height: auto; } .stage { border-right: 0; border-bottom: 1px solid var(--line); } #cbar { width: 200px; } .hud { right: 16px; top: 52px; } }
+/* Embed (?embed=1): the stage alone, for the dashboard's bento boxes. The rail's controls still exist hidden — the viewer's code reads them. AFTER the narrow-screen rule on purpose: a box is always narrow, and that rule's 62vh stage would leave most of it empty. */
+.embed .rail, .embed .views, .embed .cbar, .embed .hud span { display: none; }
+.embed .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); height: 100%; }
+.embed .stage { min-height: 0; border: 0; }
+.embed .hud { right: 10px; left: 10px; top: 6px; }
+.embed .hud b { font-size: 11px; font-weight: 500; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -401,7 +407,10 @@ function pulseTex(a, f, key) {     // one frame of a pulse atlas -> half-float t
 }
 
 // ---------- state ----------
-const state = { run: runs.find((r) => r.az === 90) || runs[0], sound: '4000', mode: 0, disp: '3d', playing: true, phase: 0, frame: 0, data: null };
+// ?run=<tag> picks the direction (the dashboard's one-direction boxes); without it, the side view.
+const Q = new URLSearchParams(location.search);
+if (Q.has('embed')) document.documentElement.classList.add('embed');
+const state = { run: runs.find((r) => r.tag === Q.get('run')) || runs.find((r) => r.az === 90) || runs[0], sound: '4000', mode: 0, disp: '3d', playing: true, phase: 0, frame: 0, data: null };
 const is3d = () => state.disp === '3d';
 const nFrames = () => is3d() ? state.data.vol.pulse.frames : state.data.pulse.n;
 // 3D click frames are spaced wider than slice frames; map by time so both show the same instant

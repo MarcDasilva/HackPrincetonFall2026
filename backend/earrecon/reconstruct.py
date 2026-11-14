@@ -210,12 +210,14 @@ def reconstruct(photo, out, box, left=False, height_mm=62.0, pad=0.15, mask_path
         cv2.imwrite(os.path.join(out, "mask.png"), mask.astype(np.uint8) * 255)
         if left:
             img, mask = img[:, ::-1].copy(), mask[:, ::-1].copy()
+        # The networks only see right ears, so a left ear is fitted MIRRORED — but every image a person sees (input, overlay, depth) is flipped back, or their own ear is shown backwards.
+        shown = (lambda a: np.ascontiguousarray(a[:, ::-1])) if left else (lambda a: a)
 
         crop, cmask = square_crop(img, mask, pad)
         crop = cv2.resize(crop, (IMG, IMG), interpolation=cv2.INTER_CUBIC).astype(np.float32) / 255.0
         cmask = cv2.resize(cmask, (IMG, IMG), interpolation=cv2.INTER_NEAREST).astype(np.float32)
         x = crop * cmask[..., None]
-        cv2.imwrite(os.path.join(out, "input.jpg"), cv2.cvtColor((x * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(out, "input.jpg"), cv2.cvtColor(shown((x * 255).astype(np.uint8)), cv2.COLOR_RGB2BGR))
         with torch.no_grad():
             t = torch.from_numpy(x).permute(2, 0, 1)[None].to(dev)
             depth, feats = fcrn(t)
@@ -238,8 +240,8 @@ def reconstruct(photo, out, box, left=False, height_mm=62.0, pad=0.15, mask_path
     ov = (crop * 255).astype(np.uint8).copy()
     for u, v in pxi[::4]:
         cv2.circle(ov, (int(u), int(v)), 1, (0, 255, 0), -1)
-    cv2.imwrite(os.path.join(out, "overlay.jpg"), cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
-    save_depth(depth, cmask, os.path.join(out, "depth.png"))
+    cv2.imwrite(os.path.join(out, "overlay.jpg"), cv2.cvtColor(shown(ov), cv2.COLOR_RGB2BGR))
+    save_depth(shown(depth), shown(cmask), os.path.join(out, "depth.png"))
 
     verts = verts * (height_mm / np.ptp(verts[:, 1]))
     if left:

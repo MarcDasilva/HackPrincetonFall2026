@@ -17,7 +17,7 @@ test("orb and chat start centered together, then split apart on send", async ({ 
   const vh = page.viewportSize()!.height;
   const orb = page.getByTestId("orb");
   const card = page.locator("form");
-  const capture = page.getByRole("button", { name: "Capture Ear" });
+  const capture = page.getByRole("button", { name: "Capture Ears & Face" });
 
   // Before sending: the card sits at screen center with the orb behind it.
   let c = await box(card), o = await box(orb);
@@ -27,11 +27,15 @@ test("orb and chat start centered together, then split apart on send", async ({ 
   expect(await angle(orb)).toBe(0);
   await page.screenshot({ path: "test-results/layout-before.png" });
 
-  // Sending now needs an ear photo AND a hearing test (see gate.spec.ts).
+  // Sending now needs BOTH ear photos AND a hearing test (see gate.spec.ts).
   await page.getByTestId("hearing-input").setInputFiles({ name: "audiogram.pdf", mimeType: "application/pdf", buffer: Buffer.from("%PDF-1.4\n%%EOF") });
   await capture.click();
   await page.getByRole("button", { name: "Take picture" }).click();
-  await expect(page.getByTestId("attachment")).toBeVisible();
+  await expect(page.getByTestId("attachment-left")).toBeVisible();
+  await page.getByRole("button", { name: "Take picture" }).click(); // the camera stays live for the right ear
+  await expect(page.getByTestId("attachment-right")).toBeVisible();
+  // The camera stays live for the optional face; skip it.
+  await page.getByRole("button", { name: "Close camera" }).click();
   await page.waitForTimeout(800); // panel retract
   // Trace the orb's screen centre every frame through the split.
   await orb.evaluate((o) => {

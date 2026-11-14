@@ -35,7 +35,8 @@ from . import earpiece as epc
 from . import scoring
 from . import target as tg
 
-N_TRY = 6            # builds attempted, best objective first, before giving up
+N_TRY = 10           # builds attempted, best objective first, before giving up
+N_OPTIONS = 4        # distinct buildable designs offered to the patient
 
 
 def _cached(path, make):
@@ -71,6 +72,25 @@ def objective(mean_db, worst_db, target, share):
     over = np.clip(mean_db - target, 0, None) ** 2 @ share
     under_w = np.clip(target - worst_db, 0, None) ** 2 @ share
     return under + 0.25 * over + 0.5 * under_w
+
+
+def _close(a, b, tol=0.15):
+    return all(abs(a[k] - b[k]) <= tol * max(abs(b[k]), 1e-9) for k in ("throat_mm2", "mouth_mm2"))
+
+
+def reason(o, best, T, key_idx):
+    """One plain line on why this option is on the list, from its numbers only."""
+    G, B = np.array(o["gain_mean_db"]), np.array(best["gain_mean_db"])
+    on_key = float(np.mean(G[key_idx])) if key_idx else float(np.mean(G))
+    head = (f"Closest fit to the gain your scenes need: meets {o['key_met']} key bands"
+            if o is best else f"Meets {o['key_met']} key bands")
+    line = f"{head}, {on_key:.1f} dB average gain where it matters most."
+    if o is not best:
+        d = G - B
+        i = int(np.argmax(np.abs(d)))
+        line += f" {abs(d[i]):.1f} dB {'more' if d[i] > 0 else 'less'} than option 1 at {tg.FREQS[i]:g} Hz."
+    L = o["geometry"].get("bore_length_mm")
+    return line + (f" Bore {L:.0f} mm." if isinstance(L, (int, float)) else "")
 
 
 def to_build_params(d):
@@ -113,39 +133,46 @@ def run(patient_dir, request, log=print):
 
     J = objective(r["mean_db"], r["worst_db"], T, share)
     order = np.argsort(J)
-    chosen, attempts = None, []
-    for rank, j in enumerate(order[:N_TRY]):
+    key = np.array(t["key_bands_hz"], float)
+    key_idx = [int(np.argmin(np.abs(tg.FREQS - f))) for f in key]
+    options, attempts = [], []
+    for j in order:
+        if len(options) == N_OPTIONS or len(attempts) == N_TRY:
+            break
         params = to_build_params(r["designs"][j])
-        did = f"grid{rank + 1}"
+        # Neighbours in the sweep are near copies; an option the patient can tell apart differs by 15%+ in throat or mouth.
+        if any(_close(params, o["params"]) for o in options):
+            continue
+        did = f"grid{len(attempts) + 1}"
         log(f"build {did}: throat {params['throat_mm2']:.0f} mm2, mouth {params['mouth_mm2']:.0f} mm2, J {J[j]:.2f}")
         rep = epc.build(os.path.join(patient_dir, "context"), os.path.join(patient_dir, "aid"), params, did,
                         log=lambda m: None)
         attempts.append({"design_id": did, "objective": round(float(J[j]), 3), "ok": rep["ok"],
                          "reasons": [x.get("message", x) for x in rep.get("reasons", [])]})
-        if rep["ok"]:
-            chosen = (j, did, params, rep)
-            break
-        log(f"  rejected: {attempts[-1]['reasons'][:1]}")
-    if chosen is None:
-        raise ValueError(f"none of the {N_TRY} best designs passed the geometry checks: {attempts}")
-
-    j, did, params, rep = chosen
-    G, Gw = r["mean_db"][j], r["worst_db"][j]
-    met = (T < tg.NEGLIGIBLE_DB) | (G >= T - 1.0)        # within 1 dB counts as met
-    key = np.array(t["key_bands_hz"], float)
-    key_idx = [int(np.argmin(np.abs(tg.FREQS - f))) for f in key]
+        if not rep["ok"]:
+            log(f"  rejected: {attempts[-1]['reasons'][:1]}")
+            continue
+        G, Gw = r["mean_db"][j], r["worst_db"][j]
+        met = (T < tg.NEGLIGIBLE_DB) | (G >= T - 1.0)        # within 1 dB counts as met
+        options.append({"id": did, "params": params, "objective": round(float(J[j]), 3),
+                        "gain_mean_db": G.round(2).tolist(), "gain_worst_db": Gw.round(2).tolist(),
+                        "key_met": f"{int(met[key_idx].sum())} of {len(key_idx)}", "met": met.tolist(),
+                        "geometry": {k: v for k, v in rep.get("geometry", {}).items() if isinstance(v, (int, float, str))},
+                        "files": {k: f"aid/{did}/{k}" for k in ("earpiece_in_ear.glb", "earpiece.glb", "earpiece_print.stl", "preview.png")
+                                  if os.path.exists(os.path.join(patient_dir, "aid", did, k))}})
+    if not options:
+        raise ValueError(f"none of the {len(attempts)} best designs passed the geometry checks: {attempts}")
+    for o in options:
+        o["reason"] = reason(o, options[0], T, key_idx)
+    did = options[0]["id"]
     result = {
         "version": 1, "elapsed_s": round(time.time() - t0, 1),
         "freqs_hz": tg.FREQS.tolist(), "target_db": T.round(2).tolist(),
         "share": share.round(4).tolist(), "key_bands_hz": t["key_bands_hz"], "guard_bands_hz": tg.FREQS[guard].tolist(),
         "triage": t["triage"], "why": t["why"],
         "reach_db": np.round(t["reach_db"], 2).tolist(),     # per band, the best ANY swept design reaches (upper bound)
-        "design": {"id": did, "params": params, "objective": round(float(J[j]), 3),
-                   "gain_mean_db": G.round(2).tolist(), "gain_worst_db": Gw.round(2).tolist(),
-                   "key_met": f"{int(met[key_idx].sum())} of {len(key_idx)}", "met": met.tolist(),
-                   "geometry": {k: v for k, v in rep.get("geometry", {}).items() if isinstance(v, (int, float, str))},
-                   "files": {k: f"aid/{did}/{k}" for k in ("earpiece_in_ear.glb", "earpiece.glb", "earpiece_print.stl", "preview.png")
-                             if os.path.exists(os.path.join(patient_dir, "aid", did, k))}},
+        # "design" stays the best option: /sim's Aggregate and the wave check read it.
+        "design": options[0], "options": options,
         "attempts": attempts, "swept": int(len(J)),
         "notes": ["Deficits come from the browser's coarse wave sim (2.5 mm, speakers at 45 mm) and the ANSI standard "
                   "speech spectrum; hornsim.runner on the full wavesim is the reference.",

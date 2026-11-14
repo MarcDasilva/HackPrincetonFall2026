@@ -1,7 +1,7 @@
 import { test, expect, type Page } from "@playwright/test";
 import { capsOn, mockBackend } from "./mockBackend";
 
-/** Send with the practice attachments and wait until the three views have fanned into their row (last reveal + 1.6 s hold + 0.9 s fan). */
+/** Send with the practice attachments and wait until the three views sit in their row (each lands straight in its slot; the last takes 0.6 s). */
 const toRow = async (page: Page) => {
   await mockBackend(page);
   await page.goto("/zz-preview");
@@ -11,17 +11,19 @@ const toRow = async (page: Page) => {
   });
   await capsOn(page);
   await expect(page.getByTestId("hearing-attachment")).toBeVisible();
-  await expect(page.getByTestId("attachment")).toBeVisible();
+  await expect(page.getByTestId("attachment-left")).toBeVisible();
   await page.keyboard.press("Enter");
-  await expect(page.getByTestId("ear-view-2")).toBeVisible({ timeout: 25_000 });
-  await page.waitForTimeout(2700);
+  await expect(page.getByTestId("ear-row-left").getByTestId("ear-view-2")).toBeVisible({ timeout: 25_000 });
+  await page.waitForTimeout(700);
 };
 
 // Catches a click on a view doing nothing, the modal not growing UP out of the row (or covering the dock), or closing leaving the card hidden.
 test("clicking a view expands it upward into a modal; Esc puts it back", async ({ page }) => {
   test.setTimeout(60_000);
   await toRow(page);
-  const card = page.getByTestId("ear-view-0");
+  // The LOWER (right ear) row: the upper one sits right under the dock, where a modal can only grow downward.
+  const card = page.getByTestId("ear-row-right").getByTestId("ear-view-0");
+  await expect(card).toBeVisible({ timeout: 15_000 }); // both ears' files exist at once in the mock, so this row fans out with the left one
   const c = (await card.boundingBox())!;
   await card.click();
   const modal = page.getByTestId("ear-view-modal");
@@ -45,17 +47,17 @@ test("clicking a view expands it upward into a modal; Esc puts it back", async (
   await expect(card).toHaveCSS("opacity", "1");
 });
 
-// Catches the row lingering forever, or vanishing before the 3 s idle window, or not shrinking toward the orb.
+// Catches the rows lingering forever, or vanishing before the SHARED 3 s idle window (every row formed, none open), or not shrinking toward the orb.
 test("with no click for 3 s the views shrink into the orb and disappear", async ({ page }) => {
   test.setTimeout(60_000);
   await toRow(page);
   await page.waitForTimeout(1500);
-  await expect(page.getByTestId("ear-views")).toBeVisible(); // still there inside the idle window
+  await expect(page.getByTestId("ear-row-left")).toBeVisible(); // still there inside the idle window
   // Frames through the 0.7 s shrink: each card's center must move toward the orb's center while it shrinks.
   const orb = (await page.getByTestId("orb").boundingBox())!;
   const oc = { x: orb.x + orb.width / 2, y: orb.y + orb.height / 2 };
   const dist = async () => {
-    const b = await page.getByTestId("ear-view-0").boundingBox().catch(() => null);
+    const b = await page.getByTestId("ear-row-left").getByTestId("ear-view-0").boundingBox().catch(() => null);
     return b && b.width > 4 ? { d: Math.hypot(b.x + b.width / 2 - oc.x, b.y + b.height / 2 - oc.y), w: b.width } : null;
   };
   const start = (await dist())!;
@@ -70,6 +72,6 @@ test("with no click for 3 s the views shrink into the orb and disappear", async 
   }
   expect(mid).not.toBeNull();
   expect(mid!.d).toBeLessThan(start.d);
-  await expect(page.getByTestId("ear-views")).toHaveCount(0, { timeout: 3000 });
+  await expect(page.getByTestId("ear-row-left")).toHaveCount(0, { timeout: 3000 });
   await page.screenshot({ path: "test-results/views-gone.png" });
 });

@@ -26,7 +26,8 @@ export class FrameStore {
   get(key: string) { return this.frames.get(key); }
 }
 
-export default function SimGrid() {
+/** `patient` is the dashboard's run ID; the standalone /sim route leaves it out and reads ?patient= instead. `maxGrid` caps the picker: every cell owns a WebGL context, and past Chrome's ~16 per page the OLDEST is dropped — on the dashboard that is a MetalFx ring, which then throws. */
+export default function SimGrid({ patient, maxGrid = 4 }: { patient?: string; maxGrid?: number } = {}) {
   const [pid, setPid] = useState<string | null>(null);
   const [grid, setGrid] = useState<GridWithPatient | null>(null);
   const [offline, setOffline] = useState<string | null>(null);   // backend unreachable: static average ear, no design
@@ -44,7 +45,7 @@ export default function SimGrid() {
 
   // ?patient=<12-hex id>; default: the average ear
   useEffect(() => {
-    const q = new URLSearchParams(window.location.search).get("patient");
+    const q = patient ?? new URLSearchParams(window.location.search).get("patient");
     setPid(q && /^[a-f0-9]{12}$/.test(q) ? q : AVERAGE_ID);
   }, []);
   useEffect(() => {
@@ -199,7 +200,7 @@ export default function SimGrid() {
           <h1>Scene grid</h1>
           <label>grid
             <select value={n} onChange={(e) => resize(+e.target.value)}>
-              {[1, 2, 3, 4].map((m) => <option key={m} value={m}>{m}×{m}</option>)}
+              {[1, 2, 3, 4].filter((m) => m <= maxGrid).map((m) => <option key={m} value={m}>{m}×{m}</option>)}
             </select>
           </label>
           <label>add preset

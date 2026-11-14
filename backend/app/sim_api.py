@@ -70,30 +70,39 @@ def _ensure_average():
                                                 "audiogram_is_example": True}})
 
 
-def _patient(pid):
+def _patient(pid, ear=None):
+    """(ear folder, {side, audiogram_db_hl, audiogram_is_example}). A two-ear patient serves ONE ear per call:
+    `ear`, or by default the worse one by mean threshold, the SAME rule agents/horn_study/server.py studies."""
     if pid == AVERAGE_ID:
         _ensure_average()
     if not ID_RE.match(pid) or jobs.read_job(pid) is None:
         raise HTTPException(404, "patient not found")
-    d = jobs.patient_dir(pid)
+    job = jobs.read_job(pid)
+    req = job.get("request", {})
+    if "ears" in job:
+        ags = {e: (req.get(e) or {}).get("audiogram_db_hl") or {} for e in jobs.ears(job)}
+        ear = ear or max(ags, key=lambda e: sum(ags[e].values()) / max(1, len(ags[e])))
+        if ear not in ags:
+            raise HTTPException(404, f"this patient has no {ear} ear")
+        d, ag = jobs.ear_dir(pid, ear, job), ags[ear]
+    else:
+        d, ear, ag = jobs.patient_dir(pid), req.get("side", "right"), req.get("audiogram_db_hl")
     if not os.path.exists(os.path.join(d, "context", "context.json")):
         raise HTTPException(409, "this patient has no context yet; wait for the pipeline to finish")
-    return d, jobs.read_job(pid)
+    example = bool(req.get("audiogram_is_example", True)) or not ag
+    return d, {"side": ear, "audiogram_db_hl": ag or EXAMPLE_AUDIOGRAM, "audiogram_is_example": example}
 
 
 @router.get("/patients/{pid}/grid")
-def get_grid(pid: str):
-    d, job = _patient(pid)
-    req = job.get("request", {})
+def get_grid(pid: str, ear: str | None = None):
+    d, info = _patient(pid, ear)
     out = os.path.join(d, "scene_design", "ear_grid.json")
     if not os.path.exists(out):
         from hornsim import sim_grid
         cfg = json.load(open(os.path.join(d, "context", "context.json")))["config"]
-        sim_grid.export(out, cfg["patient"]["ear_mesh"], left=req.get("side") == "left")
+        sim_grid.export(out, cfg["patient"]["ear_mesh"], left=info["side"] == "left")
     grid = json.load(open(out))
-    grid["patient"] = {"id": pid, "average_ear": pid == AVERAGE_ID, "side": req.get("side", "right"),
-                       "audiogram_db_hl": req.get("audiogram_db_hl", EXAMPLE_AUDIOGRAM),
-                       "audiogram_is_example": bool(req.get("audiogram_is_example", True))}
+    grid["patient"] = {"id": pid, "average_ear": pid == AVERAGE_ID, **info}
     if pid == AVERAGE_ID:
         grid["ear"] = "average ear (AudioEar mean)"
     return grid
@@ -143,8 +152,8 @@ def _run_design(d, request):
 
 
 @router.post("/patients/{pid}/design", status_code=202)
-def start_design(pid: str, body: DesignRequest):
-    d, _ = _patient(pid)
+def start_design(pid: str, body: DesignRequest, ear: str | None = None):
+    d, _ = _patient(pid, ear)
     os.makedirs(os.path.join(d, "scene_design"), exist_ok=True)
     p = _status_path(d)
     if os.path.exists(p) and json.load(open(p)).get("status") in ("queued", "running"):
@@ -155,8 +164,8 @@ def start_design(pid: str, body: DesignRequest):
 
 
 @router.get("/patients/{pid}/design")
-def design_status(pid: str):
-    d, _ = _patient(pid)
+def design_status(pid: str, ear: str | None = None):
+    d, _ = _patient(pid, ear)
     p = _status_path(d)
     if not os.path.exists(p):
         return {"status": "none"}
@@ -164,8 +173,8 @@ def design_status(pid: str):
 
 
 @router.get("/patients/{pid}/design/files/{did}/{name}")
-def design_file(pid: str, did: str, name: str):
-    d, _ = _patient(pid)
+def design_file(pid: str, did: str, name: str, ear: str | None = None):
+    d, _ = _patient(pid, ear)
     if not DESIGN_RE.match(did) or name not in DESIGN_FILES:
         raise HTTPException(404, "unknown file")
     p = os.path.join(d, "aid", did, name)
@@ -212,8 +221,8 @@ class WaveCheck(BaseModel):
 
 
 @router.post("/patients/{pid}/design/wave_check", status_code=202)
-def start_wave_check(pid: str, body: WaveCheck):
-    d, _ = _patient(pid)
+def start_wave_check(pid: str, body: WaveCheck, ear: str | None = None):
+    d, _ = _patient(pid, ear)
     st = json.load(open(_status_path(d))) if os.path.exists(_status_path(d)) else {}
     did = ((st.get("result") or {}).get("design") or {}).get("id")
     if st.get("status") != "done" or not did:
@@ -228,6 +237,6 @@ def start_wave_check(pid: str, body: WaveCheck):
 
 
 @router.get("/patients/{pid}/design/wave_check")
-def wave_check_status(pid: str):
-    d, _ = _patient(pid)
+def wave_check_status(pid: str, ear: str | None = None):
+    d, _ = _patient(pid, ear)
     return json.load(open(_wave_path(d))) if os.path.exists(_wave_path(d)) else {"status": "none"}

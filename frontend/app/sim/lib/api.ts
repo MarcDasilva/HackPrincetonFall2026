@@ -15,6 +15,8 @@ export type DesignResult = {
     gain_mean_db: number[]; gain_worst_db: number[]; key_met: string; met?: boolean[];
     geometry: Record<string, number | string | boolean>; files: Record<string, string>;
   };
+  /** The four distinct buildable designs, best first; `design` is options[0]. ABSENT from designs made before options existed. */
+  options?: (DesignResult["design"] & { reason: string })[];
   attempts: { design_id: string; objective: number; ok: boolean; reasons: string[] }[];
   swept: number; elapsed_s: number; notes: string[];
 };
@@ -30,12 +32,14 @@ async function json<T>(r: Response): Promise<T> {
   return r.json();
 }
 
-export const fetchGrid = (pid: string) => fetch(`/api/sim/patients/${pid}/grid`).then((r) => json<GridWithPatient>(r));
-export const startDesign = (pid: string, audiogram_db_hl: Record<string, number>, scenes: DesignScene[]) =>
-  fetch(`/api/sim/patients/${pid}/design`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ audiogram_db_hl, scenes }) })
+/** `?ear=` for a two-ear patient (the dashboard's runs); without it the backend serves the worse ear. */
+const q = (ear?: string) => (ear ? `?ear=${ear}` : "");
+export const fetchGrid = (pid: string, ear?: string) => fetch(`/api/sim/patients/${pid}/grid${q(ear)}`).then((r) => json<GridWithPatient>(r));
+export const startDesign = (pid: string, audiogram_db_hl: Record<string, number>, scenes: DesignScene[], ear?: string) =>
+  fetch(`/api/sim/patients/${pid}/design${q(ear)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ audiogram_db_hl, scenes }) })
     .then((r) => json<{ status_url: string }>(r));
-export const designStatus = (pid: string) => fetch(`/api/sim/patients/${pid}/design`).then((r) => json<DesignStatus>(r));
-export const designFile = (pid: string, did: string, name: string) => `/api/sim/patients/${pid}/design/files/${did}/${name}`;
+export const designStatus = (pid: string, ear?: string) => fetch(`/api/sim/patients/${pid}/design${q(ear)}`).then((r) => json<DesignStatus>(r));
+export const designFile = (pid: string, did: string, name: string, ear?: string) => `/api/sim/patients/${pid}/design/files/${did}/${name}${q(ear)}`;
 
 export type WaveCheck = {
   design_id: string; freqs_hz: number[]; dx_mm: number; dist_mm: number; canal_len_mm: number;

@@ -22,11 +22,12 @@ MODEL = os.environ.get("EAR_DETECT_MODEL", "claude-sonnet-5-5")
 URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com") + "/v1/messages"
 MAX_SIDE = 1024  # the model sees (and answers in the pixels of) this downscale; boxes are scaled back
 
+# The side rule is anatomical, NOT "which way the face points": close-ups show no face, and that rule called two left-ear photos "right" — unmirrored, the fit lands 75% inside the mask vs 95% (reconstruct.py mirrors left ears).
 PROMPT = """This is a photo of a person's ear. Reply with ONLY a JSON object, no other text:
 {"ear_visible": true or false, "side": "left" or "right", "box": [x0, y0, x1, y1]}
 
 - box: pixel coordinates in THIS image (origin top-left), tight around the WHOLE outer ear: the top of the rim (helix) to the bottom of the lobe, and from the outer rim to where the ear meets the head. Do not include hair or neck beyond the ear.
-- side: the PERSON'S OWN ear. If the face is turned toward the image's LEFT edge you are looking at their LEFT ear; toward the RIGHT edge, their RIGHT ear.
+- side: the PERSON'S OWN ear. Judge it from the ear itself, since a close-up may show no face: the ear canal opening and the small flap in front of it (tragus) are on the FACE side, and the curled outer rim (helix) faces the back of the head. Canal and tragus toward the image's LEFT edge (rim curling on the right) means their LEFT ear; toward the RIGHT edge (rim curling on the left), their RIGHT ear.
 - If no ear is clearly visible, set ear_visible to false and use [0, 0, 0, 0]."""
 
 

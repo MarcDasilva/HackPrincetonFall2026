@@ -1,0 +1,1 @@
+selfie.jpg: MediaPipe's test portrait (`mediapipe/tasks/testdata/vision/portrait.jpg`, served from the mediapipe-assets bucket listed in the repo's `third_party/external_files.bzl`, Apache-2.0 repo); the photo itself is the 2012 official White House portrait, a US federal government work in the public domain.

@@ -49,6 +49,13 @@ from horn_study.sources import (
 )
 
 MAX_FINDINGS_PER_INVESTIGATOR = 8
+# Info-board posts per investigator (submit_finding). They cost no search/read budget, so this cap
+# is what keeps a looping model from posting forever; run_investigator's model-call limit counts it.
+MAX_BOARD_POSTS_PER_INVESTIGATOR = 40
+# A search or read is refused (no budget spent) once this many have gone by without a submit_finding
+# post, so posting happens more often than not. None turns the gate off.
+POST_EVERY = 2
+_POST_NUDGE = "If anything above matters for this user's device, post it now with submit_finding."
 MIN_ABSTRACT_CHARS = 200
 # Each investigator may record this many findings from sources that are not scholarly literature
 # (software documentation, repositories, general web pages). The rest must come from the literature.
@@ -151,7 +158,14 @@ literature. Claims about acoustics, hearing, or listening conditions need a pape
 from text you read. The full text of every source you read is saved under /sources/, where \
 grep and read_file can locate exact wording. Put the claim in your own words, and say how \
 far it applies to this device and this evaluator and what limits it.
-- You have {budget} search and read calls in total. When they run out, finish with what you have.
+- You have {budget} search and read calls. Use ALL of them before your final report: search \
+widely, read many sources, and follow up on what you read. Stopping early wastes the study's \
+research.
+- submit_finding posts to the info board the study lead reads at the end of the run. Post \
+whenever you learn something important, and do it often: most of your turns should include a \
+submit_finding call next to your search or read. A post is a short headline and a sentence or \
+two of detail, with the source when there is one. Posts cost none of your search and read \
+budget, and they are not a substitute for record_finding, which needs a verbatim passage.
 - Suggest only scenarios, metrics, geometry families, and parameter values that appear in the \
 evaluator capabilities. Ideas the evaluator cannot run belong under future_work.
 - Report conflicting or missing evidence as it is. An honest gap is more useful than a \
@@ -232,6 +246,7 @@ class ResearchLedger:
         self._text: dict[str, str] = {}
         self._by_url: dict[str, str] = {}
         self._findings: list[ResearchFinding] = []
+        self._board: list[dict[str, Any]] = []
 
     @property
     def sources(self) -> tuple[SourceRecord, ...]:
@@ -277,6 +292,14 @@ class ResearchLedger:
     def add_finding(self, finding: ResearchFinding) -> None:
         self._findings.append(finding)
 
+    @property
+    def board(self) -> tuple[dict[str, Any], ...]:
+        """The info board: every investigator's submit_finding posts, in posting order (board.json)."""
+        return tuple(self._board)
+
+    def post(self, entry: dict[str, Any]) -> None:
+        self._board.append(entry)
+
     def findings_by(self, investigator: InvestigatorName) -> tuple[ResearchFinding, ...]:
         return tuple(f for f in self._findings if f.investigator == investigator)
 
@@ -293,11 +316,15 @@ class ResearchSession:
         reader: Reader,
         ledger: ResearchLedger,
         events: EventBus,
+        post_every: int | None = POST_EVERY,
     ) -> None:
         self.spec = spec
+        self.post_every = post_every
+        self.unposted = 0
         self.max_tool_calls = max_tool_calls
         self.calls_used = 0
         self.rejected_findings = 0
+        self.board_posts = 0
         self._search = search
         self._reader = reader
         self._ledger = ledger
@@ -313,7 +340,13 @@ class ResearchSession:
                 "read calls). Record any remaining findings from sources you have already "
                 "read, then give your final report."
             )
+        if self.post_every is not None and self.unposted >= self.post_every:
+            return (
+                f"Not run, and no call spent: {self.unposted} searches and reads have gone by without an "
+                "info-board post. Post what you have learned with submit_finding, then continue."
+            )
         self.calls_used += 1
+        self.unposted += 1
         return None
 
     def _remaining(self) -> str:
@@ -326,6 +359,28 @@ class ResearchSession:
         if exhausted:
             return exhausted
         hits, notes = await self._search.search(query, limit=6)
+        # The full query and hits go in data: the UI opens them when the trace row is clicked.
+        self._events.emit(
+            "research.searched",
+            f"{query[:120]} ({len(hits)} results)",
+            component=self.spec.name,
+            data={
+                "query": query,
+                "results": [
+                    {
+                        "title": hit.title,
+                        "year": hit.year,
+                        "authors": hit.authors,
+                        "venue": hit.venue,
+                        "url": hit.url,
+                        "open_access": hit.open_access,
+                        "snippet": hit.snippet,
+                    }
+                    for hit in hits
+                ],
+                "notes": list(notes),
+            },
+        )
         for hit in hits:
             self._abstracts[hit.url.rstrip("/")] = hit
         lines = [f"Results for: {query}"]
@@ -341,6 +396,7 @@ class ResearchSession:
             )
         lines.extend(f"Note: {note}" for note in notes)
         lines.append("Snippets are leads only. Read a source before recording a finding from it.")
+        lines.append(_POST_NUDGE)
         lines.append(self._remaining())
         return "\n".join(lines)
 
@@ -403,8 +459,32 @@ class ResearchSession:
             f"url: {record.url}\n"
             f"type: {record.content_type}, {record.char_count} characters. {note}\n"
             f"Passages most related to '{focus}':\n\n{select_passages(text, focus)}\n\n"
-            f"{self._remaining()}"
+            f"{_POST_NUDGE}\n{self._remaining()}"
         )
+
+    def submit_finding(self, headline: str, detail: str, source: str = "") -> str:
+        """Posts to the shared info board. Spends NO search/read budget — posting often is the point."""
+        if self.board_posts >= MAX_BOARD_POSTS_PER_INVESTIGATOR:
+            return f"Info board limit reached ({MAX_BOARD_POSTS_PER_INVESTIGATOR} posts). Keep researching."
+        headline, detail = headline.strip(), detail.strip()
+        if not headline:
+            return "Not posted: the headline is empty."
+        self.board_posts += 1
+        self.unposted = 0
+        # A source the investigator read is named by its record; anything else is kept as given.
+        known = self._ledger.lookup(source) if source.strip() else None
+        entry = {
+            "post_id": f"{self.spec.finding_prefix}-B{self.board_posts}",
+            "investigator": self.spec.name,
+            "posted_at": datetime.now(UTC).isoformat(),
+            "headline": headline[:200],
+            "detail": detail[:1200],
+            "source_id": known[0].source_id if known else None,
+            "source": (known[0].url if known else source.strip()) or None,
+        }
+        self._ledger.post(entry)
+        self._events.emit("research.board_posted", entry["headline"], component=self.spec.name, data=entry)
+        return f"Posted {entry['post_id']} to the info board."
 
     def record_finding(
         self,
@@ -554,7 +634,21 @@ class ResearchSession:
             except Exception as error:
                 return f"Not recorded: {type(error).__name__}: {error}"
 
-        return [search_literature, read_source, record_finding]
+        @tool
+        def submit_finding(headline: str, detail: str, source: str = "") -> str:
+            """Post something important to the info board the study lead reads at the end of the run.
+
+            Call this often: whenever a search or a source turns up anything that matters for this
+            user's device. It costs none of your search/read budget.
+
+            Args:
+                headline: One line: what you found.
+                detail: One or two sentences: why it matters for this user's device.
+                source: URL or source ID (for example S2) it came from, if any.
+            """
+            return session.submit_finding(headline, detail, source)
+
+        return [search_literature, read_source, record_finding, submit_finding]
 
 
 def render_package(package: StartingPackage) -> str:
@@ -588,7 +682,7 @@ async def run_investigator(
     )
     tools = session.tools()
     allowed = frozenset({t.name for t in tools} | set(_FILE_TOOLS) | {InvestigatorOutput.__name__})
-    model_calls = 3 * budget + MAX_FINDINGS_PER_INVESTIGATOR + 10
+    model_calls = 3 * budget + MAX_FINDINGS_PER_INVESTIGATOR + MAX_BOARD_POSTS_PER_INVESTIGATOR + 10
     covers = [other.covers for other in INVESTIGATORS if other.name != spec.name]
     others = "; ".join(covers[:-1]) + "; and " + covers[-1] if len(covers) > 1 else covers[0]
 

@@ -2,15 +2,19 @@
 
     uvicorn app.main:app --host 0.0.0.0 --port 8000      (run from backend/)
 
-POST /api/patients            photo + box + side + ear height + audiogram -> starts the pipeline
-GET  /api/patients/{id}       status, step, log and results
-POST /api/patients/{id}/aid   rebuild the aid with new design numbers
-GET  /api/patients/{id}/files/{name}   generated files (meshes, images, STL, JSON)
+POST /api/patients            left + right photos, boxes, ear height, audiogram, optional selfie -> starts the pipeline
+GET  /api/patients/{id}       status, step, log, results and files, per ear (+ files.head)
+POST /api/patients/{id}/aid   rebuild every ear's aid with new design numbers
+POST /api/patients/{id}/head  rebuild the head (optional new selfie)
+GET  /api/patients/{id}/files/head/{name}    head files; also at /head/{name} beside /head/viewer.html
+GET  /api/patients/{id}/files/{ear}/{name}   generated files (meshes, images, STL, JSON)
+GET  /api/patients/{id}/waves/{ear}/{name}   wave viewer and its data
 GET  /api/health
 The static frontend (../frontend) is served at / when present.
 """
 import io
 import json
+import logging
 import os
 import re
 import time
@@ -32,7 +36,14 @@ from .settings import settings
 app = FastAPI(title="Horn aid API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_methods=["*"], allow_headers=["*"])
 app.include_router(sim_api.router)
+jobs.recover()
 
+
+@app.on_event("startup")
+def _warm():
+    jobs.warm()
+
+log = logging.getLogger(__name__)
 ID_RE = re.compile(r"^[a-f0-9]{12}$")
 FILES = {
     "ear.glb": "ear/ear.glb", "ear_skin.glb": "ear/ear_skin.glb", "ear.obj": "ear/ear.obj", "mask.png": "ear/mask.png", "depth.png": "ear/depth.png",
@@ -59,32 +70,7 @@ def health():
             "audioear_present": os.path.exists(os.path.join(AUDIOEAR_DIR, "FCRN.py"))}
 
 
-@app.post("/api/patients", status_code=202)
-async def create_patient(
-    photo: UploadFile = File(..., description="side-on photo of the ear (JPEG, PNG or HEIC)"),
-    box: str = Form("", description="x0,y0,x1,y1 around the ear, in the photo's pixels (after EXIF rotation); blank = detected by Claude"),
-    side: str = Form("", description="left or right (the person's own ear); blank = detected by Claude"),
-    ear_height_mm: float = Form(62.0),
-    audiogram: str = Form("", description='JSON {"250": 15, ...} dB HL, or {"left": {...}, "right": {...}} so the detected ear picks its own; blank = example audiogram'),
-):
-    if side not in ("", "right", "left"):
-        raise HTTPException(422, "side must be right or left")
-    if not 40 <= ear_height_mm <= 90:
-        raise HTTPException(422, "ear height should be 40-90 mm")
-    b = None
-    if box.strip():
-        try:
-            b = [int(float(v)) for v in box.split(",")]
-            assert len(b) == 4
-        except Exception:
-            raise HTTPException(422, "box must be x0,y0,x1,y1")
-    try:
-        ag_raw = json.loads(audiogram) if audiogram.strip() else DEFAULT_AUDIOGRAM
-        assert isinstance(ag_raw, dict)
-    except Exception:
-        raise HTTPException(422, "audiogram must be JSON like {\"250\": 15, \"500\": 20, ...} in dB HL")
-
-    raw = await photo.read()
+def _read_photo(raw):
     if len(raw) > settings.max_upload_mb * 1e6:
         raise HTTPException(413, f"photo is larger than {settings.max_upload_mb:.0f} MB")
     try:
@@ -93,33 +79,74 @@ async def create_patient(
             pillow_heif.register_heif_opener()
         except ImportError:
             pass
-        img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+        return ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
     except Exception:
         raise HTTPException(422, "could not read the photo; use JPEG, PNG or HEIC")
 
-    # A blank box or side is the ONLY case that sends the photo to Claude (earrecon/detect.py).
-    if b is None or not side:
-        try:
-            found = await run_in_threadpool(detect_ear, img)
-        except DetectError as e:
-            raise HTTPException(e.status, str(e))
-        b, side = b or found["box"], side or found["side"]
-    # Per-ear audiogram: the detected side is only known now, so the client may send both ears.
-    if "left" in ag_raw or "right" in ag_raw:
-        ag_raw = ag_raw.get(side) or {}
+
+def _parse_box(box):
+    if not box.strip():
+        return None
+    try:
+        b = [int(float(v)) for v in box.split(",")]
+        assert len(b) == 4
+        return b
+    except Exception:
+        raise HTTPException(422, "box must be x0,y0,x1,y1")
+
+
+def _parse_audiogram(ag_raw):
     try:
         ag = {int(k): float(v) for k, v in ag_raw.items()}
         assert len(ag) >= 3 and all(-10 <= v <= 120 for v in ag.values())
+        return ag
     except Exception:
         raise HTTPException(422, "audiogram must be JSON like {\"250\": 15, \"500\": 20, ...} in dB HL")
 
+
+@app.post("/api/patients", status_code=202)
+async def create_patient(
+    photo_left: UploadFile = File(..., description="side-on photo of the person's LEFT ear (JPEG, PNG or HEIC)"),
+    photo_right: UploadFile = File(..., description="side-on photo of the person's RIGHT ear"),
+    box_left: str = Form("", description="x0,y0,x1,y1 around the ear in photo_left's pixels (after EXIF rotation); blank = detected by Claude"),
+    box_right: str = Form("", description="same, for photo_right"),
+    ear_height_mm: float = Form(62.0),
+    audiogram: str = Form("", description='JSON {"left": {"250": 15, ...}, "right": {...}} dB HL, or one {"250": 15, ...} for both ears; blank = example audiogram'),
+    photo_selfie: UploadFile | None = File(None, description="optional frontal selfie for the head model; absent = average adult head"),
+):
+    if not 40 <= ear_height_mm <= 90:
+        raise HTTPException(422, "ear height should be 40-90 mm")
+    boxes = {"left": _parse_box(box_left), "right": _parse_box(box_right)}
+    try:
+        ag_raw = json.loads(audiogram) if audiogram.strip() else DEFAULT_AUDIOGRAM
+        assert isinstance(ag_raw, dict)
+    except Exception:
+        raise HTTPException(422, "audiogram must be JSON like {\"250\": 15, \"500\": 20, ...} in dB HL")
+    per_ear = "left" in ag_raw or "right" in ag_raw
+    ags = {e: _parse_audiogram((ag_raw.get(e) or {}) if per_ear else ag_raw) for e in jobs.EARS}
+
+    imgs = {"left": _read_photo(await photo_left.read()), "right": _read_photo(await photo_right.read())}
+    selfie = await _read_selfie(photo_selfie)
+    for ear, img in imgs.items():
+        # The side comes from the upload field, NEVER from Claude: a blank box is the ONLY reason a photo goes to earrecon/detect.py.
+        if boxes[ear] is None:
+            try:
+                found = await run_in_threadpool(detect_ear, img)
+            except DetectError as e:
+                raise HTTPException(e.status, f"{ear} ear: {e}")
+            if found.get("side") != ear:
+                log.warning("photo_%s: detect_ear called it a %s ear; keeping %s", ear, found.get("side"), ear)
+            boxes[ear] = found["box"]
+
     pid = uuid.uuid4().hex[:12]
     d = jobs.patient_dir(pid)
-    os.makedirs(d)
-    img.save(os.path.join(d, "photo.jpg"), quality=95)
-    request = {"box": b, "side": side, "ear_height_mm": ear_height_mm, "audiogram_db_hl": ag,
-               "audiogram_is_example": not audiogram.strip()}
-    jobs.write_job(pid, {"id": pid, "status": "queued", "step": None, "created_at": time.time(),
+    for ear, img in imgs.items():
+        os.makedirs(os.path.join(d, ear))
+        img.save(os.path.join(d, ear, "photo.jpg"), quality=95)
+    _save_selfie(pid, selfie)
+    request = {"ear_height_mm": ear_height_mm, "audiogram_is_example": not audiogram.strip(),
+               **{e: {"box": boxes[e], "audiogram_db_hl": ags[e]} for e in jobs.EARS}}
+    jobs.write_job(pid, {"id": pid, "status": "queued", "step": None, "created_at": time.time(), "ears": list(jobs.EARS),
                          "request": request, "results": {}, "log": []})
     jobs.submit(jobs.run_full, pid, request)
     return {"id": pid, "status_url": f"/api/patients/{pid}"}
@@ -129,14 +156,102 @@ async def create_patient(
 def get_patient(pid: str):
     _check_id(pid)
     job = jobs.read_job(pid)
-    d = jobs.patient_dir(pid)
-    job["files"] = {k: f"/api/patients/{pid}/files/{k}" for k, v in FILES.items() if os.path.exists(os.path.join(d, v))}
-    if os.path.exists(os.path.join(d, "waves", "runs.json")):
-        job["files"]["waves"] = f"/api/patients/{pid}/waves/index.html"
-    return job
+    files = {}
+    for ear in jobs.ears(job):
+        d = jobs.ear_dir(pid, ear, job)
+        f = {k: f"/api/patients/{pid}/files/{ear}/{k}" for k, v in FILES.items() if os.path.exists(os.path.join(d, v))}
+        if os.path.exists(os.path.join(d, "waves", "runs.json")):
+            f["waves"] = f"/api/patients/{pid}/waves/{ear}/index.html"
+        files[ear] = f
+    head = _head_files(pid, job)
+    if head:
+        files["head"] = head
+    # Set AFTER the lookups: ear_dir reads the presence of `ears` as the two-ear folder layout.
+    return {**job, "ears": jobs.ears(job), "files": files}
+
+
+# ---------------------------------------------------------------- head (headrecon/head.py)
+
+HEAD_FILES = ("head.glb", "head_ears.glb", "head.json", "landmarks.jpg", "selfie.jpg")
+HEAD_VIEWER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hornsim", "head_viewer.html")
+
+
+async def _read_selfie(upload):
+    """The optional selfie, read like the ear photos. An empty file field counts as NO selfie."""
+    if upload is None:
+        return None
+    raw = await upload.read()
+    return _read_photo(raw) if raw else None
+
+
+def _save_selfie(pid, img):
+    if img is not None:
+        os.makedirs(jobs.head_dir(pid), exist_ok=True)
+        img.save(os.path.join(jobs.head_dir(pid), "selfie.jpg"), quality=95)
+
+
+def _head_files(pid, job):
+    """Only files that exist; "viewer" ONLY once head.json does — the viewer has nothing to load before.
+    Legacy single-ear patients have no head."""
+    if "ears" not in job:
+        return {}
+    d = jobs.head_dir(pid)
+    f = {k: f"/api/patients/{pid}/files/head/{k}" for k in HEAD_FILES if os.path.isfile(os.path.join(d, k))}
+    if "head.json" in f:
+        f["viewer"] = f"/api/patients/{pid}/head/viewer.html"
+    return f
+
+
+def _head_file(pid, name):
+    """A fixed list of names, so a request can NEVER leave head/."""
+    _check_id(pid)
+    if name not in HEAD_FILES or "ears" not in jobs.read_job(pid):
+        raise HTTPException(404, "unknown file")
+    p = os.path.join(jobs.head_dir(pid), name)
+    if not os.path.isfile(p):
+        raise HTTPException(404, "file not ready")
+    return FileResponse(p, media_type={"glb": "model/gltf-binary", "json": "application/json"}.get(name.rsplit(".", 1)[-1]))
+
+
+@app.get("/api/patients/{pid}/files/head/{name}")
+def get_head_file(pid: str, name: str):
+    """Registered BEFORE /files/{ear}/{name}, which would otherwise take "head" for an ear and 404."""
+    return _head_file(pid, name)
+
+
+@app.get("/api/patients/{pid}/head/viewer.html")
+def get_head_viewer(pid: str):
+    """The CURRENT hornsim/head_viewer.html. It fetches head.json and head_ears.glb relative to this URL
+    (the route below) and each ear's waves as ../waves/<ear>/ — so it MUST stay under /head/."""
+    _check_id(pid)
+    if not os.path.isfile(HEAD_VIEWER):
+        raise HTTPException(404, "head viewer not available")
+    return FileResponse(HEAD_VIEWER, media_type="text/html")
+
+
+@app.get("/api/patients/{pid}/head/{name}")
+def get_head_relative(pid: str, name: str):
+    return _head_file(pid, name)
+
+
+@app.post("/api/patients/{pid}/head", status_code=202)
+async def rerun_head(pid: str, photo_selfie: UploadFile | None = File(None)):
+    """Rebuild only the head, e.g. to give an existing patient one. A new selfie replaces the old one;
+    without one the stored selfie, if any, is reused."""
+    _check_id(pid)
+    job = jobs.read_job(pid)
+    if "ears" not in job:
+        raise HTTPException(409, "single-ear patients have no head; create the patient again")
+    if job["status"] in ("queued", "running"):
+        raise HTTPException(409, "this patient is still being processed")
+    _save_selfie(pid, await _read_selfie(photo_selfie))
+    jobs._update(pid, status="queued", step="head")   # so a poll right after this sees it pending
+    jobs.submit(jobs.run_head, pid, job["status"])
+    return {"id": pid, "status_url": f"/api/patients/{pid}"}
 
 
 WAVE_FILE_RE = re.compile(r"^[A-Za-z0-9_.+-]+\.(html|json|png|wav)$")
+WAVE_VIEWER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hornsim", "wave_viewer.html")
 
 
 @app.post("/api/patients/{pid}/waves", status_code=202)
@@ -148,17 +263,37 @@ def rerun_waves(pid: str):
     return {"id": pid, "status_url": f"/api/patients/{pid}"}
 
 
-@app.get("/api/patients/{pid}/waves/{name}")
-def get_wave_file(pid: str, name: str):
-    """The wave viewer and its frames. Names are flat and pattern-checked, so a request can NEVER
-    leave the patient's waves folder."""
-    _check_id(pid)
+def _wave_file(d, name):
+    """Names are flat and pattern-checked, so a request can NEVER leave the waves folder."""
     if not WAVE_FILE_RE.match(name):
         raise HTTPException(404, "unknown file")
-    p = os.path.join(jobs.patient_dir(pid), "waves", name)
+    p = os.path.join(d, "waves", name)
     if not os.path.isfile(p):
         raise HTTPException(404, "file not ready")
-    return FileResponse(p)
+    # The patient's index.html is a copy taken at simulation time — serve the CURRENT viewer instead.
+    return FileResponse(WAVE_VIEWER if name == "index.html" else p)
+
+
+def _ear_dir(pid, ear):
+    _check_id(pid)
+    d = jobs.ear_dir(pid, ear)
+    if d is None:
+        raise HTTPException(404, "this patient has no such ear")
+    return d
+
+
+@app.get("/api/patients/{pid}/waves/{ear}/{name}")
+def get_ear_wave_file(pid: str, ear: str, name: str):
+    """The wave viewer and its frames. The viewer fetches ear.json, runs.json and frames by RELATIVE
+    URL, so they MUST stay under the same /waves/{ear}/ path as index.html."""
+    return _wave_file(_ear_dir(pid, ear), name)
+
+
+@app.get("/api/patients/{pid}/waves/{name}")
+def get_wave_file(pid: str, name: str):
+    """Legacy flat route: the patient folder's own waves/, which only single-ear patients have."""
+    _check_id(pid)
+    return _wave_file(jobs.patient_dir(pid), name)
 
 
 class AidDesign(BaseModel):
@@ -180,7 +315,7 @@ def rebuild_aid(pid: str, design: AidDesign):
     job = jobs.read_job(pid)
     if job["status"] in ("queued", "running"):
         raise HTTPException(409, "this patient is still being processed")
-    if "context" not in job.get("results", {}):
+    if not any("context" in jobs.ear_results(job, e) for e in jobs.ears(job)):
         raise HTTPException(409, "patient context is missing; create the patient again")
     if design.mouth_mm2 <= design.throat_mm2:
         raise HTTPException(422, "mouth area must be larger than throat area")
@@ -189,16 +324,27 @@ def rebuild_aid(pid: str, design: AidDesign):
     return {"id": pid, "status_url": f"/api/patients/{pid}"}
 
 
-@app.get("/api/patients/{pid}/files/{name}")
-def get_file(pid: str, name: str):
-    _check_id(pid)
+def _file(d, name):
     if name not in FILES:
         raise HTTPException(404, "unknown file")
-    p = os.path.join(jobs.patient_dir(pid), FILES[name])
+    p = os.path.join(d, FILES[name])
     if not os.path.exists(p):
         raise HTTPException(404, "file not ready")
     media = {"glb": "model/gltf-binary", "stl": "model/stl", "json": "application/json"}.get(name.rsplit(".", 1)[-1])
     return FileResponse(p, media_type=media, filename=name if name.endswith(".stl") else None)
+
+
+@app.get("/api/patients/{pid}/files/{ear}/{name}")
+def get_ear_file(pid: str, ear: str, name: str):
+    return _file(_ear_dir(pid, ear), name)
+
+
+@app.get("/api/patients/{pid}/files/{name}")
+def get_file(pid: str, name: str):
+    """Legacy flat route (backend/preview, frontend/app/demo): the patient folder itself, which only
+    single-ear patients fill."""
+    _check_id(pid)
+    return _file(jobs.patient_dir(pid), name)
 
 
 if os.path.isdir(settings.frontend_dir):

@@ -2,8 +2,8 @@ import { test, expect } from "@playwright/test";
 import { capsOn, mockBackend } from "./mockBackend";
 import fs from "node:fs";
 
-// Catches the dev shortcut breaking: Caps Lock ON must attach the ear photo and a fake hearing test in the real report format and NOT send; Enter then sends through the normal gate; turning Caps Lock OFF must not re-attach.
-test("Caps Lock attaches the ear and a fake hearing test, Enter sends them", async ({ page }) => {
+// Catches the dev shortcut breaking: Caps Lock ON must fill BOTH ear slots (the right one the mirrored practice ear), the face slot and a fake hearing test in the real report format and NOT send; Enter then sends each ear's known box under its own side; turning Caps Lock OFF must not re-attach.
+test("Caps Lock attaches both ears and a fake hearing test, Enter sends them", async ({ page }) => {
   let body = "";
   await mockBackend(page, { postDelayMs: 3000, onPost: (b) => (body = b) }); // sending starts a real run otherwise; the delay keeps the chips alive while the spec reads the PDF
   await page.goto("/zz-preview");
@@ -12,9 +12,11 @@ test("Caps Lock attaches the ear and a fake hearing test, Enter sends them", asy
     return !!w && getComputedStyle(w).opacity === "1";
   });
   await capsOn(page);
-  const ear = page.getByTestId("attachment");
+  const ear = page.getByTestId("attachment-left");
   const report = page.getByTestId("hearing-attachment");
   await expect(ear).toBeVisible();
+  await expect(page.getByTestId("attachment-right")).toBeVisible();
+  await expect(page.getByTestId("attachment-selfie")).toBeVisible(); // public/dev/face.png
   await expect(report).toBeVisible();
   await page.screenshot({ path: "test-results/practice-attached.png" });
   // The fake report is the same PDF the in-app test makes.
@@ -30,9 +32,12 @@ test("Caps Lock attaches the ear and a fake hearing test, Enter sends them", asy
   await expect(report).toHaveCount(0);
   await page.waitForTimeout(1200);
   await page.screenshot({ path: "test-results/practice-sent.png" });
-  // The practice photo is known (hand box, left ear), so it sends both and never triggers backend detection; both ears' audiograms go so the side can pick.
-  expect(body).toMatch(/name="box"\r\n\r\n240,70,470,430/);
-  expect(body).toMatch(/name="side"\r\n\r\nleft/);
+  // The practice boxes are known (hand box, and its mirror on the 656px-wide flipped photo), so neither ear triggers backend detection; each ear gets its own audiogram.
+  expect(body).toMatch(/name="box_left"\r\n\r\n240,70,470,430/);
+  expect(body).toMatch(/name="box_right"\r\n\r\n186,70,416,430/);
+  expect(body).toContain('name="photo_right"');
+  expect(body).toContain('name="photo_selfie"');
+  expect(body).not.toContain('name="side"');
   expect(body).toMatch(/name="audiogram"\r\n\r\n\{"right":\{[^}]*\},"left":\{/);
   // Caps Lock OFF (keydown with the modifier cleared) must not bring the practice attachments back.
   await page.evaluate(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "CapsLock", modifierCapsLock: false, cancelable: true })));

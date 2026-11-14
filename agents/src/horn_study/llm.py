@@ -21,8 +21,18 @@ DEFAULT_MAX_TOKENS = 16000
 Role = Literal["research", "coordinator", "interpreter", "designer"]
 
 
+# The four parallel research investigators run on Haiku: many cheap tool calls each. This beats
+# HORN_STUDY_MODEL (which sets every OTHER role); only HORN_STUDY_RESEARCH_MODEL overrides it.
+ROLE_DEFAULTS: dict[Role, str] = {"research": "anthropic:claude-haiku-5-5"}
+
+
 def model_name(role: Role) -> str:
-    return os.environ.get(f"HORN_STUDY_{role.upper()}_MODEL") or os.environ.get(MODEL_ENV) or DEFAULT_MODEL
+    return (
+        os.environ.get(f"HORN_STUDY_{role.upper()}_MODEL")
+        or ROLE_DEFAULTS.get(role)
+        or os.environ.get(MODEL_ENV)
+        or DEFAULT_MODEL
+    )
 
 
 class ModelNotConfigured(Exception):

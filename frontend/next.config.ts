@@ -3,7 +3,8 @@ import type { NextConfig } from "next";
 
 // The FastAPI backend (backend/README.md runs it on :8000). Proxied under /api so the browser
 // talks to one origin and no CORS setup is needed.
-const BACKEND_URL = process.env.BACKEND_URL ?? "http://127.0.0.1:8000";
+// Defaults to the SAME backend the rest of the app calls (NEXT_PUBLIC_API_URL, lib/run.ts) — a different one serves no /api/sim or none of this app's patients.
+const BACKEND_URL = process.env.BACKEND_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 
 const nextConfig: NextConfig = {
   /* config options here */

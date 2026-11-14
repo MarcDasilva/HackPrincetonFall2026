@@ -34,13 +34,15 @@ const fib = (i: number, n: number): [number, number, number] => {
 };
 
 type P = [number, number, number];
+/** A node of the "connecting" orb as drawn this frame: x, y in the 64-unit design space, z depth in [-1, 1] (near = +1). */
+export type OrbNode = P;
 const ink = (w: number, a: number) => {
   const g = Math.round((1 - Math.min(1, Math.max(0, w))) * 255);
   return `rgba(${g},${g},${g},${a})`;
 };
 
 /** Paints one frame in 64-unit space. Dark-theme ink only: near dots bright, far dots dim, lines first so nodes sit on top. */
-function connecting(ctx: CanvasRenderingContext2D, t: number, yaw: number) {
+function connecting(ctx: CanvasRenderingContext2D, t: number, yaw: number, out?: OrbNode[]) {
   const c = D / 2, R = c * 0.8;
   const sy = Math.sin(t * 0.12 + yaw), cy = Math.cos(t * 0.12 + yaw), st = Math.sin(0.32), ct = Math.cos(0.32);
   const proj = ([x, y, z]: P): P => {
@@ -77,8 +79,10 @@ function connecting(ctx: CanvasRenderingContext2D, t: number, yaw: number) {
   }
 
   const dots: { x: number; y: number; z: number; r: number; w: number; a: number }[] = [];
+  if (out) out.length = 0;
   nodes.forEach((n, i) => {
     const [x, y, z] = proj(n);
+    out?.push([x, y, z]);
     const depth = (z + 1) / 2;
     dots.push({ x, y, z, r: (NODE_R + NODE_R_DEPTH * depth) * (1 + 0.25 * Math.sin(t * 1.4 + i * 2.7)) * RS, w: 0.55 - 0.45 * depth, a: 1 });
   });
@@ -175,7 +179,8 @@ export type OrbVariant = keyof typeof DRAW;
 
 /** Draws the 64-unit design through a scaled context onto a backing store of `px * dpr`, so it stays vector-sharp at any size. The backing store is NEVER capped below the CSS size, or it blurs. */
 /** `spin.a` is an extra yaw in radians around the vertical axis, read EVERY frame — the caller tweens the object in place (GSAP), so a new object per render would drop the tween. */
-export default function Orb({ px, speed = 1, spin, variant = "connecting" }: { px: number; speed?: number; spin?: { a: number }; variant?: OrbVariant }) {
+/** `nodes` is refilled EVERY frame with the "connecting" variant's dots as drawn (OrbNode); other variants leave it empty. ResearchBoxes lands its info-board dots on them. */
+export default function Orb({ px, speed = 1, spin, variant = "connecting", nodes }: { px: number; speed?: number; spin?: { a: number }; variant?: OrbVariant; nodes?: { current: OrbNode[] } }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const target = useRef(speed);
   target.current = speed;
@@ -195,7 +200,8 @@ export default function Orb({ px, speed = 1, spin, variant = "connecting" }: { p
       ctx.setTransform(k, 0, 0, k, 0, 0);
       ctx.clearRect(0, 0, D, D);
       // The new variants were tuned at 0.96 time units per second, connecting at SPEED.
-      DRAW[variant](ctx, t * (variant === "connecting" ? SPEED : 0.96), spin?.a ?? 0);
+      if (variant === "connecting") connecting(ctx, t * SPEED, spin?.a ?? 0, nodes?.current);
+      else DRAW[variant](ctx, t * 0.96, spin?.a ?? 0);
       raf = requestAnimationFrame(loop);
     };
     loop();

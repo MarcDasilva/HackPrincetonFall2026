@@ -15,13 +15,17 @@ test("orb enters loading at the top while a run is busy, then leaves it", async 
     return !!w && getComputedStyle(w).opacity === "1";
   });
   const orb = page.getByTestId("orb");
-  const capture = page.getByRole("button", { name: "Capture Ear" });
+  const capture = page.getByRole("button", { name: "Capture Ears & Face" });
   await expect(orb).toHaveAttribute("data-state", "idle");
 
   await page.getByTestId("hearing-input").setInputFiles({ name: "audiogram.pdf", mimeType: "application/pdf", buffer: Buffer.from("%PDF-1.4\n%%EOF") });
   await capture.click();
   await page.getByRole("button", { name: "Take picture" }).click();
-  await expect(page.getByTestId("attachment")).toBeVisible();
+  await expect(page.getByTestId("attachment-left")).toBeVisible();
+  await page.getByRole("button", { name: "Take picture" }).click(); // the camera stays live for the right ear
+  await expect(page.getByTestId("attachment-right")).toBeVisible();
+  // The camera stays live for the optional face; skip it.
+  await page.getByRole("button", { name: "Close camera" }).click();
   await page.waitForTimeout(800); // panel retract
   await page.getByRole("button", { name: "Send" }).click();
 
@@ -57,7 +61,8 @@ test("Processing text shimmers", async ({ page }) => {
     return !!w && getComputedStyle(w).opacity === "1";
   });
   await page.getByTestId("hearing-input").setInputFiles({ name: "audiogram.pdf", mimeType: "application/pdf", buffer: Buffer.from("%PDF-1.4\n%%EOF") });
-  await page.getByTestId("add-input").setInputFiles({ name: "ear.png", mimeType: "image/png", buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64") });
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  await page.getByTestId("add-input").setInputFiles([{ name: "left.png", mimeType: "image/png", buffer: png }, { name: "right.png", mimeType: "image/png", buffer: png }]);
   await page.getByRole("button", { name: "Send" }).click();
   const sub = page.getByTestId("orb").getByRole("status");
   await expect(sub).toHaveText("Processing…", { timeout: 6000 });

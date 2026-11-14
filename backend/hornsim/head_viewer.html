@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Head Acoustics</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* One head, both ears, each ear's own simulated field. Same light "journal figure" look as wave_viewer.html. */
+:root {
+  --page: #f2f1ee; --stage: #fbfaf8; --panel: #ffffff; --line: #dcd9d3; --fg: #1c2127; --muted: #5d646e;
+  --accent: #2f5fd0; --accent-ink: #ffffff;
+  --body: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif; --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--page); color: var(--fg); font: 14px/1.5 var(--body); }
+.app { display: grid; grid-template-columns: minmax(0, 1fr) 320px; height: 100%; }
+.stage { position: relative; background: var(--stage); min-height: 460px; border-right: 1px solid var(--line); }
+#gl { width: 100%; height: 100%; display: block; touch-action: none; }
+.hud { position: absolute; left: 16px; top: 14px; right: 16px; display: flex; flex-direction: column; gap: 2px; pointer-events: none; }
+.hud b { font-size: 15px; font-weight: 600; } .hud span { color: var(--muted); font: 12px var(--mono); font-variant-numeric: tabular-nums; }
+.hud i { font-style: normal; color: var(--muted); font-size: 12px; }
+.key { position: absolute; left: 16px; bottom: 14px; background: rgba(255,255,255,.92); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; font-size: 12px; display: flex; gap: 8px; align-items: center; }
+.key s { width: 14px; height: 14px; border-radius: 3px; background: #c8413a; display: inline-block; }
+.rail { background: var(--panel); overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 18px; }
+h1 { margin: 0; font-size: 16px; font-weight: 600; }
+h2 { margin: 0; font-size: 11px; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+section { display: flex; flex-direction: column; gap: 8px; }
+.seg { display: flex; flex-wrap: wrap; gap: 6px; }
+.seg button { font: 500 13px var(--body); color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; cursor: pointer; min-height: 34px; }
+.seg button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.explain { margin: 0; font-size: 13px; color: var(--muted); }
+.row { display: flex; align-items: center; gap: 10px; }
+.play { width: 38px; height: 38px; border-radius: 50%; border: 1px solid var(--line); background: var(--panel); color: var(--fg); font-size: 14px; cursor: pointer; flex: none; }
+.toggles label { display: flex; gap: 8px; align-items: center; font-size: 13px; cursor: pointer; }
+.toggles input { accent-color: var(--accent); width: 15px; height: 15px; }
+.note { font-size: 12px; color: var(--muted); margin: 0; }
+.note ul { margin: 0; padding-left: 16px; display: flex; flex-direction: column; gap: 4px; }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 860px) { .app { grid-template-columns: 1fr; grid-template-rows: 62vh auto; height: auto; } .stage { border-right: 0; border-bottom: 1px solid var(--line); } }
+/* Embed (?embed=1): the stage and a tiny caption only. AFTER the narrow-screen rule on purpose, like wave_viewer. */
+.embed .rail, .embed .key, .embed .hud span { display: none; }
+.embed .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); height: 100%; }
+.embed .stage { min-height: 0; border: 0; }
+.embed .hud { right: 10px; left: 10px; top: 6px; gap: 0; }
+.embed .hud b { font-size: 11px; font-weight: 500; color: var(--muted); }
+.embed .hud i { font-size: 10px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="stage">
+    <canvas id="gl" aria-label="3D view of a head with the sound field around each ear"></canvas>
+    <div class="hud"><b id="title">Loading…</b><i id="honest">Speaker beside each ear, mirrored · each ear simulated on its own</i><span id="sub"></span></div>
+    <div class="key"><s></s><span id="keyText">Wavefront: pressure +0.5 × the incoming wave</span></div>
+  </div>
+  <aside class="rail">
+    <section>
+      <h1>Sound around both ears</h1>
+      <p class="explain">Each ear was simulated on its own, with its own speaker on its own side and a flat wall standing in for the head. The head here is for orientation only: it did not take part in the sound simulation.</p>
+    </section>
+    <section>
+      <h2>Speaker position</h2>
+      <div class="seg" id="dirs" role="group" aria-label="Speaker position"></div>
+    </section>
+    <section>
+      <h2>Sound</h2>
+      <div class="seg" id="sound" role="group" aria-label="Sound"></div>
+      <div class="row">
+        <button class="play" id="play" type="button" aria-label="Pause">❚❚</button>
+        <span class="explain" id="time"></span>
+      </div>
+      <div class="toggles"><label><input type="checkbox" id="tW" checked> Show waves</label></div>
+    </section>
+    <section>
+      <h2>Model</h2>
+      <div class="note" id="assume"></div>
+    </section>
+  </aside>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const $ = (id) => document.getElementById(id);
+const SIDES = ['left', 'right'];
+const SIGN = { left: 1, right: -1 };          // head frame: +x is the person's LEFT
+const Q = new URLSearchParams(location.search);
+const EMBED = Q.has('embed');
+if (EMBED) document.documentElement.classList.add('embed');
+const getJSON = (u) => fetch(u).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+
+// ---------- data: head.json, then each ear's runs.json (ear.json only if the GLB is missing) ----------
+const [headInfo, ...runLists] = await Promise.all([getJSON('head.json'), ...SIDES.map((s) => getJSON(`../waves/${s}/runs.json`))]);
+const H = headInfo || { dims_mm: { breadth: 152, length: 195, height: 230 }, ears: {}, assumptions: [] };
+const dims = H.dims_mm || { breadth: 152, length: 195, height: 230 };
+const ears = {};      // side -> { runs, toHead: Matrix4, base }
+SIDES.forEach((s, i) => {
+  const e = H.ears && H.ears[s], runs = runLists[i];
+  if (!e || !Array.isArray(runs) || !runs.length) return;
+  const m = (k) => new THREE.Matrix4().set(...e[k]);    // Matrix4.set takes row-major, as head.json stores it
+  ears[s] = { runs, info: e, toHead: m('waves_to_head'), meshToHead: e.mesh_to_head ? m('mesh_to_head') : m('waves_to_head'), base: `../waves/${s}/` };
+});
+const have = SIDES.filter((s) => ears[s]);
+const allTags = [...new Set(have.flatMap((s) => ears[s].runs.map((r) => r.tag)))];
+const refRuns = have.length ? ears[have[0]].runs : [];
+
+// ---------- scene ----------
+const canvas = $('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });     // the ONLY context on the page: the dashboard shows several of these
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0xfbfaf8);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, 1, 5, 8000);
+const controls = new OrbitControls(camera, canvas); controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8f96, 1.7));
+const key = new THREE.DirectionalLight(0xffffff, 1.1); key.position.set(150, 260, 320); scene.add(key);
+
+function label(text, size = 4.2, color = '#1c2127') {
+  const c = document.createElement('canvas'), g = c.getContext('2d'), px = 48;
+  g.font = `500 ${px}px Inter, system-ui, sans-serif`;
+  c.width = Math.ceil(g.measureText(text).width) + 16; c.height = px + 16;
+  g.font = `500 ${px}px Inter, system-ui, sans-serif`; g.fillStyle = color; g.textBaseline = 'middle'; g.fillText(text, 8, c.height / 2);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false, depthWrite: false, transparent: true }));
+  s.scale.set(size * c.width / c.height, size, 1); s.renderOrder = 20; return s;
+}
+
+// Head + ears: the backend's head_ears.glb (head frame, mm) so the geometry matches it exactly. Without it, an
+// ellipsoid of dims_mm plus each ear's skin from ear.json placed with mesh_to_head.
+const headGroup = new THREE.Group(); scene.add(headGroup);
+const skinMat = (vc) => new THREE.MeshStandardMaterial({ color: vc ? 0xffffff : 0xd8c2b0, vertexColors: vc, roughness: .65, metalness: 0 });
+async function loadHead() {
+  try {
+    const gltf = await new GLTFLoader().loadAsync('head_ears.glb');
+    // The ears carry photo colours but NO glTF material, and GLTFLoader's default is fully metallic — black without an
+    // environment map. Vertex-coloured meshes get wave_viewer's matte double-sided skin; the head keeps its own.
+    gltf.scene.traverse((o) => {
+      if (!o.isMesh) return;
+      if (!o.geometry.attributes.normal) o.geometry.computeVertexNormals();
+      if (o.geometry.attributes.color) o.material = skinMat(true);
+      o.material.side = THREE.DoubleSide;
+    });
+    headGroup.add(gltf.scene); return;
+  } catch { /* fall through to the procedural head */ }
+  const g = new THREE.SphereGeometry(1, 64, 48), hm = new THREE.Mesh(g, skinMat(false));
+  hm.scale.set(dims.breadth / 2, dims.height / 2, dims.length / 2); hm.position.set(0, 25, 10); headGroup.add(hm);
+  await Promise.all(have.map(async (s) => {
+    const ear = await getJSON(`${ears[s].base}ear.json`); if (!ear) return;
+    const SK = ear.skin || { verts: ear.ear.verts, faces: ear.ear.faces, rgb: null };
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(SK.verts, 3)); geo.setIndex(SK.faces);
+    if (SK.rgb) geo.setAttribute('color', new THREE.Float32BufferAttribute(SK.rgb.map((v, k) => new THREE.Color().setRGB(SK.rgb[k - k % 3] / 255, SK.rgb[k - k % 3 + 1] / 255, SK.rgb[k - k % 3 + 2] / 255, THREE.SRGBColorSpace).toArray()[k % 3]), 3));
+    geo.applyMatrix4(ears[s].meshToHead); geo.computeVertexNormals();
+    headGroup.add(new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ vertexColors: !!SK.rgb, color: SK.rgb ? 0xffffff : 0xb0a899, roughness: .6, side: THREE.DoubleSide })));
+  }));
+}
+await loadHead();
+// The volumes draw with depthTest off (they are ray-marched inside their box), so the head's depth comes from a
+// pre-pass into this target — without it a field beside the far side of the head shows THROUGH the head.
+const depthRT = new THREE.WebGLRenderTarget(1, 1, { depthTexture: new THREE.DepthTexture(1, 1) });
+
+// 3D wavefronts: wave_viewer's ray-marched iso-surface, plus a head-frame clip. Rays STOP at the ear (voxel mask)
+// and at the opaque head (depth pre-pass), and SKIP the far side of the mid-sagittal plane — the two separately simulated fields
+// must never show through the head or overlap each other.
+const VVS = `varying vec3 vOrigin; varying vec3 vDirection;
+void main(){
+  vOrigin = vec3(inverse(modelMatrix) * vec4(cameraPosition, 1.0));
+  vDirection = position - vOrigin;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}`;
+const VFS = `precision highp float; precision highp sampler3D;
+uniform sampler3D field; uniform sampler3D mask;
+uniform float phase; uniform float iso; uniform float alpha;
+uniform vec3 dims; uniform vec3 boxMin; uniform vec3 boxSize;
+uniform mat4 toHead; uniform float side;
+uniform sampler2D sceneDepth; uniform vec2 res; uniform float near; uniform float far; uniform mat4 mv;
+uniform vec3 posCol;
+varying vec3 vOrigin; varying vec3 vDirection;
+out highp vec4 outColor;
+vec2 hitBox(vec3 o, vec3 d){ vec3 inv = 1.0 / d; vec3 t0 = (-0.5 - o) * inv; vec3 t1 = (0.5 - o) * inv;
+  vec3 a = min(t0, t1); vec3 b = max(t0, t1); return vec2(max(max(a.x, a.y), a.z), min(min(b.x, b.y), b.z)); }
+float val(vec3 uv){ vec2 a = texture(field, uv).rg; return a.x * cos(phase) - a.y * sin(phase); }
+vec3 grad(vec3 uv){ vec3 h = 1.0 / dims;
+  return vec3(val(uv + vec3(h.x, 0, 0)) - val(uv - vec3(h.x, 0, 0)), val(uv + vec3(0, h.y, 0)) - val(uv - vec3(0, h.y, 0)),
+              val(uv + vec3(0, 0, h.z)) - val(uv - vec3(0, 0, h.z))) / (2.0 * h * boxSize); }
+void main(){
+  vec3 d = normalize(vDirection);
+  vec2 b = hitBox(vOrigin, d);
+  if (b.x > b.y) discard;
+  b.x = max(b.x, 0.0);
+  float stepLen = 0.6 / max(dims.x, max(dims.y, dims.z));
+  vec3 L = normalize(vec3(0.35, 0.85, 0.4)); vec3 V = normalize(-d * boxSize);
+  vec4 acc = vec4(0.0); float prev = 0.0; bool has = false;
+  float zb = texture(sceneDepth, gl_FragCoord.xy / res).r;
+  float sceneZ = (near * far) / ((far - near) * zb - far);       // view-space z of the nearest opaque surface
+  for (int i = 0; i < 900; i++) {
+    float t = b.x + float(i) * stepLen;
+    if (t > b.y || acc.a > 0.97) break;
+    vec3 uv = vOrigin + t * d + 0.5;
+    vec3 wp = boxMin + uv * boxSize;
+    vec3 hp = (toHead * vec4(wp, 1.0)).xyz;
+    if (side * hp.x < 0.0) { has = false; continue; }
+    if ((mv * vec4(vOrigin + t * d, 1.0)).z < sceneZ) break;
+    if (texture(mask, uv).r > 0.5) break;
+    float v = val(uv);
+    if (has && (prev - iso) * (v - iso) < 0.0) {
+      vec3 n = normalize(grad(uv) + 1e-6);
+      float diff = abs(dot(n, L)), rim = pow(1.0 - abs(dot(n, V)), 2.0);
+      vec3 col = posCol * (0.42 + 0.58 * diff) + 0.16 * rim;
+      acc.rgb += (1.0 - acc.a) * alpha * col; acc.a += (1.0 - acc.a) * alpha;
+    }
+    prev = v; has = true;
+  }
+  if (acc.a < 0.01) discard;
+  outColor = vec4(acc.rgb / acc.a, acc.a);
+}`;
+function tex3(data, X, Y, Z, rg) {
+  const t = new THREE.Data3DTexture(data, X, Y, Z);
+  t.format = rg ? THREE.RGFormat : THREE.RedFormat; t.type = rg ? THREE.HalfFloatType : THREE.UnsignedByteType;
+  t.minFilter = t.magFilter = THREE.LinearFilter; t.unpackAlignment = 1; t.needsUpdate = true; return t;
+}
+// atlas pixel of voxel (x, y, z) in frame f: tile n = f·Z + z, row-major tiles, tile rows = y, tile columns = x
+function voxels(im, dims, cols, f, fn) {
+  const [X, Y, Z] = dims;
+  for (let z = 0; z < Z; z++) {
+    const n = f * Z + z, r = Math.floor(n / cols), c = n % cols;
+    for (let y = 0; y < Y; y++) {
+      const row = ((r * Y + y) * im.w + c * X) * 4, o = (z * Y + y) * X;
+      for (let x = 0; x < X; x++) fn(o + x, row + x * 4);
+    }
+  }
+}
+async function img(url) {
+  const im = new Image(); im.src = url; await im.decode();
+  const c = document.createElement('canvas'); c.width = im.naturalWidth; c.height = im.naturalHeight;
+  const g = c.getContext('2d', { willReadFrequently: true }); g.drawImage(im, 0, 0);
+  return { d: g.getImageData(0, 0, c.width, c.height).data, w: c.width, h: c.height };
+}
+
+// Per ear: a Group whose matrix IS waves_to_head, holding that ear's volume box and speaker in the waves frame.
+function speakerModel() {
+  const g = new THREE.Group();
+  g.add(new THREE.Mesh(new THREE.BoxGeometry(16, 16, 12), new THREE.MeshStandardMaterial({ color: 0x3a3f46, roughness: .6 })));
+  const cone = new THREE.Mesh(new THREE.CylinderGeometry(6.5, 3, 3, 40, 1, true), new THREE.MeshStandardMaterial({ color: 0x9aa0a8, side: THREE.DoubleSide }));
+  cone.rotation.x = Math.PI / 2; cone.position.z = 6.6; g.add(cone);
+  if (!EMBED) { const l = label('speaker', 5, '#5d646e'); l.position.set(0, 15, 0); g.add(l); }
+  return g;
+}
+for (const s of have) {
+  const E = ears[s], grp = new THREE.Group();
+  grp.matrixAutoUpdate = false; grp.matrix.copy(E.toHead); scene.add(grp);
+  const mat = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, vertexShader: VVS, fragmentShader: VFS,
+    side: THREE.BackSide, transparent: true, depthTest: false, depthWrite: false,
+    uniforms: { field: { value: null }, mask: { value: null }, phase: { value: 0 }, iso: { value: .5 }, alpha: { value: .42 },
+      dims: { value: new THREE.Vector3() }, boxMin: { value: new THREE.Vector3() }, boxSize: { value: new THREE.Vector3() },
+      toHead: { value: E.toHead }, sceneDepth: { value: depthRT.depthTexture }, res: { value: new THREE.Vector2(1, 1) },
+      near: { value: camera.near }, far: { value: camera.far }, mv: { value: new THREE.Matrix4() }, side: { value: SIGN[s] }, posCol: { value: new THREE.Color('#c8413a') } } });
+  E.volume = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), mat); E.volume.renderOrder = 10; E.volume.visible = false; grp.add(E.volume);
+  E.volume.onBeforeRender = (r, sc, cam) => mat.uniforms.mv.value.multiplyMatrices(cam.matrixWorldInverse, E.volume.matrixWorld);
+  E.spk = speakerModel(); E.spk.visible = false; grp.add(E.spk);
+  E.group = grp; E.cache = new Map();
+  // the ear as seen from its own waves frame: aim the speaker at it
+  const trag = new THREE.Vector3(...(E.info.tragion || [SIGN[s] * dims.breadth / 2, 0, 0]));
+  E.earLocal = trag.clone().applyMatrix4(E.toHead.clone().invert());
+  const tag = label(s === 'left' ? 'L' : 'R', 14, '#5d646e');
+  tag.position.copy(trag).add(new THREE.Vector3(SIGN[s] * 22, 48, 0)); scene.add(tag);
+}
+
+// Only the chosen run and sound are fetched, per ear: the dashboard opens up to five of these at once.
+async function loadField(s, r, sound) {
+  const E = ears[s], k = `${r.tag}|${sound}`;
+  if (E.cache.has(k)) return E.cache.get(k);
+  const p = (async () => {
+    const F = r.files, V = F.volume, [X, Y, Z] = V.dims, N = X * Y * Z, url = (f) => E.base + encodeURIComponent(f);
+    const maskKey = `${r.tag}|mask`;
+    if (sound === 'pulse') {
+      const P = F.pulse.vol, im = await img(url(P.file));
+      let mask = E.cache.get(maskKey);
+      if (!mask) {        // the voxel mask rides in the tone atlases' blue channel; the click atlas has none
+        const t = F.tones[0], re = await img(url(t.vol.re.file)), m = new Uint8Array(N);
+        voxels(re, V.dims, t.vol.re.cols, 0, (i, px) => { m[i] = re.d[px + 2]; });
+        mask = tex3(m, X, Y, Z, false); E.cache.set(maskKey, mask);
+      }
+      return { mask, pulse: { ...P, im, tex: tex3(new Uint16Array(N * 2), X, Y, Z, true) } };
+    }
+    const t = F.tones.find((x) => `${x.hz}` === sound) || F.tones[0];
+    const [re, im] = await Promise.all([img(url(t.vol.re.file)), img(url(t.vol.im.file))]), d = new Uint16Array(N * 2), lim = t.vol.re.lim, m = new Uint8Array(N);
+    voxels(re, V.dims, t.vol.re.cols, 0, (i, px) => { d[i * 2] = THREE.DataUtils.toHalfFloat(((re.d[px] * 256 + re.d[px + 1]) / 65535 - .5) * 2 * lim); m[i] = re.d[px + 2]; });
+    voxels(im, V.dims, t.vol.im.cols, 0, (i, px) => { d[i * 2 + 1] = THREE.DataUtils.toHalfFloat(((im.d[px] * 256 + im.d[px + 1]) / 65535 - .5) * 2 * lim); });
+    if (!E.cache.has(maskKey)) E.cache.set(maskKey, tex3(m, X, Y, Z, false));
+    return { mask: E.cache.get(maskKey), tone: tex3(d, X, Y, Z, true), meta: t };
+  })();
+  E.cache.set(k, p); p.catch(() => E.cache.delete(k)); return p;
+}
+function pulseFrame(P, dims, f) {
+  const d = P.tex.image.data;
+  voxels(P.im, dims, P.cols, f, (i, px) => { d[i * 2] = THREE.DataUtils.toHalfFloat((P.im.d[px] - 128) / 127 * P.lim); });
+  P.tex.needsUpdate = true; return P.tex;
+}
+
+// ---------- state ----------
+const posName = (r) => ({ 0: 'Front', 45: 'Front-side', 90: 'Side', 135: 'Back-side', 180: 'Behind' }[r.az] || 'Az') + ` ${r.az}°` + (r.el ? ` · up ${r.el}°` : '');
+const pick = Q.get('run');
+const state = { tag: allTags.includes(pick) ? pick : (refRuns.find((r) => r.az === 90) || refRuns[0] || {}).tag, sound: '4000',
+  playing: true, phase: 0, frame: 0, live: {} };        // live: side -> { run, field }
+const tones = refRuns[0] ? refRuns[0].files.tones.map((t) => `${t.hz}`) : [];
+if (!tones.includes(state.sound) && tones.length) state.sound = tones[0];
+$('dirs').innerHTML = refRuns.map((r) => `<button type="button" data-tag="${r.tag}">${posName(r)}</button>`).join('');
+$('sound').innerHTML = [`<button type="button" data-s="pulse">Click</button>`].concat(tones.map((h) => `<button type="button" data-s="${h}">${h / 1000} kHz tone</button>`)).join('');
+$('dirs').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) choose(b.dataset.tag, state.sound); });
+$('sound').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) choose(state.tag, b.dataset.s); });
+$('play').addEventListener('click', () => { state.playing = !state.playing; $('play').textContent = state.playing ? '❚❚' : '▶'; $('play').setAttribute('aria-label', state.playing ? 'Pause' : 'Play'); });
+$('tW').addEventListener('change', () => { for (const s of Object.keys(state.live)) ears[s].volume.visible = $('tW').checked; });
+$('assume').innerHTML = `<ul>${['Each ear was simulated separately, with its speaker on its own side; the right ear’s speaker mirrors the left’s.',
+  'In each simulation a flat rigid wall stood in for the head; this head shape did not take part in the physics.']
+  .concat(H.assumptions || []).concat(H.source ? [`Head shape: ${H.source === 'selfie' ? 'from your selfie' : 'an average adult head'}.`] : [])
+  .map((t) => `<li>${t}</li>`).join('')}</ul>`;
+
+let seq = 0;
+async function choose(tag, sound) {
+  const my = ++seq;
+  $('dirs').querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', b.dataset.tag === tag));
+  $('sound').querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', b.dataset.s === sound));
+  const got = await Promise.all(have.map(async (s) => {
+    const r = ears[s].runs.find((x) => x.tag === tag);
+    if (!r) return [s, null];
+    try { return [s, { run: r, field: await loadField(s, r, sound) }]; } catch { return [s, null]; }
+  }));
+  if (my !== seq) return;                   // a newer choice won while this one loaded
+  // tag and sound switch ONLY with the new fields: the render loop would otherwise draw a click from tone data
+  state.tag = tag; state.sound = sound; state.live = {}; state.frame = 0;
+  for (const [s, L] of got) {
+    const E = ears[s], U = E.volume.material.uniforms;
+    E.volume.visible = !!L && $('tW').checked; E.spk.visible = !!L;
+    if (!L) continue;
+    state.live[s] = L;
+    const V = L.run.files.volume;
+    E.volume.scale.set(...V.box_size); E.volume.position.set(...V.box_min.map((m, i) => m + V.box_size[i] / 2));
+    U.dims.value.set(...V.dims); U.boxMin.value.set(...V.box_min); U.boxSize.value.set(...V.box_size);
+    U.mask.value = L.field.mask;
+    if (L.field.tone) U.field.value = L.field.tone;
+    E.spk.position.set(...L.run.speaker_mm);
+    E.spk.quaternion.setFromRotationMatrix(new THREE.Matrix4().lookAt(E.earLocal, E.spk.position, new THREE.Vector3(0, 1, 0)));
+  }
+  const r0 = got.find(([, L]) => L)?.[1]?.run || refRuns.find((r) => r.tag === tag);
+  const sides = Object.keys(state.live), missing = have.length < 2 ? ['left', 'right'].filter((s) => !ears[s]) : have.filter((s) => !state.live[s]);
+  const what = sound === 'pulse' ? 'Click' : `${sound / 1000} kHz tone`;
+  $('title').textContent = `${what} · ${r0 ? posName(r0) : tag}` + (missing.length ? ` · ${missing.join(', ')} ear not simulated` : '');
+  $('honest').textContent = sides.length > 1 ? 'Speaker beside each ear, mirrored · each ear simulated on its own'
+    : 'Speaker beside the ear · simulated on its own, head not part of the physics';
+  $('keyText').textContent = sound === 'pulse' ? 'Wavefront: click pressure +0.5 × the incoming wave' : 'Wavefront: pressure +0.5 × the incoming wave';
+  fitCamera(); draw();
+}
+function draw() {
+  const pulse = state.sound === 'pulse';
+  for (const [s, L] of Object.entries(state.live)) {
+    const U = ears[s].volume.material.uniforms;
+    if (pulse) { const P = L.field.pulse; U.field.value = pulseFrame(P, L.run.files.volume.dims, state.frame % P.frames); U.phase.value = 0; }
+    else U.phase.value = state.phase;
+  }
+  const any = Object.values(state.live)[0];
+  if (pulse && any) $('time').textContent = $('sub').textContent = `t = ${(any.field.pulse.frame_us * (state.frame % any.field.pulse.frames) / 1000).toFixed(3)} ms after the click`;
+  else if (!pulse) { const deg = (state.phase * 180 / Math.PI) % 360; $('time').textContent = $('sub').textContent = `phase ${deg.toFixed(0)}°`; }
+}
+
+// ---------- camera: the whole head, both ears, both speakers, from front-above ----------
+let fitted = false;
+function fitCamera() {
+  if (fitted && !EMBED) return;             // full page: keep the user's orbit across direction changes
+  const box = new THREE.Box3().setFromObject(headGroup);
+  // EVERY direction's speakers, not just this one's: the dashboard's boxes then show the head at ONE size
+  for (const s of have) for (const r of ears[s].runs) box.expandByPoint(new THREE.Vector3(...r.speaker_mm).applyMatrix4(ears[s].toHead));
+  const ctr = box.getCenter(new THREE.Vector3()), rad = box.getSize(new THREE.Vector3()).length() / 2;
+  const vh = THREE.MathUtils.degToRad(camera.fov / 2), hh = Math.atan(Math.tan(vh) * camera.aspect);
+  const dist = rad / Math.sin(Math.min(vh, hh)) * .78;   // the box diagonal over-estimates the bounding sphere
+  camera.position.copy(ctr).addScaledVector(new THREE.Vector3(.3, .62, 1).normalize(), dist);
+  controls.target.copy(ctr); camera.lookAt(ctr); controls.update(); fitted = true;
+}
+function resize() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width === Math.round(w * renderer.getPixelRatio()) && canvas.height === Math.round(h * renderer.getPixelRatio())) return false;
+  renderer.setSize(w, h, false); camera.aspect = w / Math.max(h, 1); camera.updateProjectionMatrix();
+  const px = renderer.getDrawingBufferSize(new THREE.Vector2());
+  depthRT.setSize(px.x, px.y);
+  for (const s of have) ears[s].volume.material.uniforms.res.value.copy(px);
+  return true;
+}
+
+resize();
+if (!have.length) { $('title').textContent = headInfo ? 'No ear simulation yet' : 'Head model not ready yet'; $('honest').hidden = true; }
+if (state.tag) await choose(state.tag, state.sound); else fitCamera();
+
+if (matchMedia('(prefers-reduced-motion: reduce)').matches) { state.playing = false; $('play').textContent = '▶'; $('play').setAttribute('aria-label', 'Play'); }
+let last = 0;
+renderer.setAnimationLoop((now) => {
+  if (resize()) { fitted = false; fitCamera(); }
+  if (state.playing && Object.keys(state.live).length) {
+    const dt = last ? now - last : 0;
+    if (state.sound === 'pulse') { if (now - (state.tick || 0) > 70) { state.tick = now; state.frame++; draw(); } }
+    else { state.phase = (state.phase + dt / 1800 * 2 * Math.PI) % (2 * Math.PI); draw(); }
+  }
+  last = now;
+  controls.update();
+  const shown = have.filter((s) => ears[s].volume.visible);
+  for (const s of shown) ears[s].volume.visible = false;
+  renderer.setRenderTarget(depthRT); renderer.render(scene, camera); renderer.setRenderTarget(null);
+  for (const s of shown) ears[s].volume.visible = true;
+  renderer.render(scene, camera);
+});
+document.documentElement.dataset.ready = '1';
+</script>
+</body>
+</html>

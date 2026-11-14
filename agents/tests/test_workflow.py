@@ -46,7 +46,7 @@ from horn_study.workflow import (
     run_study,
 )
 
-EVIDENCE_TOOLS = {"search_literature", "read_source", "record_finding"}
+EVIDENCE_TOOLS = {"search_literature", "read_source", "record_finding", "submit_finding"}
 READ_ONLY_FILE_TOOLS = {"ls", "read_file", "grep"}
 
 
@@ -92,6 +92,20 @@ async def test_a_study_runs_once_through_every_phase_and_stops(tmp_path):
     assert [e.model_dump() for e in read_events(ArtifactStore(tmp_path, outcome.study_id))] == [
         e.model_dump() for e in outcome.events.history
     ]
+
+
+async def test_a_research_only_study_completes_without_planning_or_evaluating(tmp_path):
+    """Catches the dashboard's study running the fixture planner and evaluator the lead now replaces."""
+    harness = Harness(tmp_path)
+    harness.deps.research_only = True
+    outcome = await run_study(make_request(), harness.deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    phases = [e.data["to"] for e in outcome.events.history if e.type == "study.state_changed"]
+    assert phases == ["RESEARCHING", "COMPLETED"]
+    assert harness.coordinator_model.log.calls == 0
+    assert harness.evaluator.calls == []
+    assert types(outcome)[-1] == "study.completed"
 
 
 async def test_a_study_works_without_lifestyle_needs(tmp_path):

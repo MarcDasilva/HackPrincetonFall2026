@@ -30,7 +30,8 @@ FINDING = {
 }
 
 
-def session(max_calls: int = 6, reader: FakeReader | None = None, search=None):
+def session(max_calls: int = 6, reader: FakeReader | None = None, search=None, post_every: int | None = None):
+    # The post-often gate is OFF here: these cases are about evidence, not posting. Its own test turns it on.
     events = EventBus("s")
     made = ResearchSession(
         INVESTIGATORS[0],
@@ -39,6 +40,7 @@ def session(max_calls: int = 6, reader: FakeReader | None = None, search=None):
         reader=reader or FakeReader(),
         ledger=ResearchLedger(),
         events=events,
+        post_every=post_every,
     )
     return made, events
 
@@ -274,3 +276,90 @@ async def test_only_one_finding_per_investigator_may_rest_on_a_non_scholarly_sou
         "scholarly",
         "scholarly",
     ]
+
+
+async def test_a_search_event_carries_its_query_and_results():
+    """Catches the dashboard's search modal coming up empty: the event must carry the full query and every hit,
+    not only the one-line summary (truncated at 120 characters)."""
+    s, events = session()
+    await s.search_literature("horn acoustics " + "x" * 200)
+    (event,) = [e for e in events.history if e.type == "research.searched"]
+    assert event.data["query"] == "horn acoustics " + "x" * 200
+    assert event.data["results"] and {"title", "url", "year", "snippet"} <= set(event.data["results"][0])
+
+
+def test_an_event_inside_a_traced_run_names_that_run(monkeypatch):
+    """Catches trace rows linking only to the whole study: an event emitted inside a LangSmith run (a tool
+    call) records that run's id and trace id; outside any run it records none."""
+    from types import SimpleNamespace
+
+    import langsmith.run_helpers as rh
+
+    events = EventBus("s")
+    monkeypatch.setattr(rh, "get_current_run_tree", lambda: None)
+    assert "langsmith" not in events.emit("research.agent_started", "s", component="c").data
+    monkeypatch.setattr(rh, "get_current_run_tree", lambda: SimpleNamespace(id="run-1", trace_id="trace-1"))
+    assert events.emit("research.agent_started", "s", component="c").data["langsmith"] == {
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+    }
+
+
+async def test_board_posts_land_on_the_shared_board_and_cost_no_budget():
+    """Catches submit_finding eating the search/read budget (agents would stop posting to save calls), a post
+    missing from the board the lead reads, or its event missing from the boxes' feed."""
+    s, events = session(max_calls=1)
+    await s.read_source(URL, "gain")
+    assert s.submit_finding("High-frequency gain matters", "Most consonant cues sit at 2-4 kHz.", URL) == (
+        "Posted hearing-B1 to the info board."
+    )
+    s.submit_finding("Second note", "No source.")
+    assert s.calls_used == 1
+    board = s._ledger.board
+    assert [p["headline"] for p in board] == ["High-frequency gain matters", "Second note"]
+    assert board[0]["source_id"] == "S1"
+    assert board[1]["source"] is None
+    assert [e.data["post_id"] for e in events.history if e.type == "research.board_posted"] == [
+        "hearing-B1",
+        "hearing-B2",
+    ]
+    assert s.submit_finding("  ", "x").startswith("Not posted")
+
+
+async def test_tool_results_nudge_the_agent_to_post():
+    """Catches the post-often nudge dropping out of search and read results — it is what keeps posting frequent."""
+    s, _ = session()
+    assert "submit_finding" in await s.search_literature("horn acoustics")
+    message, _ = await s.read_source(URL, "gain")
+    assert "submit_finding" in message
+
+
+async def test_a_search_reply_parses_back_into_its_hits():
+    """Catches the search modal for older studies coming back empty: the server rebuilds their hits by
+    parsing the tool's reply text out of LangSmith (server.parse_search), so that parser must read EXACTLY
+    what search_literature writes."""
+    from horn_study.server import parse_search
+
+    s, events = session()
+    reply = await s.search_literature("horn acoustics")
+    (event,) = [e for e in events.history if e.type == "research.searched"]
+    parsed = parse_search(reply)
+    assert parsed["query"] == "horn acoustics"
+    keys = ("title", "url", "open_access", "venue")
+    want = [{k: h[k] or None for k in keys} for h in event.data["results"]]
+    assert [{k: h.get(k) for k in keys} for h in parsed["results"]] == want
+    assert [str(h.get("year")) for h in parsed["results"]] == [str(h["year"]) for h in event.data["results"]]
+
+
+async def test_two_unposted_research_calls_block_the_third_until_a_post():
+    """Catches agents researching for long stretches without posting: after two searches or reads with no
+    submit_finding, the next is refused WITHOUT spending budget, and a post opens it again."""
+    s, _ = session(post_every=2)
+    await s.search_literature("a")
+    await s.search_literature("b")
+    refused = await s.search_literature("c")
+    assert refused.startswith("Not run, and no call spent")
+    assert s.calls_used == 2
+    s.submit_finding("Headline", "Detail.")
+    assert (await s.search_literature("c")).startswith("Results for")
+    assert s.calls_used == 3

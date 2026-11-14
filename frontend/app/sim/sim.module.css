@@ -13,7 +13,8 @@
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 460px;
+  /* Sims take 4/5 of the width, the cohort panel 1/5 — never narrower than its charts can read. */
+  grid-template-columns: minmax(0, 4fr) minmax(380px, 1fr);
   gap: 16px;
   padding: 16px;
   min-height: 100vh;

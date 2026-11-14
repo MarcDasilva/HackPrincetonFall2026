@@ -173,6 +173,23 @@ def inside_sweep(q, path, R, fr, lo, hi):
     return (np.linalg.norm(radial, axis=1) < R[lo:hi][j, k]) & ~past_end
 
 
+def printable(solid, tol_mm=0.01):
+    """The boolean result has a few near-zero-area triangles. In memory it reads as watertight, but
+    STL stores bare float coordinates, so on reload (and in the slicer) those triangles collapse and
+    their edges turn non-manifold. Deleting them opens holes; collapsing the tiny edges INSIDE the
+    manifold kernel keeps the solid closed. 0.01 mm is far below any printer's resolution."""
+    import manifold3d as mf
+    m = mf.Manifold(mf.Mesh(vert_properties=np.asarray(solid.vertices, np.float32),
+                            tri_verts=np.asarray(solid.faces, np.uint32))).simplify(tol_mm)
+    out = m.to_mesh()
+    solid = trimesh.Trimesh(np.asarray(out.vert_properties)[:, :3], np.asarray(out.tri_verts), process=True)
+    # sealed pinhole voids (inward-facing shells, negative volume) are harmless but noisy; a second
+    # OUTWARD body would be a loose piece, so it is kept and fails the one-body check instead
+    shells = solid.split(only_watertight=False)
+    outer = [q for q in shells if q.volume > 0]
+    return outer[0] if len(outer) == 1 else solid
+
+
 def render_preview(ear, solid, c, n, up, left, png):
     """Two views for the designer to judge the look: face-on in the ear, and three-quarter."""
     import matplotlib
@@ -295,12 +312,15 @@ def build(context_dir, out_dir, params, design_id="e1", log=print):
     mesh, world = ew.build(P["ear_mesh"], E["landmarks_xlsx"], tuple(E["concha_rim_landmarks"]), E["voxel_mm"],
                            E["fit_tolerance_mm"], E["faceplate_protrusion_mm"], E["canal_opening_diameter_mm"],
                            P["ear_height_mm"])
-    # S/M/L: grow or shrink the whole cast in voxel steps; pad first so a grown cast is not
-    # clipped flat at the edge of the voxel box
+    # S/M/L: grow or shrink the cast SIDEWAYS only, in voxel steps. A size is about how snugly it
+    # fills the bowl; shrinking it vertically too would sink the faceplate under the mouth and break
+    # the bore out just below it. Pad first so a grown cast is not clipped at the voxel box edge.
     k_fit = int(round(p["fit_offset_mm"] / world.voxel_mm))
     if k_fit:
         v = np.pad(world.voxels, abs(k_fit))
-        v = ndimage.binary_dilation(v, iterations=k_fit) if k_fit > 0 else ndimage.binary_erosion(v, iterations=-k_fit)
+        sideways = ndimage.generate_binary_structure(3, 1) * np.array([0, 1, 0], bool)[None, None, :]
+        v = (ndimage.binary_dilation(v, sideways, iterations=k_fit) if k_fit > 0
+             else ndimage.binary_erosion(v, sideways, iterations=-k_fit))
         world = replace(world, voxels=v, origin=world.origin - abs(k_fit) * world.voxel_mm * world.axes.sum(0))
     fit_offset = k_fit * world.voxel_mm
     prot, n, c, wall = E["faceplate_protrusion_mm"], world.axes[2], world.rim_center, p["wall_mm"]
@@ -497,12 +517,17 @@ def build(context_dir, out_dir, params, design_id="e1", log=print):
         cut.append(capsules([P0, world.canal_point, world.canal_point + (stem + 1.5) * axis], r_t))
     body = trimesh.boolean.union([seat, *extra], engine="manifold") if extra else seat
     solid = trimesh.boolean.difference([body, *cut], engine="manifold")
+    solid = printable(solid)
     if not solid.is_watertight:
         return {**report, "ok": False, "reasons": [_reason("watertight", "the print solid is not watertight")]}
 
     out = os.path.join(out_dir, design_id)
     os.makedirs(out, exist_ok=True)
-    solid.export(os.path.join(out, "earpiece_print.stl"))
+    stl = os.path.join(out, "earpiece_print.stl")
+    solid.export(stl)
+    printed = trimesh.load(stl)                  # the FILE is what gets printed; check it, not the memory copy
+    if not printed.is_watertight or len(printed.split(only_watertight=False)) != 1:
+        return {**report, "ok": False, "reasons": [_reason("watertight", "the exported STL is not one closed solid")]}
     view = solid.copy()
     view.visual.face_colors = [243, 140, 40, 255]
     scene = trimesh.Scene()

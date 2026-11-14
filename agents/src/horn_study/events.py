@@ -24,6 +24,8 @@ EventType = Literal[
     "study.started",
     "study.state_changed",
     "research.agent_started",
+    "research.searched",
+    "research.board_posted",
     "research.source_read",
     "research.finding_added",
     "research.agent_completed",
@@ -49,6 +51,7 @@ ARTIFACT_NAMES = (
     "events.jsonl",
     "experiment_results.json",
     "results.json",
+    "board.json",
 )
 
 
@@ -56,6 +59,17 @@ class TraceRef(Contract):
     run_id: str
     project: str | None = None
     tracing_enabled: bool = False
+
+
+def _langsmith_run() -> dict[str, str] | None:
+    """The LangSmith run this event happens inside (e.g. the search_literature tool call), so the UI can link
+    the event to THAT run; the study-level TraceRef only reaches the whole trace. None when not tracing."""
+    try:
+        from langsmith.run_helpers import get_current_run_tree
+    except ImportError:
+        return None
+    run = get_current_run_tree()
+    return {"run_id": str(run.id), "trace_id": str(run.trace_id)} if run is not None else None
 
 
 class StudyEvent(Contract):
@@ -201,7 +215,7 @@ class EventBus:
                 experiment_ids=tuple(experiment_ids),
                 artifacts=tuple(artifacts),
                 trace=self._trace,
-                data=_plain(data or {}),
+                data=_plain({**(data or {}), **({"langsmith": ls} if (ls := _langsmith_run()) else {})}),
             )
             self.history.append(event)
             if self._store is not None:
