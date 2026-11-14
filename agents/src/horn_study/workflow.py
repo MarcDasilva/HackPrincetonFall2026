@@ -21,6 +21,7 @@ from typing import Annotated, Any, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tracers.langchain import wait_for_all_tracers
 from langchain_core.utils.uuid import uuid7
 from langgraph.graph import END, START, StateGraph
@@ -32,6 +33,7 @@ from horn_study.contracts import (
     BranchResult,
     EvaluatorCapabilities,
     ExperimentRecord,
+    ExperimentSpec,
     InputIssue,
     ResearchRecord,
     StartingPackage,
@@ -41,7 +43,7 @@ from horn_study.contracts import (
     StudyState,
     allowed_transitions,
 )
-from horn_study.evaluator_adapter import FIXTURE_NOTICE, Evaluator
+from horn_study.evaluator_adapter import FIXTURE_NOTICE, BuildabilityCheck, Evaluator
 from horn_study.events import ARTIFACT_NAMES, ArtifactStore, EventBus, EventListener, TraceRef
 from horn_study.followup import FollowUpError, load_prior_study
 from horn_study.intake import InputRejected, parse_request, validate_request
@@ -158,6 +160,7 @@ def build_graph(
     coordinator_model: BaseChatModel,
     interpreter_model: BaseChatModel,
     evaluate: EvaluateFn,
+    check_buildable: BuildabilityCheck | None,
     search: Search,
     reader: Reader,
     cache: EvaluationCache,
@@ -234,6 +237,14 @@ def build_graph(
         revision = state["plan_revision"]
         accepted = frozenset(f.finding_id for f in state["research"].findings)
         plan, errors = build_plan(state["draft"], package, accepted, plan_version=revision + 1)
+        if plan is not None and check_buildable is not None:
+            # Dial ranges cannot say whether a combination of values fits this ear, so each design
+            # is test-built now, while the plan can still be corrected and before any result exists.
+            errors = await unbuildable_candidates(
+                plan, check_buildable, package.budget.max_parallel_evaluations
+            )
+            if errors:
+                plan = None
         if plan is None:
             if revision >= package.budget.max_plan_revisions:
                 raise StudyFailed(
@@ -370,6 +381,47 @@ def _whole_sentences(text: str, limit: int) -> str:
         return text
     end = text.rfind(". ", 0, limit)
     return text[: end + 1] if end > 0 else text[:limit]
+
+
+async def unbuildable_candidates(
+    plan: StudyPlan, check_buildable: BuildabilityCheck, max_parallel: int
+) -> list[str]:
+    """Ask the evaluator to test-build each design in a draft plan. Returns one error per design
+    that cannot be built, worded so the coordinator can change it. Nothing is scored here.
+
+    A check that itself breaks is not held against the design: the case will report its own
+    failure when it runs.
+    """
+    gate = asyncio.Semaphore(max_parallel)
+    call = RunnableLambda(check_buildable, name="check_buildable")
+
+    async def check(candidate_id: str, spec: ExperimentSpec) -> str | None:
+        async with gate:
+            try:
+                problem = await call.ainvoke(
+                    spec,
+                    config={
+                        "run_name": "check_buildable",
+                        "tags": ["plan_validation"],
+                        "metadata": {
+                            "study_id": plan.study_id,
+                            "component": "plan_validation",
+                            "candidate_id": candidate_id,
+                        },
+                    },
+                )
+            except Exception:
+                return None
+        if problem is None:
+            return None
+        return f"candidate '{candidate_id}' cannot be built ({problem.code}): {problem.message}"[:900]
+
+    first_case: dict[str, ExperimentSpec] = {}
+    for spec in plan.experiments:
+        if spec.candidate_kind == "design":
+            first_case.setdefault(spec.candidate_id, spec)
+    found = await asyncio.gather(*(check(cid, spec) for cid, spec in first_case.items()))
+    return [message for message in found if message]
 
 
 def results_document(
@@ -521,6 +573,7 @@ async def run_study(raw_request: Mapping[str, Any], deps: StudyDependencies) -> 
         coordinator_model=deps.coordinator_model,
         interpreter_model=deps.interpreter_model,
         evaluate=deps.evaluator.evaluate_experiment,
+        check_buildable=getattr(deps.evaluator, "check_buildable", None),
         search=deps.search,
         reader=deps.reader,
         cache=snapshot_cache,
