@@ -40,3 +40,10 @@ def test_notes_repeat_until_yes() -> None:
     _, stage, notes = talk("", "I have tinnitus in my left ear", "I also run a lot", "no", "yes go ahead")
     assert stage == "launched"
     assert notes == ["I have tinnitus in my left ear", "I also run a lot"]
+
+
+def test_simulation_count_is_a_number_from_1_to_100() -> None:
+    """Catches "100" being refused, or a stray 0 or 500 starting a run the dashboard cannot hold."""
+    from horn_study.lead import count
+
+    assert [count(t) for t in ("40", "let's do 100", "0", "500", "lots")] == [40, 100, None, None, None]

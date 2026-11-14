@@ -3,7 +3,7 @@ import { capsOn, mockBackend, mockStudy, PID } from "./mockBackend";
 
 const CORS = { "access-control-allow-origin": "*", "access-control-allow-headers": "*" };
 const session = (run_id: string, reply: string, launched: boolean, updated_at: number) =>
-  ({ run_id, reply, awaiting_launch: !launched, launch_requested: launched, study_id: launched ? `${run_id}-1` : null, status: launched ? "running" : "none", updated_at });
+  ({ run_id, reply, stage: launched ? "launched" : "begin", awaiting_launch: !launched, launch_requested: launched, study_id: launched ? `${run_id}-1` : null, status: launched ? "running" : "none", updated_at });
 const SESSIONS = [
   session("aaaaaaaaaaaa", "Four agents are researching your aid. Ask me anything.", true, 1794690000),
   session("bbbbbbbbbbbb", "Noted. May I begin?", false, 1794680000),
@@ -42,7 +42,8 @@ test("the session picker switches between saved sessions and back to a new one",
   await picker.selectOption("aaaaaaaaaaaa");
   await expect(line).toHaveText("Four agents are researching your aid. Ask me anything.");
   await expect(page.getByTestId("agent-ear_fit_research").getByTestId("summary")).toHaveText("A concha lock holds while running.");
-  await expect(page.getByRole("button", { name: "Start simulation" })).toBeVisible();
+  // Research is still running: the orb opens ONLY once the simulations run.
+  await expect(page.getByRole("button", { name: "Start simulation" })).toHaveCount(0);
   await expect(page).toHaveURL(/\?session=aaaaaaaaaaaa$/);
   await expect(page.getByTestId("session-id")).toHaveText("aaaaaaaaaaaa");
   await page.waitForTimeout(3500); // orb rise, agent flight and fade

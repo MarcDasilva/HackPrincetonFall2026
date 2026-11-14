@@ -10,7 +10,9 @@ import { fakeHearing } from "@/lib/fakeHearing";
 import type { Result } from "@/lib/audiometry";
 import { pollRun, runNote, startRun, type EarPhoto, type Run } from "@/lib/run";
 import type { Ear } from "@/lib/audiometry";
-import { createSession, getLead, listSessions, talkToLead, type LeadReply } from "@/lib/lead";
+import { createSession, getLead, leadEvent, listSessions, MOVING, talkToLead, type LeadReply } from "@/lib/lead";
+import SimRuns, { type Outcome } from "@/app/sim/SimRuns";
+import { designFile, designStatus, startDesign } from "@/app/sim/lib/api";
 import ResearchBoxes, { RESEARCH_LINE } from "@/components/ResearchBoxes";
 import EarViews, { type View } from "@/components/EarViews";
 import WaveBento from "@/components/WaveBento";
@@ -190,6 +192,8 @@ export default function Dashboard() {
   // The lead agent takes over once the ear cards vanish (EarViews onGone). From then on the composer talks to it, and its latest reply replaces "Processing…" under the orb. null = not started.
   const [lead, setLead] = useState<{ line: string; waiting: boolean } | null>(null);
   const leadOn = lead !== null;
+  // The lead's latest full reply: its stage and the simulation half (scenes, options, report). null before the lead speaks.
+  const [view, setView] = useState<LeadReply | null>(null);
   // The research view: the four investigator boxes in the corners, and the chat card and pills go see-through so only their metal rings draw. Opens when the lead launches the study (or a launched session is picked); dev key 5 toggles it.
   const [research, setResearch] = useState(false);
   // Saved lead sessions for the picker under the chat card, one per run (agents server, most recent first). Empty when the server is down — the picker then offers only "New session".
@@ -215,6 +219,8 @@ export default function Dashboard() {
   // simReady makes the orb clickable; zoomed is the full-screen orb with the dock and chat hidden. ponytail: launch_requested stands in for "research finished" until the study workflow reports completion.
   const [simReady, setSimReady] = useState(false);
   const [zoomed, setZoomed] = useState(false);
+  // Escape and the X close the orb the SAME way (exitSim): a close can move the lead on.
+  const exitRef = useRef(() => setZoomed(false));
   const bar = useRef<HTMLDivElement>(null);
   const simWrap = useRef<HTMLDivElement>(null);
   // True once the zoom-in has LANDED. The sims mount on this, never on zoomed: building their 3D scenes and workers blocks the main thread for seconds, and doing it mid-zoom freezes the zoom and the chrome fade.
@@ -225,7 +231,7 @@ export default function Dashboard() {
   const card = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!zoomed) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setZoomed(false);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && exitRef.current();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [zoomed]);
@@ -355,6 +361,47 @@ export default function Dashboard() {
     });
     return () => ctx.kill();
   }, [ready, sent, panelOn, zoomed, leadOn]);
+  // apply and step are defined below the `ready` early return; the hooks here reach them through refs.
+  const applyRef = useRef<(r: LeadReply) => void>(() => {});
+  const stepRef = useRef<(event: string, data?: Record<string, unknown>) => Promise<void>>(async () => {});
+  // Stages that move without the patient (research finishing, the scene picker) are polled; every other stage moves on a send or a step.
+  useEffect(() => {
+    if (!run || !view || !MOVING.includes(view.stage)) return;
+    const t = window.setInterval(() => void getLead(run.id).then((r) => r && (r.stage !== view.stage || r.reply !== view.reply) && applyRef.current(r), () => {}), 3000);
+    return () => window.clearInterval(t);
+  }, [run?.id, view?.stage, view?.reply]); // eslint-disable-line react-hooks/exhaustive-deps
+  // "Ready to run the simulation?" -> yes: the research boxes fade away, then unmount.
+  const boxes = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!research || !view || view.stage === "launched" || view.stage === "sim_ready") return;
+    const tw = gsap.to(boxes.current, { opacity: 0, duration: 0.8, ease: "power1.out", onComplete: () => setResearch(false) });
+    return () => { tw.kill(); };
+  }, [view?.stage, research]); // eslint-disable-line react-hooks/exhaustive-deps
+  // designing: ask the backend for the four designs from the simulations' deficits, poll, and hand them to the lead. ONE request per entry into the stage.
+  const designing = useRef(false);
+  useEffect(() => {
+    if (!run || view?.stage !== "designing" || !view.sims || designing.current) return;
+    designing.current = true;
+    const { results, audiogram_db_hl } = view.sims, ear = view.ear ?? undefined;
+    let live = true;
+    (async () => {
+      const scenes = results.filter((x) => x.weight > 0).map((x) => ({ id: x.id, name: x.name, weight: x.weight, deficit_db: x.deficit_db, deficit_weighted: x.deficit_weighted }));
+      // "already running" (a reload mid-design) is fine: the poll below picks that design up.
+      await startDesign(run.id, audiogram_db_hl, scenes, ear).catch((e: Error) => { if (!/already running/.test(e.message)) throw e; });
+      for (;;) {
+        await new Promise((ok) => setTimeout(ok, 1500));
+        if (!live) return;
+        const st = await designStatus(run.id, ear).catch(() => null);
+        if (st?.status === "error") throw new Error(st.error ?? "design failed");
+        if (st?.status !== "done" || !st.result) continue;
+        const opts = st.result.options ?? [{ ...st.result.design, reason: "The best design for your scenes." }];
+        return stepRef.current("options", { options: opts.map((o) => ({ id: o.id, reason: o.reason, key_met: o.key_met, gain_mean_db: o.gain_mean_db, files: o.files })) });
+      }
+    })().catch((e: Error) => { if (live) void stepRef.current("design_failed", { error: e.message }); }).finally(() => { designing.current = false; });
+    return () => { live = false; };
+  }, [run?.id, view?.stage]); // eslint-disable-line react-hooks/exhaustive-deps
+  // The simulations' latest numbers (SimRuns onDone), sent to the lead when the patient closes the orb.
+  const [outcome, setOutcome] = useState<Outcome | null>(null);
   if (!ready) return null;
 
   const openCam = async () => {
@@ -518,44 +565,6 @@ export default function Dashboard() {
       else setLead({ line: "The assistant is unreachable. Is the agents server running on :8010?", waiting: false });
     }
   };
-  // Stages that move without the patient (research finishing, the scene picker) are polled; every other stage moves on a send or a step.
-  useEffect(() => {
-    if (!run || !view || !MOVING.includes(view.stage)) return;
-    const t = window.setInterval(() => void getLead(run.id).then((r) => r && (r.stage !== view.stage || r.reply !== view.reply) && apply(r), () => {}), 3000);
-    return () => window.clearInterval(t);
-  }, [run?.id, view?.stage, view?.reply]); // eslint-disable-line react-hooks/exhaustive-deps
-  // "Ready to run the simulation?" -> yes: the research boxes fade away, then unmount.
-  const boxes = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!research || !view || view.stage === "launched" || view.stage === "sim_ready") return;
-    const tw = gsap.to(boxes.current, { opacity: 0, duration: 0.8, ease: "power1.out", onComplete: () => setResearch(false) });
-    return () => { tw.kill(); };
-  }, [view?.stage, research]); // eslint-disable-line react-hooks/exhaustive-deps
-  // designing: ask the backend for the four designs from the simulations' deficits, poll, and hand them to the lead. ONE request per entry into the stage.
-  const designing = useRef(false);
-  useEffect(() => {
-    if (!run || view?.stage !== "designing" || !view.sims || designing.current) return;
-    designing.current = true;
-    const { results, audiogram_db_hl } = view.sims, ear = view.ear ?? undefined;
-    let live = true;
-    (async () => {
-      const scenes = results.filter((x) => x.weight > 0).map((x) => ({ id: x.id, name: x.name, weight: x.weight, deficit_db: x.deficit_db, deficit_weighted: x.deficit_weighted }));
-      // "already running" (a reload mid-design) is fine: the poll below picks that design up.
-      await startDesign(run.id, audiogram_db_hl, scenes, ear).catch((e: Error) => { if (!/already running/.test(e.message)) throw e; });
-      for (;;) {
-        await new Promise((ok) => setTimeout(ok, 1500));
-        if (!live) return;
-        const st = await designStatus(run.id, ear).catch(() => null);
-        if (st?.status === "error") throw new Error(st.error ?? "design failed");
-        if (st?.status !== "done" || !st.result) continue;
-        const opts = st.result.options ?? [{ ...st.result.design, reason: "The best design for your scenes." }];
-        return step("options", { options: opts.map((o) => ({ id: o.id, reason: o.reason, key_met: o.key_met, gain_mean_db: o.gain_mean_db, files: o.files })) });
-      }
-    })().catch((e: Error) => live && step("design_failed", { error: e.message })).finally(() => { designing.current = false; });
-    return () => { live = false; };
-  }, [run?.id, view?.stage]); // eslint-disable-line react-hooks/exhaustive-deps
-  // The simulations' latest numbers (SimRuns onDone), sent to the lead when the patient closes the orb.
-  const [outcome, setOutcome] = useState<Outcome | null>(null);
   const pickedGain = view?.options?.find((o) => o.id === view.picked)?.gain_mean_db;
   const exitSim = () => {
     setZoomed(false);
@@ -575,6 +584,9 @@ export default function Dashboard() {
     const n = (view.options?.findIndex((o) => o.id === view.picked) ?? 0) + 1;
     void step("validated", { aided, summary: `With option ${n} you hear ${pct(mean(aided))} of speech on average, up from ${pct(unaided)}. It helps in ${better} of ${aided.length} scenes.` });
   };
+  exitRef.current = exitSim;
+  applyRef.current = apply;
+  stepRef.current = step;
   const note = runErr ?? (run ? runNote(run) : "");
   // Dev shortcut: skip upload, run and ear views and land in the lead conversation, as if a run had just finished. The lead reads a FINISHED patient from the backend's data folder (job.json), so this needs one: d60d88e7550d is the validation patient (done, left ear); override with NEXT_PUBLIC_DEV_RUN_ID. The lead agents server (:8010) must be up.
   const skipToLead = () => {
@@ -658,7 +670,7 @@ export default function Dashboard() {
     {/* The up arrow is live only once BOTH ear photos AND a hearing test are attached; plus is inert. Width 600 approximates the dock's resting width — retune if the dock changes. */}
     {/* The ear stage's three views, revealed as the backend writes them; the orb's rect is where the stack lands. */}
     {/* Keyed on the run: switching sessions remounts the boxes, so one study's traces never show under another's. Key 5 with no run shows the dev patient's study. */}
-    {research && <ResearchBoxes key={run?.id} runId={run?.id ?? DEV_RUN_ID} origin={() => orb.current?.getBoundingClientRect() ?? null} delay={flyDelay.current} nodes={orbNodes} />}
+    {research && <div ref={boxes}><ResearchBoxes key={run?.id} runId={run?.id ?? DEV_RUN_ID} origin={() => orb.current?.getBoundingClientRect() ?? null} delay={flyDelay.current} nodes={orbNodes} /></div>}
     {/* Three rows — left ear on top, the head (face) in the MIDDLE, right ear at the bottom — each revealing its OWN files as the backend writes them. They close together (rowsSettled); the lead opens once they are gone (see headComing). */}
     {run && (["left", "right"] as const).map((ear) => (
       <EarViews key={`${run.id}:${ear}`} {...rowProps(ear)} label={`${ear === "left" ? "Left" : "Right"} ear`} testid={`ear-row-${ear}`} y={earRows().ys[ear === "left" ? 0 : 2]} size={earRows().size} files={run.files?.[ear]} anchor={() => orb.current?.getBoundingClientRect() ?? null}

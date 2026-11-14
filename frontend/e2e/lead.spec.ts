@@ -89,8 +89,8 @@ test("holding 1 and 2 skips the upload and opens the lead", async ({ page }) => 
   await page.screenshot({ path: "test-results/lead-skip.png" });
 });
 
-// Catches the orb being clickable before the simulation is ready, the zoom leaving the dock or chat on screen, or the X / Escape failing to bring them back.
-test("once launch is confirmed, clicking the orb zooms in and X or Escape zooms back out", async ({ page }) => {
+// Catches the orb being clickable before the simulations run (a launched study is NOT enough), the zoom leaving the dock or chat on screen, or the X / Escape failing to bring them back.
+test("once the simulations run, clicking the orb zooms in and X or Escape zooms back out", async ({ page }) => {
   await page.route("**/api/patients", (route) => route.abort());
   // This spec is about the zoom, not the sims: an unknown patient keeps the wave viewers from loading and starving the animation.
   await page.route(/\/api\/patients\/[a-f0-9]{12}$/, (route) => route.fulfill({ status: 404, headers: CORS, contentType: "application/json", body: "{}" }));
@@ -98,9 +98,11 @@ test("once launch is confirmed, clicking the orb zooms in and X or Escape zooms 
   await mockStudy(page);
   await page.route("**/lead/*", async (route) => {
     if (route.request().method() === "OPTIONS") return route.fulfill({ headers: CORS });
-    const { message } = route.request().postDataJSON();
-    launched ||= message === "yes";
-    return route.fulfill({ contentType: "application/json", headers: CORS, body: JSON.stringify({ reply: launched ? "Research is running." : "Launch the research agents?", awaiting_launch: !launched, launch_requested: launched }) });
+    // A poll (GET) after launch finds the simulations running; no scenes, so the orb shows the wave bento.
+    const polled = route.request().method() === "GET";
+    launched ||= !polled && route.request().postDataJSON().message === "yes";
+    const stage = !launched ? "begin" : polled ? "sim_running" : "launched";
+    return route.fulfill({ contentType: "application/json", headers: CORS, body: JSON.stringify({ stage, reply: launched ? "Research is running." : "Launch the research agents?", awaiting_launch: !launched, launch_requested: launched }) });
   });
   await page.goto("/zz-preview");
   await page.waitForFunction(() => {
@@ -119,9 +121,10 @@ test("once launch is confirmed, clicking the orb zooms in and X or Escape zooms 
   await page.locator("textarea").fill("yes");
   await page.getByRole("button", { name: "Send" }).click();
   const start = page.getByRole("button", { name: "Start simulation" });
-  await expect(start).toBeVisible();
-  // The yes launches the study: the investigator boxes open without key 5.
+  // The yes launches the study: the investigator boxes open without key 5, and the orb waits for the simulations.
   await expect(page.getByTestId("agent-hearing_research").getByTestId("traces")).toContainText("Finding from hearing_research");
+  await expect(start).toHaveCount(0);
+  await expect(start).toBeVisible({ timeout: 10_000 });
   await page.waitForTimeout(1000); // orb rise
   await start.click();
 
