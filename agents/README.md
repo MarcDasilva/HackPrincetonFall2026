@@ -253,9 +253,11 @@ The amplitude and calibration convention is defined by the evaluator and named b
 ### The hornsim evaluator
 
 `horn_study.hornsim_evaluator` connects `evaluation_mode: "real"` to the backend's `hornsim` pipeline (see `../backend/HORNSIM.md`).
-It builds the 3D aid in the configured ear, models its insertion gain with the 1D acoustic model, applies that gain to the speech clips, and scores them with HASPI v2 using the supplied audiogram.
+It builds a 3D device in the configured ear, models its insertion gain with the 1D acoustic model, applies that gain to the speech clips, and scores them with HASPI v2 using the supplied audiogram.
+It can build two devices: the coiled aid of `hornsim.aid` and the in-concha earpiece of `hornsim.earpiece`.
+Both go through the same scenarios, canal sample, HASPI call, and unaided control, so one study can compare them.
 
-What the model says about this device, so results are read correctly:
+What the model says about the coiled aid, so results are read correctly:
 A narrow throat feeding the ear canal is a low-pass filter, so the hornsim default (throat 1 mm^2) sits 10 to 25 dB below the open ear above 500 Hz and scores worse than no device.
 Widening the throat is what brings 1 to 4 kHz back, and a wide bore is routed as a short funnel with no vent.
 Even the widest buildable bore stays about 6 dB below the open ear at 2 to 4 kHz, because the shell fills the concha and removes its natural boost.
@@ -292,7 +294,7 @@ Then set these in `agents/.env`:
 | `HORN_STUDY_REAL_EVALUATOR` | `horn_study.hornsim_evaluator` |
 | `HORNSIM_BACKEND_DIR` | The repository's `backend/` directory. Required. |
 | `HORNSIM_EAR_MESH` | The patient's ear mesh in mm, in AudioEar's 2,800-vertex topology (`ear.ply` from `earrecon`, or the template). Required. |
-| `HORNSIM_WORK_DIR` | Where patient contexts and built aids are kept and reused. Required. |
+| `HORNSIM_WORK_DIR` | Where patient contexts, built devices, and each ear's earpiece limits are kept and reused. Required. |
 | `HORNSIM_PYTHON` | The backend interpreter. Defaults to `<backend>/.venv/bin/python`. |
 | `HORNSIM_EAR_HEIGHT_MM` | Optional. Rescales the mesh to this ear height. Unset means the mesh is used at its own size. |
 | `HORNSIM_BRIDGE_TIMEOUT_SECONDS` | Optional. Time allowed per bridge step. Defaults to 1800. |
@@ -310,17 +312,23 @@ uv run horn-study run examples/requests/real_with_needs.json
 
 What it declares, all read from the installed backend each time a study starts:
 
-- One geometry family, `spiral_exponential_horn`, with the parameters and bounds of `AidDesign` in `backend/app/main.py`: throat 0.3 to 31 mm^2, mouth 2 to 200 mm^2, vent 0 to 2.5 mm, wall 0.4 to 2 mm, path 20 to 300 mm, and tip clearance 0.2 to 1.5 mm.
+- The geometry family `spiral_exponential_horn`, with the parameters and bounds of `AidDesign` in `backend/app/main.py`: throat 0.3 to 31 mm^2, mouth 2 to 200 mm^2, vent 0 to 2.5 mm, wall 0.4 to 2 mm, path 20 to 300 mm, and tip clearance 0.2 to 1.5 mm.
   A vent of 0 means no vent, which a throat above about 3 mm^2 needs because there is no room for a vent beside it in the canal tip.
   The largest throat that passes the canal tip is `pi * (canal diameter / 2 - tip clearance - wall)^2`: 20.4 mm^2 at the defaults and 31 mm^2 with the smallest tip clearance and wall.
   The bounds are what some ear can hold, so a design can be in bounds and still not fit the configured ear.
+- The geometry family `concha_horn_earpiece`, described in the next section.
+  It is declared only when the backend has `hornsim.earpiece` and the configured ear can hold an earpiece.
+  Otherwise the capabilities carry the reason under `earpiece.reason` and the spiral family stands alone.
 - One baseline, `unaided`: a flat 0 dB response sent through the same clips, levels, and HASPI call as the designs.
 - Scenarios for each clip type (clean speech, speech in babble) at each presentation level in `hornsim/defaults.yaml`.
   Every scenario is the mean over its clips: three clean sentences, or four sentences in babble.
   HASPI on a single two-second clip swings too much with level to rank designs, so per-clip values are kept for inspection only.
 - One calibration, `hornsim-reference-at-65-db-spl-v2`: HASPI's clean reference always stands for 65 dB SPL and the presentation level scales only what the listener hears.
   Results made under the earlier `hornsim-reference-rms1-at-level-v1` convention are not comparable at 50 and 80 dB SPL.
-- Metrics: `haspi_v2_mean`, `haspi_v2_worst_canal`, `haspi_v2_improvement_over_unaided`, four insertion gain band averages, and `bore_length_mm`.
+- Metrics: `haspi_v2_mean`, `haspi_v2_worst_canal`, `haspi_v2_improvement_over_unaided`, four insertion gain band averages, `bore_length_mm`, and `protrusion_mm`.
+  The last two are informational.
+  `protrusion_mm` is how far the print stands out past the plane of the concha rim, measured the same way for both families, and 0 for the control.
+  A plan can cap it with a selection constraint when the user wants a small or discreet device, which is why `compact_size` is not listed as unsupported while the earpiece is declared.
 - Required thresholds at 250, 500, 1000, 2000, 4000, and 6000 Hz, the six frequencies HASPI v2 uses.
   pyclarity would interpolate a missing one, so a request without all six is rejected instead.
   The placeholder audiogram in `defaults.yaml` is never used.
@@ -330,18 +338,113 @@ What it declares, all read from the installed backend each time a study starts:
 
 What to expect when it runs:
 
-- The patient context is built once per ear mesh and audiogram (about three minutes) and each design once per set of design numbers (about ten seconds), however many scenarios or threads ask for it.
+- The patient context is built once per ear mesh and audiogram (about three minutes) and each design once per family and set of design numbers (about ten seconds for a coiled aid, about three for an earpiece), however many scenarios or threads ask for it.
   Both are kept in `HORNSIM_WORK_DIR` and reused by later studies.
+- The first time capabilities are read for an ear, two probe earpieces are built to find its limits (about five seconds).
+  The answer is kept under `HORNSIM_WORK_DIR/ears` and reused.
 - Scoring one scenario takes 20 to 40 seconds.
 - A design that cannot be routed in the ear comes back as `status: "failed"` with `error.code: "geometry_does_not_fit"` and hornsim's reason, never as a score.
   The reasons are a throat too wide for the canal tip, no bore route that fits the concha, and a vent that cannot keep the minimum wall to the bore.
 - hornsim itself now refuses a vent that would cut into the bore.
   The adapter still checks `vent_wall_to_bore_mm` in `design.json` and reports `error.code: "vent_intersects_bore"` if an older backend lets one through, because the acoustic model assumes separate channels.
+- An earpiece that `hornsim.earpiece` rejects comes back the same way, with every reason the builder gave in `error.message` and, unchanged, under `build_reasons`.
+  Values the builder does not accept at all come back as `status: "unsupported"` with `error.code: "bad_parameter"`, and a crash in either builder as `error.code: "build_failed"`.
 - Results carry references to `design.json`, `aid.glb`, `aid_in_ear.glb`, `aid_print.stl`, `acoustics.json`, and `references.json`, plus hornsim's own per-clip scores and its unaided and ceiling references.
+  For an earpiece the built files are `design.json` (the builder's report), `earpiece.glb`, `earpiece_in_ear.glb`, `earpiece_print.stl`, `preview.png`, and an `acoustics.json` that records exactly what the acoustic model was given.
 - The bridge process does not inherit model or tracing keys.
 
 `tests/test_hornsim_evaluator.py` covers the adapter with the bridge stubbed.
-Its last test runs the real pipeline and is skipped unless `HORNSIM_BACKEND_DIR`, `HORNSIM_EAR_MESH`, and `HORNSIM_WORK_DIR` are set.
+Its last two tests run the real pipeline, one per family, and are skipped unless `HORNSIM_BACKEND_DIR`, `HORNSIM_EAR_MESH`, and `HORNSIM_WORK_DIR` are set.
+
+#### The in-concha earpiece family
+
+`concha_horn_earpiece` is the device of `backend/hornsim/earpiece.py`: a seat cast from the concha with the horn carved inside it, an optional soft stem into the canal, and an optional collector that carries the horn outward past the faceplate.
+It has no vent.
+It is the only family whose opening can be larger than the concha opening.
+A study that selects one names its parameters `throat_mm2` and `mouth_mm2`, which is what `horn-study earpiece` locks when it shapes the final print.
+
+Every bound is read from the backend when capabilities are read.
+The values below are the template ear's.
+
+| Parameter | Bounds | Where they come from |
+| --- | --- | --- |
+| `throat_mm2` | 7 to 60 mm^2 | `earpiece.PARAMS`. With a stem the bore runs inside it, so the throat can be at most 27.3 mm^2 unless `canal_stem_mm` is 0. That limit is this ear's, from `target.earpiece_boxes`. |
+| `mouth_mm2` | 20 to 304.7 mm^2 | The mouth on the faceplate. The lower bound is the builder's. The upper bound is this ear's: 0.95 of the largest mouth its concha opening holds, from `target.earpiece_boxes`, rounded down to 0.1. The builder's own range reaches 1500. |
+| `canal_stem_mm` | 0 to 8 mm | `earpiece.PARAMS`. 0 means no stem. |
+| `collector_reach_mm` | 0 to 35 mm | `earpiece.MAX_REACH_MM`. 0 means no collector. |
+| `collector_mouth_mm2` | 0 to 2827.4 mm^2 | The area of the largest section radius, 30 mm, that `earpiece.validate_collector` accepts. 0 means no collector. |
+
+How a study asks for a collector:
+The builder takes a collector as a spine and a cross-section at each spine point, which is not a number a plan can hold.
+A study sets two numbers instead, and the adapter writes them into the builder's format as one straight section.
+The spine has one point, `collector_reach_mm` out from the mouth centre along the faceplate normal.
+The builder rounds off the end of the path, so the rim it builds sits about 1 mm closer than that.
+Its cross-section is round, with area `collector_mouth_mm2`.
+The builder blends the mouth outline on the faceplate into that circle.
+Both numbers 0 means no collector and a flush faceplate.
+One without the other is refused as `bad_parameter`.
+
+What a study cannot ask for:
+A bent or scooped collector, one that faces the talker, a cross-section that is not round, more than one section, a hood, a vent, or any other dial of the builder.
+The talker direction, mouth outline, flare shape, wall, removal tab, and fit size stay at the builder's defaults, which the capabilities list under `earpiece.fixed_dials`.
+A faceplate mouth larger than the ear allows cannot be asked for either: the planner rejects it against the declared bound, and a spec that reaches the evaluator anyway is built, rejected by the builder with `mouth_fit`, and returned as a failed case.
+
+The bounds are checked one dial at a time, so a design can be in bounds and still be rejected.
+On the template ear a 304.7 mm^2 mouth builds with a 60 mm^2 throat and no stem, and fails with a 27 mm^2 throat and a stem because the flare breaks through the seat wall.
+
+How it is scored:
+The builder reports the area along the bore it actually cut, about every millimetre.
+That profile goes through the profile door of `hornsim.acoustics`, from the collector's rim (or the faceplate mouth) to the seat floor, followed by the stem as a tube at the throat area.
+The patient's `ear_params` are passed, so the open-ear reference is this ear's own concha.
+The canals, clips, levels, HASPI call, and unaided control are the ones the spiral family uses.
+If a backend's builder reports no area profile, the dial door is used with the same settings, and a collector cannot be scored.
+A profile that stops short of the opening the builder reports is refused with `build_failed`, because the model would be scoring a smaller mouth than was built.
+
+The settings are the unified defaults with one exception.
+The whole canal is each canal sample plus 9 mm, the coiled aid's tip length, which is the canal the spiral family's open ear already has.
+Both families are then compared with the same open canal, and a shorter stem leaves more of it behind the piece.
+With the field left unset, the profile door would give each stem length a different canal: a design with no stem would be compared with an ear whose canal is 9 mm shorter than the one the coiled aid is compared with.
+
+What the acoustic model does not see:
+
+- The direction a collector faces, and any directional gain.
+  The model is one-dimensional.
+- The shape of a cross-section.
+  Only its area counts.
+- The head and pinna around a protruding collector.
+- The open neck between the seat floor and the canal opening.
+  The builder reports its height as `seat_floor_mm` (3 to 5.5 mm on the template ear), and with a stem the bore runs through it.
+  Adding that length to the default earpiece lowers its modelled gain by about 1.8 dB at 2 to 4 kHz and raises it by 1 dB at 1 to 2 kHz.
+  Designs with no stem are not affected.
+- The removal tab, and any leak around the seat, which is treated as sealed.
+
+One more difference between the families:
+The spiral family's insertion gain is relative to an average concha resonance, as before, and the earpiece's is relative to this ear's concha.
+On the earpieces tried here the two references differ by up to 0.9 dB per band.
+
+What the model says about the earpiece on the template ear, with the example sloping loss (15, 20, 30, 45, 55, 55 dB HL):
+These are model outputs from built designs, not measurements on a printed device.
+Each cell is `haspi_v2_mean`, with the difference from the unaided control in brackets.
+The selection rule tolerates a shortfall of 0.02 in a scenario.
+
+| Design (throat, mouth, stem, collector) | Clean 50 | Clean 65 | Clean 80 | Babble 50 | Babble 65 | Babble 80 | Mean |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Unaided control | 0.571 | 0.776 | 0.988 | 0.348 | 0.576 | 0.735 | 0.666 |
+| Builder defaults (27, 150, 5 mm, none) | 0.614 (+0.044) | 0.783 (+0.007) | 0.934 (-0.054) | 0.358 (+0.009) | 0.589 (+0.013) | 0.679 (-0.056) | 0.660 |
+| Wide throat (60, 150, 0, none) | 0.573 (+0.002) | 0.778 (+0.002) | 0.979 (-0.009) | 0.349 (+0.001) | 0.580 (+0.003) | 0.698 (-0.036) | 0.659 |
+| Largest faceplate mouth (60, 304.7, 0, none) | 0.567 (-0.003) | 0.775 (-0.001) | 0.981 (-0.007) | 0.346 (-0.002) | 0.568 (-0.008) | 0.700 (-0.035) | 0.656 |
+| Collector 450 mm^2 at 10 mm (60, 300, 0) | 0.586 (+0.016) | 0.785 (+0.008) | 0.990 (+0.002) | 0.354 (+0.006) | 0.600 (+0.024) | 0.741 (+0.006) | 0.676 |
+| Collector 700 mm^2 at 15 mm (60, 300, 0) | 0.600 (+0.030) | 0.795 (+0.019) | 0.992 (+0.004) | 0.361 (+0.012) | 0.611 (+0.034) | 0.750 (+0.015) | 0.685 |
+| Collector 450 mm^2 at 12 mm, with a stem (27, 150, 5 mm) | 0.646 (+0.075) | 0.789 (+0.012) | 0.971 (-0.017) | 0.368 (+0.020) | 0.606 (+0.030) | 0.704 (-0.031) | 0.681 |
+| Coiled aid for reference (throat 20, mouth 150, no vent) | 0.683 (+0.112) | 0.781 (+0.005) | 0.879 (-0.109) | 0.371 (+0.023) | 0.573 (-0.003) | 0.672 (-0.063) | 0.660 |
+
+Without a collector each earpiece tried falls more than 0.02 below the control for speech in babble at 80 dB SPL, as the coiled aid in the last row does.
+The two designs with a wide throat, no stem, and a collector stay at or above the control in all six scenarios, so the selection rule can pick one.
+Their margin is small: 0.002 to 0.034 per scenario, and 0.010 and 0.019 on the mean, against a resolution of 0.02.
+Their modelled insertion gain stays between -0.3 and +2.3 dB of the open ear in every band (+0.6 and +2.3 dB at 2 to 4 kHz, -0.3 dB at 4 to 8 kHz), where the designs without a collector sit 2 to 6 dB below it above 2 kHz.
+They stand 11.1 and 16.1 mm out past the concha rim, against 5.9 mm for a flush earpiece with its removal tab and 2.3 mm for a coiled aid.
+The result does not hinge on the canal setting above: with the whole canal read as sample plus 6 mm, or left at the profile door's default, both designs stay within 0.02 of the control in every scenario (worst case -0.010).
+A 304.7 mm^2 mouth on a 27 mm^2 throat with a stem, and a 450 mm^2 mouth with no collector, came back as failed cases with the builder's `bore_wall` and `mouth_fit` reasons.
 
 ### The development fixture
 
@@ -414,6 +517,7 @@ Tests drive the real workflow with a scripted stand-in model and offline sources
 | A design that is worse than the control in any scenario cannot win | `test_a_design_that_loses_to_the_control_in_one_scenario_cannot_win`, `test_nothing_is_selected_when_every_design_loses_somewhere`, `test_reporting.py` |
 | Reported numbers are the evaluator's numbers | `test_reported_numbers_are_the_evaluators_numbers`, `test_per_scenario_numbers_in_the_report_are_the_evaluators_numbers` |
 | The real evaluator never fills in a threshold, builds each design once, and reports a misfit as a failure | `test_hornsim_evaluator.py` |
+| Both device families can share one plan, an earpiece the builder rejects is a failed case with its reasons, and a selected earpiece carries the names the final step locks | `test_a_plan_with_candidates_from_both_families_is_valid`, `test_an_earpiece_the_builder_rejects_is_a_failed_case_with_its_reasons`, `test_a_study_with_both_families_completes_and_can_select_an_earpiece` |
 | No path from results back to planning or evaluation | `test_nothing_leads_from_results_back_to_planning_or_evaluation` |
 | A follow-up runs nothing until requested, and keeps the parent record | `test_a_suggested_follow_up_causes_no_evaluation_until_requested`, `test_a_follow_up_is_a_new_study_and_the_parent_record_is_kept` |
 | The trace shows branches, planning, evaluation attempts, and the report | `test_the_trace_exposes_branches_planning_evaluation_and_report` |

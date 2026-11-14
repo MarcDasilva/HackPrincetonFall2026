@@ -274,6 +274,13 @@ def capsules(points, r):
     return trimesh.boolean.union(parts, engine="manifold")
 
 
+def profile_stations(along):
+    """Stations reported in area_profile_mm2: the throat, the first station past each whole
+    millimetre, and ALWAYS the outer end. Without the end the profile stopped up to 1 mm short of the
+    mouth (a 304 mm2 mouth was reported as 252), and the acoustic model scored a smaller horn."""
+    return np.unique(np.r_[0, np.nonzero(np.diff(np.floor(along)))[0] + 1, len(along) - 1])
+
+
 def _reason(check, message, dial=None, direction=None, **values):
     r = {"check": check, "message": message, **values}
     if dial:
@@ -515,7 +522,7 @@ def build(context_dir, out_dir, params, design_id="e1", log=print):
     render_preview(mesh, solid, c, n, up, left, os.path.join(out, "preview.png"))
     # area along the bore from the throat, ~1 mm apart: what the acoustic model (spec 07) consumes
     along = arc[i0:i_end + 1] - arc[i0]
-    pick = np.r_[0, np.nonzero(np.diff(np.floor(along)))[0] + 1]
+    pick = profile_stations(along)
     area = np.pi * np.mean(R[i0:i_end + 1] ** 2, axis=1)
 
     k = slice(None, None, 8)
