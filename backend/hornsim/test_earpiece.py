@@ -7,7 +7,7 @@ import math
 import numpy as np
 
 from .aid import frames
-from .earpiece import SEG, inside_sweep, mouth_outline, ring_radii, section_on_grid, validate
+from .earpiece import SEG, inside_sweep, mouth_outline, profile_stations, ring_radii, section_on_grid, validate
 
 GRID = np.linspace(-np.pi, np.pi, 256, endpoint=False)
 KIDNEY = 1 + 0.25 * np.cos(2 * GRID) + 0.1 * np.sin(3 * GRID)          # a kidney-shaped opening
@@ -61,10 +61,21 @@ def test_inside_sweep_only_counts_what_the_tube_encloses():
     assert inside_sweep(q, path, R, frames(path), 0, 41).tolist() == [True, False, False, False, False]
 
 
+def test_the_area_profile_always_reaches_the_outer_end():
+    """The acoustic model radiates from the LAST area it is given. A profile sampled only at whole
+    millimetres dropped the end of an 8.9 mm bore, so a 304 mm2 mouth was scored as 252."""
+    along = np.array([0.0, 0.5, 1.1, 1.6, 2.1, 7.6, 8.0, 8.4, 8.9])
+    assert along[profile_stations(along)].tolist() == [0.0, 1.1, 2.1, 7.6, 8.0, 8.9]
+    # an end that is itself the first station past a whole millimetre is not reported twice
+    along = np.array([0.0, 0.6, 1.2, 1.8, 2.4, 3.1])
+    assert along[profile_stations(along)].tolist() == [0.0, 1.2, 2.4, 3.1]
+
+
 if __name__ == "__main__":
     test_shaping_never_changes_the_mouth_area()
     test_the_mouth_never_crosses_the_concha_opening()
     test_bad_dials_are_all_reported_at_once()
     test_a_section_front_faces_the_face_on_both_ears()
     test_inside_sweep_only_counts_what_the_tube_encloses()
+    test_the_area_profile_always_reaches_the_outer_end()
     print("ok")
