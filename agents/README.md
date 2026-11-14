@@ -368,7 +368,10 @@ Asset files are passed as references, never as content.
 ## Research sources
 
 Search queries go to OpenAlex and Europe PMC.
-Sources are fetched over HTTP, and PubMed records are read through NCBI E-utilities.
+Sources are fetched over HTTP.
+PubMed records and PubMed Central articles are read through NCBI E-utilities, because those sites answer automated page requests with a browser check.
+E-utilities calls from all investigators share one pace of two per second, under the three per second NCBI allows without an API key, and a rate-limit answer is waited out and tried once more.
+When the API has no full text for an article, the reader tries the article page, and after that the abstract from the search result.
 No key is required.
 OpenAlex without a key shares a small daily allowance per network, so set `OPENALEX_API_KEY` at an event.
 Investigators are told to keep user data out of queries.
