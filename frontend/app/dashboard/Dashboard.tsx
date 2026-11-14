@@ -6,6 +6,13 @@ import Dock from "@/components/Dock";
 import Orb from "@/components/Orb";
 import gsap from "gsap";
 import { supabase } from "@/lib/supabase";
+import { classifyPhoto, earReadyForSim, fitHead, KIND_LABEL, patientStatus, uploadEar, type PhotoKind } from "./intake";
+
+/** auto: the label came from the photo (face found / nose direction), not from upload order. box: where the ear is. */
+type Attachment = { id: string; blob: Blob; url: string; kind: PhotoKind; mirror: boolean; auto: boolean; box?: [number, number, number, number] };
+type Msg = { id: string; text: string; link?: { href: string; label: string }; tone?: "error" };
+let seq = 0;
+const nid = () => `a${++seq}`;
 
 // Same chrome ramp as the "Auris" title on the splash (app/page.tsx). Gradient ids are document-global, so each icon gets its OWN id — a shared one breaks when the first icon unmounts.
 const svg = (id: string, d: string[]) => (
@@ -119,10 +126,24 @@ export default function Dashboard() {
       window.removeEventListener("pointerdown", onDown);
     };
   }, [profileAt]);
-  // Capture Ear: camOn mounts the feed panel; photo is the still taken from it (null while live). ponytail: the photo only lives in state until the backend upload (POST /api/patients) is wired.
+  // Capture Ear: camOn mounts the feed panel; each still taken from it becomes a chat attachment.
   const [camOn, setCamOn] = useState(false);
   const [camErr, setCamErr] = useState<string | null>(null);
-  const [photo, setPhoto] = useState<{ blob: Blob; url: string } | null>(null);
+  // Chat attachments: camera stills and picked files, each labelled left ear / right ear / front face.
+  const [photos, setPhotos] = useState<Attachment[]>([]);
+  const fileInput = useRef<HTMLInputElement>(null);
+  // What the chat has set up for /sim so far: a patient id per ear and a head shape id.
+  const [msgs, setMsgs] = useState<Msg[]>([]);
+  const [intake, setIntake] = useState<{ left?: string; right?: string; head?: string; ready: Record<string, boolean> }>({ ready: {} });
+  const say = (m: Omit<Msg, "id"> & { id?: string }) => setMsgs((ms) => {
+    const id = m.id ?? nid();
+    const i = ms.findIndex((x) => x.id === id);
+    const next = { ...m, id } as Msg;
+    return i < 0 ? [...ms, next] : ms.map((x, k) => (k === i ? next : x));
+  });
+  const polls = useRef<number[]>([]);
+  const moving = useRef(false);   // navigating to /sim (once)
+  useEffect(() => () => polls.current.forEach((t) => window.clearInterval(t)), []);
   // Software zoom (CSS scale on the feed, same crop baked into the snapshot) — most webcams expose no hardware zoom constraint. ponytail: use track.applyConstraints({zoom}) where supported if quality matters.
   const [zoom, setZoom] = useState(1);
   const camPanel = useRef<HTMLDivElement>(null);
@@ -178,14 +199,94 @@ export default function Dashboard() {
       setCamErr("Camera unavailable");
       return;
     }
-    if (photo) URL.revokeObjectURL(photo.url);
-    setPhoto(null);
     setZoom(1);
     setCamOn(true);
   };
-  const clearPhoto = () => {
-    if (photo) URL.revokeObjectURL(photo.url);
-    setPhoto(null);
+  /** Add photos as attachments, labelled from the photo itself: a face looking at the camera is the front
+   * photo; an ear photo's side comes from which way the nose points. Only when no face is found at all
+   * does the label fall back to whichever ear is still missing (marked so you check it). */
+  const addPhotos = async (items: { blob: Blob; mirror: boolean }[]) => {
+    for (const it of items) {
+      const c = await classifyPhoto(it.blob).catch(() => ({ kind: "ear" as const, ear: null }));
+      setPhotos((ps) => {
+        const have = new Set([...ps.map((p) => p.kind), ...(intake.left ? ["left"] : []), ...(intake.right ? ["right"] : []), ...(intake.head ? ["face"] : [])]);
+        const base = { id: nid(), blob: it.blob, url: URL.createObjectURL(it.blob), mirror: it.mirror };
+        if (c.kind === "face") return [...ps, { ...base, kind: "face", auto: true }];
+        if (c.ear) return [...ps, { ...base, kind: c.ear.side, auto: true, box: c.ear.box }];
+        const k: PhotoKind = !have.has("right") ? "right" : !have.has("left") ? "left" : "right";
+        return [...ps, { ...base, kind: k, auto: false }];
+      });
+    }
+  };
+  const removePhoto = (id: string) => setPhotos((ps) => {
+    const p = ps.find((x) => x.id === id);
+    if (p) URL.revokeObjectURL(p.url);
+    return ps.filter((x) => x.id !== id);
+  });
+  const setKind = (id: string, kind: PhotoKind) => setPhotos((ps) => ps.map((p) => (p.id === id ? { ...p, kind, auto: false } : p)));
+
+  /** Send: each ear starts the ear pipeline, the front face becomes a head shape; once both ears and the
+   * head are ready the chat links to /sim with all three. */
+  const submitPhotos = async (batch: Attachment[]) => {
+    const next = { ...intake, ready: { ...intake.ready } };
+    const tryLink = (s: typeof next) => {
+      if (s.left && s.right && s.head && s.ready[s.left] && s.ready[s.right] && !moving.current) {
+        const href = `/sim?left=${s.left}&right=${s.right}&head=${s.head}`;
+        moving.current = true;
+        say({ id: "link", text: "Both ears and the head are ready. Opening the scene simulation…", link: { href, label: "Open it now" } });
+        window.setTimeout(() => window.location.assign(href), 1500);   // a beat to read the message
+      }
+    };
+    for (const p of batch) {
+      if (p.kind === "face") {
+        const id = nid();
+        say({ id, text: "Front face: finding landmarks and fitting the head shape…" });
+        try {
+          const fit = await fitHead(p.blob);
+          next.head = fit.id;
+          say({ id, text: `Front face: head ${fit.meta.breadth_mm.toFixed(0)} mm wide, chin to crown ${(fit.meta.crown_mm - fit.meta.chin_mm).toFixed(0)} mm.${fit.warnings.length ? " " + fit.warnings.join(" ") : ""}` });
+        } catch (e) {
+          say({ id, text: `Front face: ${(e as Error).message}`, tone: "error" });
+        }
+      } else {
+        const side = p.kind;
+        const id = nid();
+        say({ id, text: `${KIND_LABEL[side]}: uploading…` });
+        try {
+          const pid = await uploadEar(p.blob, side, p.box);
+          next[side] = pid;
+          say({ id, text: `${KIND_LABEL[side]}: reconstructing the ear (patient ${pid}, about 2–3 minutes; ears queue one at a time)…` });
+          const t = window.setInterval(async () => {
+            try {
+              const j = await patientStatus(pid);
+              const sc = j.results?.side_check;
+              const doubt = sc && !sc.agrees ? ` Note: the ear's shape fits a ${sc.side} ear better; if this photo is mirrored, re-send it labelled ${KIND_LABEL[sc.side as PhotoKind] ?? sc.side}.` : "";
+              if (earReadyForSim(j)) {
+                window.clearInterval(t);
+                say({ id, text: `${KIND_LABEL[side]}: ear reconstructed and fitted (patient ${pid}).${doubt}` });
+                setIntake((s) => { const u = { ...s, ready: { ...s.ready, [pid]: true } }; tryLink(u); return u; });
+              } else if (j.status === "error") {
+                window.clearInterval(t);
+                say({ id, text: `${KIND_LABEL[side]}: ${j.error ?? "the ear pipeline failed"}. Retake with the ear filling most of the frame.`, tone: "error" });
+              } else {
+                say({ id, text: `${KIND_LABEL[side]}: ${j.status === "queued" ? "waiting for the other ear" : `step ${j.step ?? "…"}`} (patient ${pid})…` });
+              }
+            } catch { /* transient: keep polling */ }
+          }, 3000);
+          polls.current.push(t);
+        } catch (e) {
+          say({ id, text: `${KIND_LABEL[side]}: ${(e as Error).message}`, tone: "error" });
+        }
+      }
+    }
+    setIntake((s) => {
+      const u = { ...s, left: next.left ?? s.left, right: next.right ?? s.right, head: next.head ?? s.head, ready: { ...next.ready, ...s.ready } };
+      const missing = [!u.left && "left ear", !u.right && "right ear", !u.head && "front face"].filter(Boolean);
+      if (missing.length) say({ id: "todo", text: `Still needed for the simulation: ${missing.join(", ")} photo${missing.length > 1 ? "s" : ""}.` });
+      else setMsgs((ms) => ms.filter((m) => m.id !== "todo"));
+      tryLink(u);
+      return u;
+    });
   };
   const closeCam = () => {
     gsap.to(camPanel.current, { height: 0, marginBottom: 0, borderWidth: 0, duration: 0.45, ease: "power2.in", onComplete: () => { stopStream(); setCamOn(false); } });
@@ -206,7 +307,7 @@ export default function Dashboard() {
     c.toBlob((blob) => {
       if (!blob) return;
       stopStream();
-      setPhoto({ blob, url: URL.createObjectURL(blob) });
+      addPhotos([{ blob, mirror: true }]);
       // The still becomes a chat attachment (chip in the composer), so the panel retracts instead of lingering over it.
       closeCam();
     }, "image/jpeg", 0.92);
@@ -227,7 +328,7 @@ export default function Dashboard() {
 
   return (
     <>
-    {/* ponytail: no backend yet, so send only clears the box; plus is inert. Width 600 approximates the dock's resting width — retune if the dock changes. */}
+    {/* Send uploads attached photos (left ear, right ear, front face) and links to /sim once ready; text alone has no backend yet. Width 600 approximates the dock's resting width — retune if the dock changes. */}
     <div ref={chat} style={{ position: "fixed", top: "50%", left: "50%", transform: "translate(-50%, -50%)", width: 600, maxWidth: "calc(100vw - 32px)", zIndex: 10 }}>
     {/* Orb draws at full resolution (components/Orb.tsx), so size is plain pixels. zIndex -1 sits behind the card and bar inside this wrapper's stacking context. The inner div carries the post-send y/scale tween, so GSAP NEVER rewrites the centering translate on the outer one. */}
     <div aria-hidden style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)", zIndex: -1, pointerEvents: "none" }}>
@@ -248,11 +349,10 @@ export default function Dashboard() {
         <div ref={camPanel} style={{ width: "100%", overflow: "hidden", borderRadius: 24, border: "2px solid transparent", background: `linear-gradient(#000, #000) padding-box, ${SILVER} border-box` }}>
           <div ref={camInner} style={{ position: "relative", height: "max(180px, min(340px, calc(100vh - 420px)))" }}>
             <video ref={camVideo} muted playsInline style={{ width: "100%", height: "100%", objectFit: "cover", display: "block", transform: `scaleX(-1) scale(${zoom})` }} />
-            {photo && <img src={photo.url} alt="Captured ear" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", transform: "scaleX(-1)" }} />}
             <button type="button" aria-label="Close camera" onClick={closeCam} style={{ position: "absolute", top: 12, right: 12, width: 32, height: 32, borderRadius: 999, border: 0, background: "rgba(0,0,0,0.55)", color: "#e6e8eb", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
               <svg viewBox="0 0 24 24" {...icon}><path d="M6 6l12 12M18 6 6 18" /></svg>
             </button>
-            {!photo && (
+            {(
               <div style={{ position: "absolute", bottom: 16, left: 0, right: 0, display: "flex", flexDirection: "column", alignItems: "center", gap: 10 }}>
                 <span style={{ padding: "3px 10px", borderRadius: 999, background: "rgba(0,0,0,0.55)", color: "#e6e8eb", fontSize: 13, fontVariantNumeric: "tabular-nums" }}>{zoom.toFixed(1)}×</span>
                 <div style={{ display: "flex", alignItems: "center", gap: 28 }}>
@@ -277,26 +377,49 @@ export default function Dashboard() {
       onSubmit={(e) => {
         e.preventDefault();
         const ta = e.currentTarget.elements.namedItem("msg") as HTMLTextAreaElement;
-        if (ta.value.trim() || photo) {
+        if (ta.value.trim() || photos.length) {
           ta.value = "";
           setSent(true);
         }
-        clearPhoto();
+        const batch = photos;
+        setPhotos([]);
+        if (batch.length) submitPhotos(batch).finally(() => batch.forEach((p) => URL.revokeObjectURL(p.url)));
       }}
       style={{ boxSizing: "border-box", width: "100%", padding: 14, borderRadius: 24, background: "#000" }}
     >
-      {photo && (
-        <div data-testid="attachment" style={{ position: "relative", width: 64, height: 64, margin: "0 6px 8px" }}>
-          <img src={photo.url} alt="Captured ear attachment" style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: 12, transform: "scaleX(-1)" }} />
-          <button type="button" aria-label="Remove attachment" onClick={clearPhoto} style={{ position: "absolute", top: -6, right: -6, width: 20, height: 20, padding: 0, borderRadius: 999, border: 0, background: "#3b3d42", color: "#e6e8eb", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
-          </button>
+      {msgs.length > 0 && (
+        <div data-testid="chat-log" style={{ maxHeight: 180, overflowY: "auto", display: "flex", flexDirection: "column", gap: 6, margin: "0 6px 10px", fontSize: 14, lineHeight: 1.4 }}>
+          {msgs.map((m) => (
+            <div key={m.id} style={{ color: m.tone === "error" ? "#f87171" : "#c9ccd1" }}>
+              {m.text}
+              {m.link && <> <a href={m.link.href} style={{ color: "#60a5fa" }}>{m.link.label} →</a></>}
+            </div>
+          ))}
+        </div>
+      )}
+      {photos.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 10, margin: "0 6px 8px" }}>
+          {photos.map((p) => (
+            <div key={p.id} data-testid="attachment" style={{ display: "flex", flexDirection: "column", gap: 4, width: 76 }}>
+              <div style={{ position: "relative", width: 76, height: 76 }}>
+                <img src={p.url} alt={`${KIND_LABEL[p.kind]} attachment`} style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: 12, transform: p.mirror ? "scaleX(-1)" : undefined }} />
+                <button type="button" aria-label="Remove attachment" onClick={() => removePhoto(p.id)} style={{ position: "absolute", top: -6, right: -6, width: 20, height: 20, padding: 0, borderRadius: 999, border: 0, background: "#3b3d42", color: "#e6e8eb", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
+                </button>
+              </div>
+              <select aria-label="What this photo shows" value={p.kind} onChange={(e) => setKind(p.id, e.target.value as PhotoKind)}
+                title={p.auto ? "Detected from the photo; change it if wrong" : "Could not tell from the photo: check this"}
+                style={{ width: "100%", background: "#16171a", color: p.auto ? "#c9ccd1" : "#fbbf24", border: `1px solid ${p.auto ? "rgba(255,255,255,0.18)" : "#fbbf24"}`, borderRadius: 6, fontSize: 11, padding: "2px 2px" }}>
+                {(Object.keys(KIND_LABEL) as PhotoKind[]).map((k) => <option key={k} value={k}>{KIND_LABEL[k]}</option>)}
+              </select>
+            </div>
+          ))}
         </div>
       )}
       <textarea
         name="msg"
         rows={2}
-        placeholder="How can I help you today?"
+        placeholder="How can I help you today? Add photos of each ear and your face with +"
         onKeyDown={(e) => {
           if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault();
@@ -306,9 +429,14 @@ export default function Dashboard() {
         style={{ display: "block", width: "100%", boxSizing: "border-box", resize: "none", border: 0, outline: 0, background: "transparent", color: "#e6e8eb", font: "inherit", fontSize: 16, padding: "4px 6px" }}
       />
       <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8 }}>
-        <button type="button" aria-label="Add" style={{ ...iconBtn, border: "1px solid rgba(255,255,255,0.18)", background: "transparent", color: "#c9ccd1" }}>
+        <button type="button" aria-label="Add photos" title="Add photos: left ear, right ear, front face" onClick={() => fileInput.current?.click()} style={{ ...iconBtn, border: "1px solid rgba(255,255,255,0.18)", background: "transparent", color: "#c9ccd1" }}>
           <svg viewBox="0 0 24 24" {...icon}><path d="M12 5v14M5 12h14" /></svg>
         </button>
+        <input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={(e) => {
+          const fs = Array.from(e.target.files ?? []);
+          e.target.value = "";
+          addPhotos(fs.map((blob) => ({ blob, mirror: false })));
+        }} />
         <button type="submit" aria-label="Send" style={{ ...iconBtn, border: 0, background: "#3b82f6", color: "#fff" }}>
           <svg viewBox="0 0 24 24" {...icon}><path d="M12 19V5M5 12l7-7 7 7" /></svg>
         </button>

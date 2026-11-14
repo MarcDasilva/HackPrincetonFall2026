@@ -1,32 +1,37 @@
-"""API for the frontend's live scene grid (/sim): the patient's ear as a coarse wave grid, and an
-earpiece designed from the grid's scenes (hornsim.scene_design).
+"""API for the frontend's live scene grid (/sim): BOTH of the patient's ears on a dummy head as one
+coarse wave grid (hornsim.head_grid), and per ear an earpiece designed from the grid's scenes
+(hornsim.scene_design). Each ear is its own patient record (one photo, one side, one audiogram).
 
-    GET  /api/sim/patients/{pid}/grid                       ear grid + side + audiogram
+    POST /api/sim/head_shapes                               face landmarks of a front photo -> fitted head shape
+    GET  /api/sim/head?left={pid}&right={pid}[&shape={sid}] head grid + both patients' side and audiogram
     POST /api/sim/patients/{pid}/design                     {audiogram_db_hl, scenes} -> 202
     GET  /api/sim/patients/{pid}/design                     status, log, result
     GET  /api/sim/patients/{pid}/design/files/{did}/{name}  earpiece mesh / print / preview
     POST /api/sim/patients/{pid}/design/wave_check          3D wave sim of the current design -> 202
     GET  /api/sim/patients/{pid}/design/wave_check          status, result (hornsim.aided_wave)
 
-`000000000000` is the average ear (AudioEar's mean, not anyone's ear): created on first use so the
-grid works before any photo has been uploaded.
+`000000000000` / `000000000001` are the average ear (AudioEar's mean, not anyone's ear) as a right
+and as a mirrored left ear: created on first use so the grid works before any photo is uploaded.
 """
 import json
 import os
 import re
+import secrets
 import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from . import jobs
+from .settings import settings
 
 router = APIRouter(prefix="/api/sim")
-AVERAGE_ID = "000000000000"
+AVERAGE_IDS = {"right": "000000000000", "left": "000000000001"}
+AVERAGE_SIDE = {v: k for k, v in AVERAGE_IDS.items()}
 ID_RE = re.compile(r"^[a-f0-9]{12}$")
 DESIGN_RE = re.compile(r"^grid\d{1,2}$")
 DESIGN_FILES = {"earpiece_in_ear.glb": "model/gltf-binary", "earpiece.glb": "model/gltf-binary",
@@ -38,24 +43,28 @@ _pool = ThreadPoolExecutor(max_workers=1)      # designs queue behind each other
 _lock = threading.Lock()
 
 
-def _ensure_average():
-    """Average-ear patient: mesh, a context.json carrying only the config, and the canal samples."""
-    d = jobs.patient_dir(AVERAGE_ID)
+def _ensure_average(pid):
+    """Average-ear patient for one side: mesh (mirrored for the left, as earrecon mirrors a left
+    reconstruction), a context.json carrying only the config, and the canal samples."""
+    d = jobs.patient_dir(pid)
     if os.path.exists(os.path.join(d, "context", "canals.json")):
         return
     import numpy as np
     from scipy.stats import qmc
     from earrecon.reconstruct import LANDMARKS_XLSX, mean_ear
     from hornsim.context import load_defaults
+    from hornsim.head_grid import mirrored_mean_ear
+    side = AVERAGE_SIDE[pid]
     with _lock:
         if os.path.exists(os.path.join(d, "context", "canals.json")):
             return
         os.makedirs(os.path.join(d, "context"), exist_ok=True)
         cfg = load_defaults()
-        cfg["patient"].update({"id": AVERAGE_ID, "ear_mesh": mean_ear(os.path.join(d, "ear")), "side": "right"})
+        mesh = mean_ear(os.path.join(d, "ear")) if side == "right" else mirrored_mean_ear(os.path.join(d, "ear"))
+        cfg["patient"].update({"id": pid, "ear_mesh": mesh, "side": side})
         cfg["ear_world"]["landmarks_xlsx"] = LANDMARKS_XLSX
         json.dump({"patient": cfg["patient"], "config": cfg,
-                   "notes": ["Average ear (AudioEar mean): NOT anyone's ear. Config only, for the scene grid."]},
+                   "notes": [f"Average ear (AudioEar mean) as a {side} ear: NOT anyone's ear. Config only, for the scene grid."]},
                   open(os.path.join(d, "context", "context.json"), "w"), indent=1)
         C, E = cfg["canal"], cfg["ear_world"]      # same Latin hypercube as hornsim.context step 2
         lo, hi = C["residual_volume_cc"]
@@ -65,14 +74,14 @@ def _ensure_average():
                    "length_mm": round(float((lo + (hi - lo) * x) / area_cm2 * 10), 2)} for i, x in enumerate(u)]
         json.dump({"assumed_diameter_mm": E["canal_opening_diameter_mm"], "canals": canals},
                   open(os.path.join(d, "context", "canals.json"), "w"), indent=1)
-        jobs.write_job(AVERAGE_ID, {"id": AVERAGE_ID, "status": "done", "average_ear": True, "results": {},
-                                    "request": {"side": "right", "audiogram_db_hl": EXAMPLE_AUDIOGRAM,
-                                                "audiogram_is_example": True}})
+        jobs.write_job(pid, {"id": pid, "status": "done", "average_ear": True, "results": {},
+                             "request": {"side": side, "audiogram_db_hl": EXAMPLE_AUDIOGRAM,
+                                         "audiogram_is_example": True}})
 
 
 def _patient(pid):
-    if pid == AVERAGE_ID:
-        _ensure_average()
+    if pid in AVERAGE_SIDE:
+        _ensure_average(pid)
     if not ID_RE.match(pid) or jobs.read_job(pid) is None:
         raise HTTPException(404, "patient not found")
     d = jobs.patient_dir(pid)
@@ -81,21 +90,74 @@ def _patient(pid):
     return d, jobs.read_job(pid)
 
 
-@router.get("/patients/{pid}/grid")
-def get_grid(pid: str):
-    d, job = _patient(pid)
+def _patient_info(pid, job):
     req = job.get("request", {})
-    out = os.path.join(d, "scene_design", "ear_grid.json")
-    if not os.path.exists(out):
-        from hornsim import sim_grid
-        cfg = json.load(open(os.path.join(d, "context", "context.json")))["config"]
-        sim_grid.export(out, cfg["patient"]["ear_mesh"], left=req.get("side") == "left")
+    return {"id": pid, "average_ear": pid in AVERAGE_SIDE, "side": req.get("side", "right"),
+            "audiogram_db_hl": req.get("audiogram_db_hl", EXAMPLE_AUDIOGRAM),
+            "audiogram_is_example": bool(req.get("audiogram_is_example", True))}
+
+
+class HeadShapeRequest(BaseModel):
+    """MediaPipe face-landmarker output for one front photo. The photo stays in the browser."""
+    landmarks: list[list[float]] = Field(min_length=478, max_length=478)
+    image_w: int = Field(gt=0, le=20000)
+    image_h: int = Field(gt=0, le=20000)
+    yaw_deg: float | None = Field(None, ge=-90, le=90)
+
+
+def _shape_path(sid):
+    return os.path.join(settings.data_dir, "head_shapes", f"{sid}.json")
+
+
+@router.post("/head_shapes", status_code=201)
+def create_head_shape(body: HeadShapeRequest):
+    """Fit the head's shape from a front photo's face landmarks (hornsim.head_shape). Only the fitted
+    shape is stored, not the landmarks."""
+    from hornsim import head_shape
+    if any(len(p) < 2 for p in body.landmarks):
+        raise HTTPException(422, "each landmark needs x and y")
+    try:
+        shape, report = head_shape.fit(body.landmarks, body.image_w, body.image_h, body.yaw_deg)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    sid = secrets.token_hex(6)
+    os.makedirs(os.path.dirname(_shape_path(sid)), exist_ok=True)
+    json.dump({"id": sid, "shape": shape.to_json(), "warnings": report["warnings"], "created_at": time.time()},
+              open(_shape_path(sid), "w"))
+    return {"id": sid, "meta": report["meta"], "warnings": report["warnings"], "overlay": report["overlay"]}
+
+
+def _load_shape(sid):
+    from hornsim import head_shape
+    if not sid:
+        return None
+    if not ID_RE.match(sid) or not os.path.exists(_shape_path(sid)):
+        raise HTTPException(404, "head shape not found; take the front photo again")
+    return head_shape.HeadShape.from_json(json.load(open(_shape_path(sid)))["shape"])
+
+
+@router.get("/head")
+def get_head(left: str = Query(..., description="patient id of the LEFT ear scan"),
+             right: str = Query(..., description="patient id of the RIGHT ear scan"),
+             shape: str | None = Query(None, description="head shape id from POST /head_shapes; none = the average head")):
+    """Both ears on the dummy head. Each id must be a patient whose photo was taken of that side."""
+    from hornsim import head_grid
+    head = _load_shape(shape)
+    ears, info = {}, {}
+    for side, pid in (("left", left), ("right", right)):
+        d, job = _patient(pid)
+        info[side] = _patient_info(pid, job)
+        if info[side]["side"] != side:
+            raise HTTPException(422, f"patient {pid} is a {info[side]['side']} ear scan, not a {side} ear")
+        ears[side] = json.load(open(os.path.join(d, "context", "context.json")))["config"]["patient"]["ear_mesh"]
+    out = os.path.join(settings.data_dir, "heads", f"{left}_{right}_{shape or 'average'}", f"head_grid_v{head_grid.VERSION}.json")
+    sources = list(ears.values()) + ([_shape_path(shape)] if shape else [])
+    stale = not os.path.exists(out) or any(os.path.getmtime(m) > os.path.getmtime(out) for m in sources)
+    if stale:
+        with _lock:
+            head_grid.export(out, ears, head=head)
     grid = json.load(open(out))
-    grid["patient"] = {"id": pid, "average_ear": pid == AVERAGE_ID, "side": req.get("side", "right"),
-                       "audiogram_db_hl": req.get("audiogram_db_hl", EXAMPLE_AUDIOGRAM),
-                       "audiogram_is_example": bool(req.get("audiogram_is_example", True))}
-    if pid == AVERAGE_ID:
-        grid["ear"] = "average ear (AudioEar mean)"
+    grid["patients"] = info
     return grid
 
 
@@ -219,7 +281,7 @@ def start_wave_check(pid: str, body: WaveCheck):
     if st.get("status") != "done" or not did:
         raise HTTPException(409, "design an earpiece first")
     if any(not (0 <= a <= 180) for a in body.azimuths):
-        raise HTTPException(422, "azimuths must be 0-180 (the flat head plane cannot model the far side)")
+        raise HTTPException(422, "azimuths must be 0-180 relative to this ear (the 3D check's flat head plane cannot model the far side)")
     if os.path.exists(_wave_path(d)) and json.load(open(_wave_path(d))).get("status") in ("queued", "running"):
         raise HTTPException(409, "a wave check is already running for this patient")
     _write_wave(d, status="queued", design_id=did, log=[], error=None, result=None)

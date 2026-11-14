@@ -61,8 +61,22 @@
 .weight { display: flex; gap: 4px; align-items: center; color: var(--text-secondary); margin-left: auto; }
 .weight input { width: 46px; }
 
+.side {
+  position: sticky; top: 16px; align-self: start; max-height: calc(100vh - 32px);
+  display: flex; flex-direction: column; gap: 8px; min-width: 0;
+}
+.earTabs { display: flex; gap: 4px; padding: 3px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; }
+.earTab {
+  flex: 1; display: flex; justify-content: center; align-items: baseline; gap: 8px; padding: 6px 10px;
+  background: transparent; color: var(--text-secondary); border: 0; border-radius: 7px; cursor: pointer; font: 600 13px system-ui, sans-serif;
+}
+.earTab:hover { color: var(--text-primary); }
+.earTab[aria-selected="true"] { background: var(--surface-1); color: var(--text-primary); box-shadow: inset 0 0 0 1px var(--line); }
+.tabState { font: 400 11px system-ui, sans-serif; color: var(--text-muted); }
+.siiRow { display: flex; gap: 14px; flex-wrap: wrap; }
+.siiRow b { color: var(--text-primary); font-weight: 600; margin-right: 2px; }
 .panel {
-  position: sticky; top: 16px; align-self: start; max-height: calc(100vh - 32px); overflow: auto;
+  overflow: auto; min-height: 0;
   background: var(--surface-1); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
 }
 .panelHead { display: flex; justify-content: space-between; align-items: baseline; }
@@ -93,6 +107,7 @@
 .loading, .error { position: relative; z-index: 1; padding: 24px; color: #e6e8eb; }
 
 /* design */
+.patient { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .patient label { display: flex; gap: 6px; align-items: center; color: var(--text-secondary); }
 .patient input { background: var(--surface-2); color: var(--text-primary); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; font: 12px ui-monospace, monospace; }
 .legend { flex-wrap: wrap; }
@@ -130,3 +145,16 @@
 .keyMark { fill: none; stroke: var(--text-secondary); stroke-width: 1.2; }
 .designBar { flex-wrap: wrap; row-gap: 6px; }
 .designBar .btn { white-space: nowrap; padding: 5px 10px; }
+
+/* front photo -> head shape */
+.gate { position: relative; z-index: 1; max-width: 560px; margin: 40px auto; padding: 0 16px; }
+.headPhoto {
+  background: var(--surface-1, #1a1a19); border: 1px solid var(--line, #3a3a38); border-radius: 10px; padding: 14px 16px;
+  color: var(--text-primary, #f0efec); font: 13px/1.4 system-ui, sans-serif; max-width: 560px;
+  --surface-1: #1a1a19; --surface-2: #232322; --line: #3a3a38; --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #8f8e86;
+}
+.headPhoto h2 { font-size: 15px; margin: 0; font-weight: 600; }
+.headPhoto label.primary { cursor: pointer; }
+.photoWrap { position: relative; margin: 10px 0; border-radius: 8px; overflow: hidden; background: var(--surface-2); }
+.photoWrap img, .photoWrap canvas { display: block; width: 100%; height: auto; }
+.photoWrap canvas { position: absolute; inset: 0; height: 100%; }
