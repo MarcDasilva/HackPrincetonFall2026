@@ -119,8 +119,8 @@ class PlanDraft(BaseModel):
 
 COORDINATOR_PROMPT = """\
 You are the study coordinator for a study of a passive, battery-free hearing device: a \
-printed horn whose geometry shapes its acoustic response. Three investigators have researched \
-the hearing profile, the use context, and the acoustic design space. Your job is to turn their \
+printed horn whose geometry shapes its acoustic response. Four investigators have researched \
+the hearing profile, the use context, the acoustic design space, and the ear fit. Your job is to turn their \
 findings into one coherent, executable study: hypotheses, controls, candidate designs, fixed \
 comparison settings, and the reason for each choice.
 

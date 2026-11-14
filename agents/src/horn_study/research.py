@@ -1,4 +1,4 @@
-"""The three parallel research investigators.
+"""The four parallel research investigators.
 
 Each investigator is a Deep Agent with evidence tools only. It can search,
 read sources, and record findings whose quoted passage is verified against the
@@ -105,7 +105,25 @@ INVESTIGATORS: tuple[InvestigatorSpec, ...] = (
             "within the evaluator's bounds, and capability constraints"
         ),
     ),
+    InvestigatorSpec(
+        name="ear_fit_research",
+        title="ear-fit investigator",
+        finding_prefix="fit",
+        question=(
+            "Given this user's ear and activities, what shell shape, retention, and venting "
+            "will fit, stay in place, and stay comfortable?"
+        ),
+        covers="ear anatomy, fit, and retention",
+        required_output=(
+            "fit constraints from the supplied ear measurements, retention needs for the user's "
+            "activities, occlusion and venting tradeoffs, comfort limits, and fit-related "
+            "hypotheses expressed in terms the evaluator supports"
+        ),
+    ),
 )
+
+# Prompts state the investigator count in words; it comes from INVESTIGATORS so adding one cannot leave a stale count.
+_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
 
 _SYSTEM_PROMPT = """\
 You are the {title} for a study of a passive, battery-free hearing device: a printed horn \
@@ -115,8 +133,8 @@ study should test.
 
 Your question: {question}
 
-Two other investigators are working at the same time on {others}. Stay on your own question. \
-A coordinator will combine all three reports into one fixed experiment plan, so the most \
+{n_others} other investigators are working at the same time on {others}. Stay on your own question. \
+A coordinator will combine all {n_all} reports into one fixed experiment plan, so the most \
 useful thing you can give it is evidence it can act on: findings tied to sources, and \
 suggestions expressed in terms the evaluator supports.
 
@@ -571,7 +589,8 @@ async def run_investigator(
     tools = session.tools()
     allowed = frozenset({t.name for t in tools} | set(_FILE_TOOLS) | {InvestigatorOutput.__name__})
     model_calls = 3 * budget + MAX_FINDINGS_PER_INVESTIGATOR + 10
-    others = " and ".join(other.covers for other in INVESTIGATORS if other.name != spec.name)
+    covers = [other.covers for other in INVESTIGATORS if other.name != spec.name]
+    others = "; ".join(covers[:-1]) + "; and " + covers[-1] if len(covers) > 1 else covers[0]
 
     events.emit(
         "research.agent_started",
@@ -587,6 +606,8 @@ async def run_investigator(
                 title=spec.title,
                 question=spec.question,
                 others=others,
+                n_others=_WORDS[len(covers)].capitalize(),
+                n_all=_WORDS[len(INVESTIGATORS)],
                 budget=budget,
                 max_other=MAX_NON_SCHOLARLY_FINDINGS,
                 required_output=spec.required_output,

@@ -33,6 +33,7 @@ from horn_study.evaluator_adapter import DevelopmentFixtureEvaluator, TransientE
 from horn_study.events import ARTIFACT_NAMES, ArtifactStore, EventBus, StudyExists, read_events
 from horn_study.followup import follow_up_request
 from horn_study.intake import InputRejected
+from horn_study.research import INVESTIGATORS
 from horn_study.workflow import (
     NODE_EVALUATE,
     NODE_FREEZE,
@@ -122,20 +123,25 @@ async def test_invalid_input_is_rejected_before_anything_is_saved_or_evaluated(t
 # --------------------------------------------------------------------------
 
 
-async def test_three_research_branches_overlap_and_return_identifiable_evidence(tmp_path):
+async def test_all_research_branches_overlap_and_return_identifiable_evidence(tmp_path):
     harness = Harness(tmp_path)
     outcome = await run_study(make_request(), harness.deps)
     history = outcome.events.history
 
     started = [e.sequence for e in history if e.type == "research.agent_started"]
     finished = [e.sequence for e in history if e.type == "research.agent_completed"]
-    assert len(started) == len(finished) == 3
+    assert len(started) == len(finished) == len(INVESTIGATORS)
     assert max(started) < min(finished)
-    assert harness.research_model.log.max_active == 3
+    assert harness.research_model.log.max_active == len(INVESTIGATORS)
 
     research = load(outcome, "research.json")
     assert [b["investigator"] for b in research["branches"]] == list(RESEARCH_NODES)
-    assert {f["finding_id"] for f in research["findings"]} == {"hearing-F1", "context-F1", "design-F1"}
+    assert {f["finding_id"] for f in research["findings"]} == {
+        "hearing-F1",
+        "context-F1",
+        "design-F1",
+        "fit-F1",
+    }
     sources = {s["source_id"]: s for s in research["sources"]}
     for finding in research["findings"]:
         source = sources[finding["source_id"]]
@@ -184,9 +190,9 @@ async def test_the_report_states_how_much_of_the_evidence_is_scholarly(tmp_path)
     outcome = await run_study(make_request(), Harness(tmp_path, research=cites_documentation).deps)
     report = outcome.report
     assert report is not None
-    assert report.findings_by_source_tier == {"scholarly": 2, "technical_documentation": 1}
+    assert report.findings_by_source_tier == {"scholarly": 3, "technical_documentation": 1}
     assert any(
-        text.startswith("2 of 3 research findings rest on scholarly literature.")
+        text.startswith("3 of 4 research findings rest on scholarly literature.")
         for text in report.limitations
     )
     research = load(outcome, "research.json")
@@ -196,7 +202,7 @@ async def test_the_report_states_how_much_of_the_evidence_is_scholarly(tmp_path)
 
     all_scholarly = await run_study(make_request("all_papers"), Harness(tmp_path).deps)
     assert all_scholarly.report is not None
-    assert all_scholarly.report.findings_by_source_tier == {"scholarly": 3}
+    assert all_scholarly.report.findings_by_source_tier == {"scholarly": len(INVESTIGATORS)}
     assert not any("rest on scholarly literature" in text for text in all_scholarly.report.limitations)
 
 
@@ -236,7 +242,7 @@ async def test_an_investigator_cannot_reach_tools_outside_its_allowlist(tmp_path
     assert outcome.state is StudyState.COMPLETED
     assert set(refusals) == set(forbidden)
     assert all("not available to this investigator" in text for text in refusals.values())
-    assert len(load(outcome, "research.json")["findings"]) == 3
+    assert len(load(outcome, "research.json")["findings"]) == len(INVESTIGATORS)
 
 
 async def test_an_investigator_can_search_the_full_text_of_a_source_it_read(tmp_path):

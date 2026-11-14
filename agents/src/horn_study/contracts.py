@@ -403,7 +403,9 @@ class InputIssue(Contract):
 # Research
 # --------------------------------------------------------------------------
 
-InvestigatorName = Literal["hearing_research", "use_context_research", "acoustic_design_research"]
+InvestigatorName = Literal[
+    "hearing_research", "use_context_research", "acoustic_design_research", "ear_fit_research"
+]
 SourceTier = Literal["scholarly", "technical_documentation", "tertiary", "other"]
 
 
