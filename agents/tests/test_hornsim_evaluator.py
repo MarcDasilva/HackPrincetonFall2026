@@ -715,11 +715,16 @@ def hornsim_draft() -> dict[str, Any]:
         varied_parameter="mouth_mm2",
     )
     draft["candidates"] = [draft["candidates"][0], design("mouth22", 22.2), design("mouth40", 40.0)]
-    draft["scenario_ids"] = ["clean_speech_65_db_spl", "speech_in_babble_65_db_spl"]
+    draft["scenario_ids"] = [
+        "clean_speech_50_db_spl",
+        "clean_speech_65_db_spl",
+        "speech_in_babble_50_db_spl",
+        "speech_in_babble_65_db_spl",
+    ]
     draft["selection"] = {
         "primary_metric": "haspi_v2_mean",
         "reference_candidate_id": "unaided",
-        "tie_breaker_metrics": ["bore_length_mm"],
+        "tie_breaker_metrics": ["haspi_v2_worst_canal"],
         "constraints": [],
     }
     return draft
@@ -737,14 +742,16 @@ async def test_a_study_runs_end_to_end_on_the_hornsim_evaluator(tmp_path):
     assert outcome.state is StudyState.COMPLETED
     assert bridge.count("context") == 1
     assert bridge.count("build") == 2
-    assert bridge.count("score") == 6
+    assert bridge.count("score") == 12  # 3 candidates x 4 scenarios
     report = outcome.report
     assert report is not None
     assert report.result_kind == "real"
     assert report.evaluator_version == VERSION
-    assert report.experiments_completed == 6
-    # Same score for both designs, so the longer bore (the tie-breaker) decides.
-    assert report.selected_candidate_id == "mouth40"
+    assert report.experiments_completed == 12
+    # The stub scores both designs identically, and bore length is informational, so nothing in
+    # the plan can separate them: the study reports a tie instead of forcing a winner.
+    assert report.selected_candidate_id is None
+    assert report.selection.reason_code == "tie"
     saved = json.loads((outcome.directory / "experiment_results.json").read_text())
     assert all(record["outcome"] == "completed" for record in saved["records"])
     assert saved["records"][-1]["result"]["design"]["printable_solid_watertight"] is True

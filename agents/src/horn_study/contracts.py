@@ -229,7 +229,9 @@ class ScenarioSpec(ExternalContract):
 class MetricSpec(ExternalContract):
     name: str
     unit: str
-    direction: Literal["higher_is_better", "lower_is_better"]
+    # "informational" metrics are reported but have no preferred direction, so they cannot rank
+    # designs. They may still be used in a selection constraint or compared in a hypothesis.
+    direction: Literal["higher_is_better", "lower_is_better", "informational"]
     description: str = ""
     resolution: float = Field(
         default=0.0,

@@ -473,10 +473,24 @@ def build_plan(
         )
         return False
 
+    informational = {m.name for m in caps.metrics if m.direction == "informational"}
+
+    def check_rankable(name: str, where: str) -> bool:
+        if not check_metric(name, where):
+            return False
+        if name in informational:
+            errors.append(
+                f"{where}: metric '{name}' is informational and has no better or worse direction, "
+                "so it cannot rank designs. Use it only in a constraint or a hypothesis."
+            )
+            return False
+        return True
+
     selection = draft.selection
-    primary_ok = check_metric(selection.primary_metric, "selection.primary_metric")
+    primary_ok = check_rankable(selection.primary_metric, "selection.primary_metric")
     for name in selection.tie_breaker_metrics:
-        check_metric(name, "selection.tie_breaker_metrics")
+        check_rankable(name, "selection.tie_breaker_metrics")
+    constrained = {constraint.metric for constraint in selection.constraints}
     for constraint in selection.constraints:
         check_metric(constraint.metric, "selection.constraints")
     reference = by_id.get(selection.reference_candidate_id)
@@ -559,7 +573,11 @@ def build_plan(
             if outside:
                 errors.append(f"{where}: scenarios {outside} are not in the plan's scenario_ids.")
             for name in item.metric_names:
-                check_metric(name, where)
+                if check_metric(name, where) and name in informational and name not in constrained:
+                    errors.append(
+                        f"{where}: metric '{name}' is informational, so it shows a need is met only "
+                        "through a selection constraint on it. Add the constraint or mark the need 'untested'."
+                    )
         elif item.scenario_ids or item.metric_names:
             errors.append(f"{where}: an 'untested' need cannot list scenarios or metrics.")
         coverage.append(
@@ -593,6 +611,7 @@ def build_plan(
     assert primary_ok
     primary = caps.metric(selection.primary_metric)
     assert primary is not None
+    assert primary.direction != "informational"  # rejected above by check_rankable
 
     experiments = tuple(
         ExperimentSpec(

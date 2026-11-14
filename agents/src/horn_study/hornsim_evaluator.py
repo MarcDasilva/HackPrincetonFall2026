@@ -47,6 +47,24 @@ CANAL_CONFIG_ID = "sampled_canals"
 CALIBRATION_REF = "hornsim-reference-at-65-db-spl-v2"
 FIDELITY = "plane_wave_1d"
 HASPI_UNIT = "HASPI v2 (0-1)"
+# Smallest HASPI difference treated as meaningful when a design is compared with the unaided
+# control in one scenario. HASPI's seed-to-seed variation was measured at 0.002 or less; differences
+# of 0.01 to 0.02 are within the clip-to-clip scatter. This value is a judgment call for the
+# evaluator owner to confirm.
+HASPI_RESOLUTION = 0.02
+# A study must cover enough listening conditions that one noisy condition cannot decide it.
+MINIMUM_SCENARIOS = 4
+_PLANNING_NOTES = (
+    "Evaluations are cheap here: building a candidate's geometry and scoring one scenario each take "
+    "seconds. Use the budget to cover clean speech and speech in babble at every presentation level, "
+    "with a handful of candidates, in preference to many candidates in few scenarios.",
+    "A design is rejected if it scores below the unaided control in any scenario by more than the "
+    "metric's resolution, so a design that only helps soft speech and harms loud speech cannot be selected.",
+    "Where unaided speech is already at the HASPI ceiling a design can only tie, and a tie does not "
+    "disqualify it.",
+    "bore_length_mm is informational only. It is not a size, comfort, or quality measure and has no "
+    "preferred direction.",
+)
 
 DEFAULT_BRIDGE = Path(__file__).resolve().parents[2] / "bridges" / "hornsim_bridge.py"
 DEFAULT_TIMEOUT_SECONDS = 1800.0
@@ -342,6 +360,7 @@ def _metrics(described: Mapping[str, Any]) -> list[dict[str, Any]]:
             "name": "haspi_v2_mean",
             "unit": HASPI_UNIT,
             "direction": "higher_is_better",
+            "resolution": HASPI_RESOLUTION,
             "description": (
                 f"HASPI v2 speech intelligibility index with the listener's audiogram, averaged over "
                 f"{spread}, and over the scenario's clips. For the unaided control it is the score with "
@@ -352,6 +371,7 @@ def _metrics(described: Mapping[str, Any]) -> list[dict[str, Any]]:
             "name": "haspi_v2_worst_canal",
             "unit": HASPI_UNIT,
             "direction": "higher_is_better",
+            "resolution": HASPI_RESOLUTION,
             "description": (
                 "HASPI v2 for the sampled ear canal with the lowest score (each canal averaged over "
                 "the scenario's clips). Shows sensitivity to the unknown canal size."
@@ -361,6 +381,7 @@ def _metrics(described: Mapping[str, Any]) -> list[dict[str, Any]]:
             "name": "haspi_v2_improvement_over_unaided",
             "unit": HASPI_UNIT,
             "direction": "higher_is_better",
+            "resolution": HASPI_RESOLUTION,
             "description": (
                 "haspi_v2_mean minus the unaided score for the same clips and level, computed the "
                 "same way. Negative means the device makes speech less intelligible than no device."
@@ -384,7 +405,7 @@ def _metrics(described: Mapping[str, Any]) -> list[dict[str, Any]]:
         {
             "name": "bore_length_mm",
             "unit": "mm",
-            "direction": "higher_is_better",
+            "direction": "informational",
             "description": (
                 "Length of the bore that was actually routed in this ear, from design.json. It counts the "
                 "mouth riser and the run through the canal tip, so it can exceed max_path_mm, which limits "
@@ -460,6 +481,7 @@ def build_capabilities(described: Mapping[str, Any]) -> dict[str, Any]:
     fixed = {k: v for k, v in described["aid_defaults"].items() if k not in fields}
     required = [float(f) for f in described["haspi_frequencies_hz"]]
     canal = described["canal"]
+    scenarios = _scenarios(described)
     return {
         "evaluator_name": EVALUATOR_NAME,
         "evaluator_version": described["version"],
@@ -511,7 +533,12 @@ def build_capabilities(described: Mapping[str, Any]) -> dict[str, Any]:
             ),
         },
         "demo_profiles": [],
-        "scenarios": _scenarios(described),
+        "scenarios": scenarios,
+        "required_scenario_tags": [
+            tag for tag in ("quiet", "babble") if any(tag in sc["tags"] for sc in scenarios)
+        ],
+        "minimum_scenarios": min(MINIMUM_SCENARIOS, len(scenarios)),
+        "planning_notes": list(_PLANNING_NOTES),
         "metrics": _metrics(described),
         "canal_configurations": [
             {

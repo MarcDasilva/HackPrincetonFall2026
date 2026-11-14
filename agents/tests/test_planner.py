@@ -273,3 +273,41 @@ def test_freezing_stamps_a_hash_that_detects_any_change():
     assert tampered.plan_hash != tampered.compute_hash()
     with pytest.raises(ValueError, match="already frozen"):
         freeze_plan(frozen)
+
+
+def test_an_informational_metric_cannot_rank_designs_or_stand_for_a_need_without_a_limit():
+    length = next(m for m in CAPS.metrics if m.name == "fixture_device_length_mm")
+    neutral = CAPS.model_copy(
+        update={
+            "metrics": tuple(
+                m.model_copy(update={"direction": "informational"}) if m is length else m
+                for m in CAPS.metrics
+            )
+        }
+    )
+
+    def check_neutral(draft: dict):
+        return build_plan(
+            PlanDraft.model_validate(draft),
+            validate_request(parse_request(make_request()), neutral),
+            FINDINGS,
+            plan_version=1,
+        )
+
+    # valid_draft uses the length metric as a tie-breaker, which an informational metric cannot be.
+    plan, errors = check_neutral(valid_draft())
+    assert plan is None
+    assert any("is informational and has no better or worse direction" in e for e in errors)
+
+    constrained = valid_draft()
+    constrained["selection"]["tie_breaker_metrics"] = []
+    plan, errors = check_neutral(constrained)
+    assert errors == []
+    assert plan is not None
+
+    unconstrained = valid_draft()
+    unconstrained["selection"]["tie_breaker_metrics"] = []
+    unconstrained["selection"]["constraints"] = []
+    plan, errors = check_neutral(unconstrained)
+    assert plan is None
+    assert any("only through a selection constraint" in e for e in errors)
