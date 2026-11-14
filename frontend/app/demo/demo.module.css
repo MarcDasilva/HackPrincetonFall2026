@@ -1,0 +1,161 @@
+/* Dark Auris chrome (the root layout's backdrop shows through); figures sit on light plates like the wave viewer, so RdBu and viridis read the SAME as there. */
+.page {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+  color: #e6e8eb;
+  padding: 20px 32px 48px;
+  box-sizing: border-box;
+  max-width: 1440px;
+  margin: 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+.header { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+.headText { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 260px; }
+.headText h1 { margin: 0; font-size: 18px; font-weight: 500; letter-spacing: 0.01em; }
+.headText p { margin: 0; font-size: 13px; color: #9aa0a8; overflow-wrap: anywhere; }
+.badge {
+  font: 600 11px/1 system-ui, sans-serif;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 6px 9px;
+  border-radius: 4px;
+  border: 1px solid #f59e0b;
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.12);
+  white-space: nowrap;
+}
+
+.steps {
+  display: flex;
+  gap: 6px;
+  margin: 18px 0 16px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding-bottom: 2px;
+}
+.step {
+  flex: 1 0 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  background: rgba(20, 21, 25, 0.85);
+  border: 1px solid #2f3138;
+  color: #9aa0a8;
+  border-radius: 6px;
+  padding: 9px 12px;
+  font: 500 13px system-ui, sans-serif;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.step b { font-weight: 600; color: #6b7079; }
+.step[aria-current="step"] { border-color: #c9ccd1; color: #fff; background: rgba(40, 42, 48, 0.95); }
+.step[aria-current="step"] b { color: #fff; }
+
+.beat { display: grid; gap: 16px; grid-template-columns: repeat(12, minmax(0, 1fr)); }
+.beatHead { grid-column: 1 / -1; display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.beatHead h2 { margin: 0; font-size: 22px; font-weight: 500; }
+.beatHead p { margin: 4px 0 0; font-size: 14px; color: #9aa0a8; max-width: 760px; }
+.span4 { grid-column: span 4; }
+.span5 { grid-column: span 5; }
+.span6 { grid-column: span 6; }
+.span7 { grid-column: span 7; }
+.span8 { grid-column: span 8; }
+.span12 { grid-column: 1 / -1; }
+
+.plate {
+  background: #fbfbfa;
+  color: #1d1f23;
+  border-radius: 8px;
+  border: 1px solid #d9dce0;
+  padding: 14px 16px 12px;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.plate h3 { margin: 0 0 2px; font-size: 14px; font-weight: 600; }
+.plate .sub { margin: 0 0 10px; font-size: 12px; color: #5d636c; }
+.note { font-size: 12px; color: #5d636c; margin: 8px 0 0; }
+.missing { display: grid; place-items: center; min-height: 160px; color: #5d636c; font-size: 13px; text-align: center; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: #1d1f23; margin-top: 6px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { display: inline-block; width: 18px; height: 0; border-top: 2px solid; }
+
+.toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 12px; color: #5d636c; margin-bottom: 10px; }
+.btn {
+  font: 500 12px system-ui, sans-serif;
+  color: #1d1f23;
+  background: #fff;
+  border: 1px solid #c9ccd1;
+  border-radius: 5px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.btn:hover { border-color: #5d636c; }
+
+/* 96-tile grid: 8 condition rows × 12 tiles (3 clips × 4 canals). */
+.grid { display: grid; grid-template-columns: minmax(0, auto) repeat(12, minmax(0, 1fr)); gap: 3px; align-items: center; }
+.rowLabel { font-size: 12px; color: #1d1f23; padding-right: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rowLabel small { color: #5d636c; margin-left: 4px; }
+.short { display: none; }
+.tile {
+  aspect-ratio: 1.25;
+  border-radius: 2px;
+  border: 1px solid #e4e6e9;
+  background: #f1f2f4;
+  padding: 0;
+  cursor: pointer;
+  position: relative;
+  transition: background-color 0.35s ease;
+}
+.tile[data-done="true"] { border-color: transparent; }
+.tile[aria-pressed="true"] { outline: 2px solid #1d1f23; outline-offset: 1px; }
+.tile .dot { position: absolute; right: 2px; top: 2px; width: 4px; height: 4px; border-radius: 50%; background: #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45); }
+.tile .x { position: absolute; inset: 0; display: grid; place-items: center; font: 700 11px/1 system-ui; color: #67001f; }
+.colHead { font-size: 10px; color: #5d636c; text-align: center; }
+
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; margin: 0; }
+.kv dt { color: #5d636c; }
+.kv dd { margin: 0; }
+
+.neuro { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); margin-top: 10px; }
+.neuro figure { margin: 0; }
+.neuro figcaption { font-size: 12px; margin-bottom: 4px; }
+.neuro img { width: 100%; height: 96px; object-fit: fill; image-rendering: pixelated; display: block; border: 1px solid #d9dce0; }
+.axis { display: flex; justify-content: space-between; font-size: 10px; color: #5d636c; margin-top: 2px; }
+
+.audio { display: grid; gap: 8px; margin-top: 10px; }
+.audio label { font-size: 12px; display: grid; gap: 4px; }
+.audio audio { width: 100%; height: 32px; }
+
+.agent { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; font-size: 13px; }
+.agent li { display: grid; grid-template-columns: auto 1fr; gap: 10px; }
+.agent b { font-weight: 600; color: #5d636c; font-size: 12px; }
+
+.card { width: 100%; border-collapse: collapse; font-size: 13px; }
+.card th { text-align: left; font-weight: 500; color: #5d636c; padding: 6px 12px 6px 0; vertical-align: top; width: 38%; }
+.card td { padding: 6px 0; border-top: 1px solid #e4e6e9; }
+.card th { border-top: 1px solid #e4e6e9; }
+
+.iframe { width: 100%; height: 600px; border: 0; display: block; border-radius: 4px; background: #fff; }
+
+.nav { display: flex; justify-content: space-between; align-items: center; margin-top: 18px; gap: 12px; font-size: 13px; color: #9aa0a8; }
+.navBtn {
+  font: 500 13px system-ui, sans-serif;
+  color: #e6e8eb;
+  background: rgba(20, 21, 25, 0.9);
+  border: 1px solid #3a3d45;
+  border-radius: 6px;
+  padding: 8px 14px;
+  cursor: pointer;
+}
+.navBtn:disabled { opacity: 0.35; cursor: default; }
+
+@media (max-width: 900px) {
+  .page { padding: 16px 16px 40px; }
+  .span4, .span5, .span6, .span7, .span8 { grid-column: 1 / -1; }
+  .iframe { height: 520px; }
+  .long { display: none; }
+  .short { display: inline; }
+  .rowLabel small { display: none; }
+}

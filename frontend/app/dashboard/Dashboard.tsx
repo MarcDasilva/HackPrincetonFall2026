@@ -1,10 +1,23 @@
 "use client";
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { MetalFx } from "@/components/metal";
+import { MetalFx, SILVER } from "@/components/metal";
 import Dock from "@/components/Dock";
 import Orb from "@/components/Orb";
+import HearingTest from "@/components/HearingTest";
+import { hearingPdf } from "@/lib/hearingPdf";
+import { fakeHearing } from "@/lib/fakeHearing";
+import type { Result } from "@/lib/audiometry";
+import { pollRun, runNote, startRun, type Run } from "@/lib/run";
+import EarViews from "@/components/EarViews";
 import gsap from "gsap";
+import { CustomEase } from "gsap/CustomEase";
+
+gsap.registerPlugin(CustomEase);
+// Easy Ease's soft start (0.33, 0) with a long coast out (0.2, 1): the orb winds DOWN like a spun ball instead of braking symmetrically.
+const SPIN_EASE = CustomEase.create("orbSpin", "0.33,0,0.2,1");
+// Peak speed of SPIN_EASE is 2.6× its average vs 2× for power1.inOut — the spin runs 1.3× the rise so its top speed matches the old one; shorter and it reads as FASTER.
+const SPIN_STRETCH = 1.3;
 import { supabase } from "@/lib/supabase";
 
 // Same chrome ramp as the "Auris" title on the splash (app/page.tsx). Gradient ids are document-global, so each icon gets its OWN id — a shared one breaks when the first icon unmounts.
@@ -25,8 +38,6 @@ const svg = (id: string, d: string[]) => (
 
 /** Black square with a silver metal ring. MetalFx strips the CHILD's background (transparent !important) and a root-background fill does not paint, so the black fill is a wrapper div under each MetalFx — the ring still draws on top. variant="circle" forces a round outline whatever borderRadius says, so the square needs "button". The child and MetalFx take the SAME radius — a mismatch draws the ring off the tile edge. The dock runs with tiles off, so this square IS the tile — MetalFx must wrap a child that fills the dock face or the ring collapses to the glyph. */
 const RADIUS = 12;
-// Same chrome ramp as the title and icon strokes, as a CSS border (MetalFx would bake its ring from the panel's size mid-animation).
-const SILVER = "linear-gradient(135deg, #ffffff 0%, #c9ccd1 30%, #7d8189 52%, #e6e8eb 75%, #9aa0a8 100%)";
 const metal = (glyph: React.ReactNode) => (
   <div style={{ width: "100%", height: "100%", background: "#000", borderRadius: RADIUS }}>
   <MetalFx variant="button" preset="silver" theme="dark" innerShadow ringCssPx={2} borderRadius={RADIUS} style={{ width: "100%", height: "100%" }}>
@@ -69,6 +80,10 @@ const ORB_PX = 450;
 /** The sphere fills ~80% of the Orb canvas; the rest is transparent padding. Layout math uses the visible size, or the separated pair sits too far apart. */
 const ORB_FILL = 0.8;
 const DOCK_BOTTOM = 100;
+/** Height kept free under the sphere for the loading sub text, so "Processing…" NEVER lands on the Capture pills. */
+const ORB_SUB = 48;
+/** idle: behind the card. active: rising to, or resting at, the top. loading: at the top while a run is queued or running — the ONLY state that shows the "Processing…" sub text. */
+type OrbState = "idle" | "active" | "loading";
 /** Gap between the sent-state chat card and the bottom edge. */
 const BOTTOM = 64;
 
@@ -79,6 +94,9 @@ export default function Dashboard() {
   const dockWrap = useRef<HTMLDivElement>(null);
   const chat = useRef<HTMLDivElement>(null);
   const orb = useRef<HTMLDivElement>(null);
+  const spin = useRef({ a: 0 });
+  // True once the rise tween completes; loading waits for it so the sub text rises in under a settled orb.
+  const [arrived, setArrived] = useState(false);
   const form = useRef<HTMLFormElement>(null);
   // Flips on the first send; the orb and card split apart from then on (see the layout effect below).
   const [sent, setSent] = useState(false);
@@ -122,9 +140,33 @@ export default function Dashboard() {
   // Capture Ear: camOn mounts the feed panel; photo is the still taken from it (null while live). ponytail: the photo only lives in state until the backend upload (POST /api/patients) is wired.
   const [camOn, setCamOn] = useState(false);
   const [camErr, setCamErr] = useState<string | null>(null);
-  const [photo, setPhoto] = useState<{ blob: Blob; url: string } | null>(null);
+  // box and side are set only by the practice shortcut, which knows its photo; every other photo leaves them out and the backend detects the ear.
+  const [photo, setPhoto] = useState<{ blob: Blob; url: string; box?: [number, number, number, number]; side?: "left" | "right"; mirror?: boolean } | null>(null);
+  // mirror is true ONLY for camera captures: the live feed is shown selfie-style, so its still is too. Uploaded and dropped files show as they are.
   // Software zoom (CSS scale on the feed, same crop baked into the snapshot) — most webcams expose no hardware zoom constraint. ponytail: use track.applyConstraints({zoom}) where supported if quality matters.
   const [zoom, setZoom] = useState(1);
+  // Capture Hearing: hearOn mounts the hearing-test panel in the SAME slot and refs as the camera (only one panel is ever open). hearing is the attached report — the generated PDF or an uploaded file.
+  const [hearOn, setHearOn] = useState(false);
+  const [hearing, setHearing] = useState<{ blob: Blob; url: string; name: string; result?: Result } | null>(null);
+  // The pipeline run the up arrow starts. starting covers the POST; run then tracks the backend job (and its files, which EarViews reveals) until done or error.
+  const [starting, setStarting] = useState(false);
+  const [run, setRun] = useState<Run | null>(null);
+  const [runErr, setRunErr] = useState<string | null>(null);
+  const upload = useRef<HTMLInputElement>(null);
+  // Composer "+" and drag-drop share one router (addFiles below); dragging lights the card while a file hovers over it.
+  const pick = useRef<HTMLInputElement>(null);
+  const [dragging, setDragging] = useState(false);
+  // A file dropped OUTSIDE the card would otherwise make the browser navigate to it and throw away the page.
+  useEffect(() => {
+    const stop = (e: DragEvent) => e.preventDefault();
+    window.addEventListener("dragover", stop);
+    window.addEventListener("drop", stop);
+    return () => {
+      window.removeEventListener("dragover", stop);
+      window.removeEventListener("drop", stop);
+    };
+  }, []);
+  const panelOn = camOn || hearOn;
   const camPanel = useRef<HTMLDivElement>(null);
   const camInner = useRef<HTMLDivElement>(null);
   const camVideo = useRef<HTMLVideoElement>(null);
@@ -137,7 +179,7 @@ export default function Dashboard() {
   useEffect(() => stopStream, []);
   // The panel grows from the chat card's top edge: the wrapper's height clips while the content rises out from behind the card. Height animates on this plain-bordered wrapper, NEVER on a MetalFx — it sizes its ring from getBoundingClientRect once.
   useEffect(() => {
-    if (!camOn) return;
+    if (!camOn && !hearOn) return;
     const v = camVideo.current;
     if (v && stream.current) {
       v.srcObject = stream.current;
@@ -148,26 +190,46 @@ export default function Dashboard() {
       gsap.fromTo(camInner.current, { yPercent: 100 }, { yPercent: 0, duration: 0.6, ease: "power3.out" });
     });
     return () => ctx.revert();
-  }, [camOn]);
-  // After the first send the card slides down to the bottom and the orb rises into the space above it. Card moves by marginTop on the wrapper (its translate does the centering); the orb tween subtracts that same shift. Camera mode returns both to center — the feed is sized for a centered stack. ponytail: measured on send/camera toggle only, not on window resize.
+  }, [camOn, hearOn]);
+  // Dev shortcut, two keys (handler assigned each render below; the listener lives in a hook above the early return): turning Caps Lock ON attaches the practice ear and fake hearing test, then Enter sends them like any submit. Only the ON transition counts — macOS fires keydown for ON and keyup for OFF, other platforms keydown for both, so getModifierState keeps turning it OFF from re-attaching. Enter is swallowed ONLY when focus is on the page itself, so the textarea and buttons keep their own Enter. Dev builds only.
+  const keyFn = useRef<(e: KeyboardEvent) => void>(() => {});
+  useEffect(() => {
+    if (process.env.NODE_ENV === "production") return;
+    const onKey = (e: KeyboardEvent) => keyFn.current(e);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  // Poll the backend job. Deps are id+status only — new files and steps arrive through setRun without restarting the timer.
+  useEffect(() => {
+    if (!run || run.status === "done" || run.status === "error") return;
+    const t = setInterval(() => pollRun(run).then(setRun, () => {}), 1500);
+    return () => clearInterval(t);
+  }, [run?.id, run?.status]); // eslint-disable-line react-hooks/exhaustive-deps
+  // After the first send the card slides down to the bottom and the orb rises into the space above it. Card moves by marginTop on the wrapper (its translate does the centering); the orb tween subtracts that same shift. An open panel (camera or hearing) returns both to center — the panel is sized for a centered stack. ponytail: measured on send/camera toggle only, not on window resize.
   useLayoutEffect(() => {
     const w = chat.current, o = orb.current, f = form.current;
     if (!w || !o || !f) return;
     let shift = 0, orbY = 0, s = 1;
-    if (sent && !camOn) {
+    if (sent && !panelOn) {
       // Card drops to BOTTOM px above the screen edge; the orb centers in the gap between the dock icons' bottom edge (DOCK_BOTTOM: dock top 12 + (panelHeight 100 - item 76) / 2 + 76) and the Capture Ear button's top (card top - 40 button - 12 margin), shrinking only when that gap is too short.
       const vh = window.innerHeight, h = f.offsetHeight, bar = 52, gap = 8;
       shift = vh - BOTTOM - h / 2 - vh / 2;
-      const capTop = vh - BOTTOM - h - bar;
+      const capTop = vh - BOTTOM - h - bar - ORB_SUB;
       s = Math.min(1, (capTop - DOCK_BOTTOM - 2 * gap) / (ORB_PX * ORB_FILL));
       orbY = (DOCK_BOTTOM + capTop) / 2 - (vh / 2 + shift);
     }
+    setArrived(false);
     const ctx = gsap.context(() => {
-      gsap.to(w, { marginTop: shift, duration: 0.9, ease: "power3.inOut" });
-      gsap.to(o, { y: orbY, scale: s, duration: 0.9, ease: "power3.inOut" });
+      const dur = 0.9;
+      // ONE ease for card and orb: the orb lives inside the card's wrapper, so its screen path is marginTop + y — a different ease on either makes the orb rise, dip, then rise again. power1.inOut is GSAP's closest match to After Effects' Easy Ease.
+      const ease = "power1.inOut";
+      gsap.to(w, { marginTop: shift, duration: dur, ease });
+      gsap.to(o, { y: orbY, scale: s, "--orb-s": s, duration: dur, ease, onComplete: () => setArrived(sent && !panelOn) });
+      // Active (orb out from behind the card) turns the sphere a half turn about its vertical axis, still coasting briefly after the rise lands. It does NOT share the card/orb ease: spin is a yaw drawn in the canvas, not a position, so its curve cannot cause the dip.
+      gsap.to(spin.current, { a: sent && !panelOn ? Math.PI : 0, duration: dur * SPIN_STRETCH, ease: SPIN_EASE });
     });
     return () => ctx.kill();
-  }, [ready, sent, camOn]);
+  }, [ready, sent, panelOn]);
   if (!ready) return null;
 
   const openCam = async () => {
@@ -187,9 +249,38 @@ export default function Dashboard() {
     if (photo) URL.revokeObjectURL(photo.url);
     setPhoto(null);
   };
-  const closeCam = () => {
-    gsap.to(camPanel.current, { height: 0, marginBottom: 0, borderWidth: 0, duration: 0.45, ease: "power2.in", onComplete: () => { stopStream(); setCamOn(false); } });
+  const closePanel = () => {
+    gsap.to(camPanel.current, { height: 0, marginBottom: 0, borderWidth: 0, duration: 0.45, ease: "power2.in", onComplete: () => { stopStream(); setCamOn(false); setHearOn(false); } });
     gsap.to(camInner.current, { yPercent: 100, duration: 0.45, ease: "power2.in" });
+  };
+  // result is set ONLY for the in-app test (and the practice report) — its numbers feed the run. An uploaded file carries none.
+  const attachHearing = (blob: Blob, name: string, result?: Result) => {
+    if (hearing) URL.revokeObjectURL(hearing.url);
+    setHearing({ blob, url: URL.createObjectURL(blob), name, result });
+  };
+  const clearHearing = () => {
+    if (hearing) URL.revokeObjectURL(hearing.url);
+    setHearing(null);
+  };
+  // Dev-only practice attachments: the personal ear photo (public/dev/ear.png, gitignored) and a fake hearing test. ponytail: dev builds only — production has no such file and no business faking a patient.
+  const practice = async () => {
+    const res = await fetch("/dev/ear.png");
+    if (!res.ok) return;
+    clearPhoto();
+    const blob = await res.blob();
+    // Ear in public/dev/ear.png (656x534): helix top ~y88, lobe/stud ~y400, canal side ~x270 to rim ~x455.
+    setPhoto({ blob, url: URL.createObjectURL(blob), box: [240, 70, 470, 430], side: "left" });
+    const r = fakeHearing();
+    attachHearing(hearingPdf(r), `Hearing test ${r.date}.pdf`, r);
+  };
+  // One router for the composer "+" and drops: an image is the EAR photo, a PDF is the hearing test. A clinic audiogram that is an IMAGE must come through the pill "+" next to Capture Hearing, which always files it as a hearing test.
+  const addFiles = (files: FileList | File[]) => {
+    for (const f of Array.from(files)) {
+      if (f.type.startsWith("image/")) {
+        clearPhoto();
+        setPhoto({ blob: f, url: URL.createObjectURL(f) });
+      } else if (f.type === "application/pdf") attachHearing(f, f.name);
+    }
   };
   const snap = () => {
     const v = camVideo.current;
@@ -206,9 +297,9 @@ export default function Dashboard() {
     c.toBlob((blob) => {
       if (!blob) return;
       stopStream();
-      setPhoto({ blob, url: URL.createObjectURL(blob) });
+      setPhoto({ blob, url: URL.createObjectURL(blob), mirror: true });
       // The still becomes a chat attachment (chip in the composer), so the panel retracts instead of lingering over it.
-      closeCam();
+      closePanel();
     }, "image/jpeg", 0.92);
   };
 
@@ -221,35 +312,68 @@ export default function Dashboard() {
   };
   const dockItems = items.map((it) => (it.label === "Profile" ? { ...it, onClick: toggleProfile } : it));
 
+  const busy = starting || run?.status === "queued" || run?.status === "running";
+  const orbState: OrbState = !sent || panelOn ? "idle" : arrived && busy ? "loading" : "active";
+  const canRun = !!photo && !!hearing && !busy;
+  const note = runErr ?? (run ? runNote(run) : "");
+  keyFn.current = (e) => {
+    if (e.key === "CapsLock" && e.getModifierState("CapsLock")) void practice();
+    else if (e.key === "Enter" && canRun && e.target === document.body) {
+      e.preventDefault();
+      form.current?.requestSubmit();
+    }
+  };
   const iconBtn = { display: "flex", alignItems: "center", justifyContent: "center", width: 34, height: 34, borderRadius: 999, cursor: "pointer", font: "inherit" } as const;
   const zoomBtn = { ...iconBtn, width: 38, height: 38, border: 0, background: "rgba(0,0,0,0.55)", color: "#e6e8eb" } as const;
   const icon = { width: 18, height: 18, fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" } as const;
+  // Metal-ringed pill above the card. No label = round icon-only button, so it needs an aria-label.
+  const pill = (onClick: () => void, d: string[], label?: string, color = "#757575", aria?: string) => (
+    <div style={{ background: "#000", borderRadius: 20 }}>
+      <MetalFx variant="button" preset="silver" theme="dark" innerShadow ringCssPx={2} borderRadius={20}>
+        <button type="button" aria-label={aria} onClick={onClick} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, height: 40, minWidth: 40, padding: label ? "0 24px" : 0, border: 0, borderRadius: 20, background: "#000", color, cursor: "pointer", font: "inherit", fontSize: 16 }}>
+          <svg viewBox="0 0 24 24" width="1.1em" height="1.1em" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{d.map((p) => <path key={p} d={p} />)}</svg>
+          {label}
+        </button>
+      </MetalFx>
+    </div>
+  );
 
   return (
     <>
-    {/* ponytail: no backend yet, so send only clears the box; plus is inert. Width 600 approximates the dock's resting width — retune if the dock changes. */}
+    {/* The up arrow is live only once an ear photo AND a hearing test are attached; plus is inert. Width 600 approximates the dock's resting width — retune if the dock changes. */}
+    {/* The ear stage's three views, revealed as the backend writes them; the orb's rect is where the stack lands. */}
+    {run && <EarViews key={run.id} files={run.files} anchor={() => orb.current?.getBoundingClientRect() ?? null} />}
     <div ref={chat} style={{ position: "fixed", top: "50%", left: "50%", transform: "translate(-50%, -50%)", width: 600, maxWidth: "calc(100vw - 32px)", zIndex: 10 }}>
     {/* Orb draws at full resolution (components/Orb.tsx), so size is plain pixels. zIndex -1 sits behind the card and bar inside this wrapper's stacking context. The inner div carries the post-send y/scale tween, so GSAP NEVER rewrites the centering translate on the outer one. */}
-    <div aria-hidden style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)", zIndex: -1, pointerEvents: "none" }}>
-      <div ref={orb} data-testid="orb"><Orb px={ORB_PX} /></div>
+    <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)", zIndex: -1, pointerEvents: "none" }}>
+      <div ref={orb} data-testid="orb" data-state={orbState} style={{ position: "relative" }}>
+        <Orb px={ORB_PX} speed={orbState === "idle" ? 1 : 2} spin={spin.current} />
+        {/* Sits under the visible sphere (canvas is ORB_FILL sphere + padding) and scales with the orb. Colour and font match the Capture Ear pill label (pill() default colour), one size up; dividing by --orb-s undoes the orb's scale so it stays 18px on short screens. */}
+        {orbState === "loading" && <div role="status" className="orb-sub" style={{ position: "absolute", top: (ORB_PX * (1 + ORB_FILL)) / 2 + 28, left: 0, right: 0, textAlign: "center", fontSize: "calc(18px / var(--orb-s, 1))", lineHeight: "calc(22px / var(--orb-s, 1))", color: "#757575" }}>Processing…</div>}
+      </div>
     </div>
-    {/* Bar floats above the card (bottom: 100%) so the card stays centered, and hugs its content. While the camera is ON the bar joins the flow instead, so the wrapper (centered by its translate) re-centers feed + card together and the card is pushed down. Inert until capture is wired. Grey matches the textarea placeholder. */}
-    <div style={camOn ? { display: "flex", justifyContent: "center" } : { position: "absolute", bottom: "100%", left: 0, right: 0, marginBottom: 12, display: "flex", justifyContent: "center" }}>
-      {!camOn && <div style={{ background: "#000", borderRadius: 20 }}>
-      <MetalFx variant="button" preset="silver" theme="dark" innerShadow ringCssPx={2} borderRadius={20}>
-        <button type="button" onClick={openCam} style={{ display: "flex", alignItems: "center", gap: 8, height: 40, padding: "0 24px", border: 0, borderRadius: 20, background: "#000", color: camErr ? "#f87171" : "#757575", cursor: "pointer", font: "inherit", fontSize: 16 }}>
-          <svg viewBox="0 0 24 24" width="1.1em" height="1.1em" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M4 8h3l2-3h6l2 3h3v11H4z" /><path d="M12 10a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z" /></svg>
-          {camErr ?? "Capture Ear"}
-        </button>
-      </MetalFx>
-      </div>}
+    {/* Bar floats above the card (bottom: 100%) so the card stays centered, and hugs its content. While a panel (camera or hearing) is open the bar joins the flow instead, so the wrapper (centered by its translate) re-centers feed + card together and the card is pushed down. Inert until capture is wired. Grey matches the textarea placeholder. */}
+    <div style={panelOn ? { display: "flex", justifyContent: "center" } : { position: "absolute", bottom: "100%", left: 0, right: 0, marginBottom: 12, display: "flex", justifyContent: "center", gap: 10 }}>
+      {!panelOn && (
+        <>
+          {pill(openCam, ["M4 8h3l2-3h6l2 3h3v11H4z", "M12 10a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z"], camErr ?? "Capture Ear", camErr ? "#f87171" : undefined)}
+          {pill(() => setHearOn(true), ["M3 14v-2a9 9 0 0 1 18 0v2", "M21 15a2 2 0 0 1-2 2h-1v-5h3z", "M3 15a2 2 0 0 0 2 2h1v-5H3z"], "Capture Hearing")}
+          {pill(() => upload.current?.click(), ["M12 5v14", "M5 12h14"], undefined, undefined, "Upload hearing test")}
+          {/* Upload path for patients who already have a clinic audiogram (specs/01a path A). */}
+          <input ref={upload} data-testid="hearing-input" type="file" accept="application/pdf,image/*" hidden onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) attachHearing(f, f.name);
+            e.target.value = "";
+          }} />
+        </>
+      )}
       {/* Camera panel REPLACES the Capture Ear button above the card. It is in flow, so growing its height shoves the card down while the centered wrapper keeps the pair centered. The 12px gap is animated on the panel (not the bar) so the swap back to the floating button does not jump the card; border is a box-shadow for the same reason. Height cap keeps the pair clear of the 140px dock; see the camOn effect. */}
       {camOn && (
         <div ref={camPanel} style={{ width: "100%", overflow: "hidden", borderRadius: 24, border: "2px solid transparent", background: `linear-gradient(#000, #000) padding-box, ${SILVER} border-box` }}>
           <div ref={camInner} style={{ position: "relative", height: "max(180px, min(340px, calc(100vh - 420px)))" }}>
             <video ref={camVideo} muted playsInline style={{ width: "100%", height: "100%", objectFit: "cover", display: "block", transform: `scaleX(-1) scale(${zoom})` }} />
             {photo && <img src={photo.url} alt="Captured ear" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", transform: "scaleX(-1)" }} />}
-            <button type="button" aria-label="Close camera" onClick={closeCam} style={{ position: "absolute", top: 12, right: 12, width: 32, height: 32, borderRadius: 999, border: 0, background: "rgba(0,0,0,0.55)", color: "#e6e8eb", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <button type="button" aria-label="Close camera" onClick={closePanel} style={{ position: "absolute", top: 12, right: 12, width: 32, height: 32, borderRadius: 999, border: 0, background: "rgba(0,0,0,0.55)", color: "#e6e8eb", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
               <svg viewBox="0 0 24 24" {...icon}><path d="M6 6l12 12M18 6 6 18" /></svg>
             </button>
             {!photo && (
@@ -269,29 +393,75 @@ export default function Dashboard() {
           </div>
         </div>
       )}
+      {hearOn && (
+        <div ref={camPanel} style={{ width: "100%", overflow: "hidden", borderRadius: 24, border: "2px solid transparent", background: `linear-gradient(#000, #000) padding-box, ${SILVER} border-box` }}>
+          <div ref={camInner} style={{ position: "relative", height: "max(180px, min(340px, calc(100vh - 420px)))" }}>
+            <HearingTest
+              onClose={closePanel}
+              onDone={(r) => {
+                attachHearing(hearingPdf(r), `Hearing test ${r.date}.pdf`, r);
+                closePanel();
+              }}
+            />
+          </div>
+        </div>
+      )}
     </div>
-    <div style={{ background: "#000", borderRadius: 24 }}>
+    <div
+      data-testid="drop-zone"
+      onDragOver={(e) => { if (e.dataTransfer.types.includes("Files")) setDragging(true); }}
+      onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragging(false); }}
+      onDrop={(e) => { setDragging(false); addFiles(e.dataTransfer.files); }}
+      style={{ background: "#000", borderRadius: 24, outline: dragging ? "2px dashed #757575" : "none", outlineOffset: 4 }}
+    >
     <MetalFx variant="button" preset="silver" theme="dark" innerShadow ringCssPx={2} borderRadius={24} style={{ width: "100%" }}>
     <form
       ref={form}
-      onSubmit={(e) => {
+      onSubmit={async (e) => {
         e.preventDefault();
+        // A run needs BOTH inputs. Enter in the textarea submits too, so the guard lives here, not only on the arrow.
+        if (!photo || !hearing || busy) return;
         const ta = e.currentTarget.elements.namedItem("msg") as HTMLTextAreaElement;
-        if (ta.value.trim() || photo) {
+        setStarting(true);
+        setRunErr(null);
+        try {
+          setRun(await startRun(photo.blob, hearing.result, photo.box, photo.side));
           ta.value = "";
           setSent(true);
+          clearPhoto();
+          clearHearing();
+        } catch (err) {
+          // Attachments stay so the patient can retry without retaking either.
+          setRunErr(err instanceof Error && err.message !== "Failed to fetch" ? err.message : "Could not reach the server.");
+        } finally {
+          setStarting(false);
         }
-        clearPhoto();
       }}
       style={{ boxSizing: "border-box", width: "100%", padding: 14, borderRadius: 24, background: "#000" }}
     >
+      {(photo || hearing) && <div style={{ display: "flex", gap: 10 }}>
       {photo && (
         <div data-testid="attachment" style={{ position: "relative", width: 64, height: 64, margin: "0 6px 8px" }}>
-          <img src={photo.url} alt="Captured ear attachment" style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: 12, transform: "scaleX(-1)" }} />
+          <img src={photo.url} alt="Captured ear attachment" style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: 12, transform: photo.mirror ? "scaleX(-1)" : undefined }} />
           <button type="button" aria-label="Remove attachment" onClick={clearPhoto} style={{ position: "absolute", top: -6, right: -6, width: 20, height: 20, padding: 0, borderRadius: 999, border: 0, background: "#3b3d42", color: "#e6e8eb", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
             <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
           </button>
         </div>
+      )}
+      {hearing && (
+        <div data-testid="hearing-attachment" style={{ position: "relative", width: 64, height: 64, margin: "0 6px 8px" }}>
+          <a href={hearing.url} target="_blank" rel="noreferrer" title={hearing.name} style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4, width: "100%", height: "100%", borderRadius: 12, background: "#1c1d20", color: "#c9ccd1", fontSize: 11, textDecoration: "none" }}>
+            <svg viewBox="0 0 24 24" {...icon}><path d="M14 3H6v18h12V7z" /><path d="M14 3v4h4" /><path d="M9 13h6M9 17h6" /></svg>
+            {(hearing.name.split(".").pop() ?? "").toUpperCase()}
+          </a>
+          <button type="button" aria-label="Remove hearing test" onClick={clearHearing} style={{ position: "absolute", top: -6, right: -6, width: 20, height: 20, padding: 0, borderRadius: 999, border: 0, background: "#3b3d42", color: "#e6e8eb", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
+          </button>
+        </div>
+      )}
+      </div>}
+      {note && (
+        <div data-testid="run-status" role="status" style={{ padding: "0 6px 8px", fontSize: 13, color: runErr || run?.status === "error" ? "#f87171" : "#9aa0a8" }}>{note}</div>
       )}
       <textarea
         name="msg"
@@ -305,11 +475,15 @@ export default function Dashboard() {
         }}
         style={{ display: "block", width: "100%", boxSizing: "border-box", resize: "none", border: 0, outline: 0, background: "transparent", color: "#e6e8eb", font: "inherit", fontSize: 16, padding: "4px 6px" }}
       />
+      <input ref={pick} data-testid="add-input" type="file" multiple accept="image/*,application/pdf" hidden onChange={(e) => {
+        if (e.target.files) addFiles(e.target.files);
+        e.target.value = "";
+      }} />
       <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8 }}>
-        <button type="button" aria-label="Add" style={{ ...iconBtn, border: "1px solid rgba(255,255,255,0.18)", background: "transparent", color: "#c9ccd1" }}>
+        <button type="button" aria-label="Add" onClick={() => pick.current?.click()} style={{ ...iconBtn, border: "1px solid rgba(255,255,255,0.18)", background: "transparent", color: "#c9ccd1" }}>
           <svg viewBox="0 0 24 24" {...icon}><path d="M12 5v14M5 12h14" /></svg>
         </button>
-        <button type="submit" aria-label="Send" style={{ ...iconBtn, border: 0, background: "#3b82f6", color: "#fff" }}>
+        <button type="submit" aria-label="Send" disabled={!canRun} title={canRun ? undefined : "Add an ear photo and a hearing test to start"} style={{ ...iconBtn, border: 0, background: "#3b82f6", color: "#fff", opacity: canRun ? 1 : 0.35, cursor: canRun ? "pointer" : "not-allowed" }}>
           <svg viewBox="0 0 24 24" {...icon}><path d="M12 19V5M5 12l7-7 7 7" /></svg>
         </button>
       </div>

@@ -47,12 +47,17 @@ def frames(path):
     return t, n, np.cross(t, n)
 
 
-def tube(path, radii, seg=28):
-    """Closed (capped) tube mesh with varying radius."""
-    _, n, b = frames(path)
+def tube(path, radii, seg=28, fr=None):
+    """Closed (capped) tube mesh. `radii` is per station, or [station, angle] for a shaped section
+    whose angle j points along cos(a_j)·n + sin(a_j)·b of `frames(path)`. Pass `fr` (sliced from a
+    longer path's frames) when this tube must line up angle-for-angle with a tube on that path."""
+    _, n, b = fr if fr is not None else frames(path)
+    if radii.ndim == 2:
+        seg = radii.shape[1]
     ang = np.linspace(0, 2 * np.pi, seg, endpoint=False)
     ring = np.cos(ang)[None, :, None] * n[:, None, :] + np.sin(ang)[None, :, None] * b[:, None, :]
-    verts = (path[:, None, :] + radii[:, None, None] * ring).reshape(-1, 3)
+    r = radii[:, :, None] if radii.ndim == 2 else radii[:, None, None]
+    verts = (path[:, None, :] + r * ring).reshape(-1, 3)
     faces = []
     for i in range(len(path) - 1):
         for j in range(seg):

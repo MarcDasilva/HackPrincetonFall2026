@@ -131,6 +131,58 @@ def square_crop(img, mask, pad_frac):
     return img_p[sy:sy + side, sx:sx + side], mask_p[sy:sy + side, sx:sx + side]
 
 
+def _canonical(m, shape):
+    """PCA shape coefficients -> vertices in AudioEar's canonical frame (+x lateral, +y up, -z forward
+    for a right ear), centred, in model units. Returns (verts, faces)."""
+    verts = (m["Mean"][:, 0] + m["Eigenvectors"] @ (shape * m["EigenValues"])).reshape(-1, 3)
+    faces = np.asarray(m["Trilist"], dtype=np.int64)
+    if faces.min() == 1:
+        faces = faces - 1
+    verts = verts - (verts.min(0) + verts.max(0)) / 2      # same canonicalisation as AudioEar utils
+    verts[:, 0] *= -1
+    verts[:, 2] *= -1
+    return verts, faces
+
+
+def save_depth(depth, mask, path):
+    """depth.png: the depth FCRN predicts from the photo (AudioEar's first network), inside the ear mask.
+    Colour is RELATIVE depth (2nd-98th percentile in the mask), nearest the camera brightest; no units —
+    FCRN's output is not metric. Display only; the mesh comes from the second network."""
+    import matplotlib
+    # the mask's ragged edge (hair, earring) gives specks: open it, then keep only the largest region
+    m = cv2.morphologyEx((mask > 0).astype(np.uint8), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m)
+    if n < 2:
+        return
+    m = lab == 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    # FCRN's deconvolutions leave dot artifacts on a regular grid, up to ~12 px wide at 256 px: replace pixels that
+    # stand out from a 15 px median, then a light median for the rest
+    from scipy.ndimage import median_filter
+    d = depth.astype(np.float32)
+    big = median_filter(d, size=15)
+    dev = np.abs(d - big)
+    d = np.where(dev > 3 * np.median(dev[m]), big, d)
+    d = cv2.medianBlur(d, 5)
+    lo, hi = np.percentile(d[m], [2, 98])
+    t = np.clip((hi - d) / (hi - lo + 1e-9), 0, 1)        # LOW FCRN values are near the camera (checked: concha darkest)
+    rgb = (matplotlib.colormaps["inferno"](t)[..., :3] * 255).astype(np.uint8)
+    rgb[~m] = 0
+    rgb = cv2.resize(rgb, (512, 512), interpolation=cv2.INTER_CUBIC)
+    cv2.imwrite(path, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+
+def mean_ear(out, height_mm=62.0):
+    """The PCA model's average right ear, scaled to `height_mm`. A stand-in when no photo has been
+    reconstructed yet; it is NOT anyone's ear. Writes <out>/ear.ply and returns its path."""
+    m = pickle.load(open(os.path.join(AUDIOEAR_DIR, "data", "UHM_models", "ear_model.pkl"), "rb"))
+    verts, faces = _canonical(m, np.zeros(len(m["EigenValues"])))
+    verts = verts * (height_mm / np.ptp(verts[:, 1]))
+    os.makedirs(out, exist_ok=True)
+    path = os.path.join(out, "ear.ply")
+    trimesh.Trimesh(verts, faces, process=False).export(path)
+    return path
+
+
 def reconstruct(photo, out, box, left=False, height_mm=62.0, pad=0.15, mask_path=None, log=print):
     """Photo -> ear mesh in `out`. `box` = [x0, y0, x1, y1] around the ear in full-resolution pixels.
 
@@ -166,17 +218,12 @@ def reconstruct(photo, out, box, left=False, height_mm=62.0, pad=0.15, mask_path
         cv2.imwrite(os.path.join(out, "input.jpg"), cv2.cvtColor((x * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
         with torch.no_grad():
             t = torch.from_numpy(x).permute(2, 0, 1)[None].to(dev)
-            _, feats = fcrn(t)
+            depth, feats = fcrn(t)
             pos, _, shape = enc(t, feats)
         pos, shape = pos[0].cpu().numpy(), shape[0].cpu().numpy()
+        depth = depth[0, 0].cpu().numpy()
 
-    verts = (m["Mean"][:, 0] + m["Eigenvectors"] @ (shape * m["EigenValues"])).reshape(-1, 3)
-    faces = np.asarray(m["Trilist"], dtype=np.int64)
-    if faces.min() == 1:
-        faces = faces - 1
-    verts = verts - (verts.min(0) + verts.max(0)) / 2      # same canonicalisation as AudioEar utils
-    verts[:, 0] *= -1
-    verts[:, 2] *= -1
+    verts, faces = _canonical(m, shape)
 
     # posed verts -> pixels (pytorch3d look_at_view_transform(10, 0, pi/2) + orthographic camera)
     f = pos[5]
@@ -192,6 +239,7 @@ def reconstruct(photo, out, box, left=False, height_mm=62.0, pad=0.15, mask_path
     for u, v in pxi[::4]:
         cv2.circle(ov, (int(u), int(v)), 1, (0, 255, 0), -1)
     cv2.imwrite(os.path.join(out, "overlay.jpg"), cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
+    save_depth(depth, cmask, os.path.join(out, "depth.png"))
 
     verts = verts * (height_mm / np.ptp(verts[:, 1]))
     if left:

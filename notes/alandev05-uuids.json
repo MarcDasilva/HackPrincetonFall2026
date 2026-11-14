@@ -1,0 +1,227 @@
+[
+  {
+    "id": "4ba67dc5-2b6c-4e11-b771-904c1fe2dbc0",
+    "title": "Claude Code hooks: a regex-based PreToolUse deny also blocks commands that merely mention the pattern; filter a third-party Stop hook with a jq wrapper",
+    "score": 0
+  },
+  {
+    "id": "e5800d28-fa08-439e-a428-aa6fbfec18f3",
+    "title": "Claude Code PreToolUse hook to block one CLI subcommand: deny via permissionDecision, and chained commands get blocked whole",
+    "score": 0
+  },
+  {
+    "id": "4b5255d1-6533-4f02-aa10-b70057f92adb",
+    "title": "deepagents: custom tool exceptions crash the run, recursion_limit defaults to 9999, and the parent limit doesn't bound subagents",
+    "score": 0
+  },
+  {
+    "id": "89a6e0cf-5330-4344-94f2-b5c600119b7e",
+    "title": "deepagents JS (npm 1.16.x): createFileData not exported, unknown subagent_type crashes the run, v3 streamEvents exposes subagents",
+    "score": 0
+  },
+  {
+    "id": "756bd8a3-4b89-4fc5-b35d-7a0b79bbc738",
+    "title": "quickstart deep_research crashes on import without TAVILY_API_KEY via tavily 0.7.13",
+    "score": 0
+  },
+  {
+    "id": "328b0409-2aed-458f-8005-2521f1cee3ec",
+    "title": "Pyserini 1.6.0 import fails on empty OPENAI_API_KEY",
+    "score": 0
+  },
+  {
+    "id": "13cf8eed-3ed5-46d3-8a74-2feec547c7c6",
+    "title": "llm-wiki init needs a separate langsmith hub CLI that uv sync does not install",
+    "score": 0
+  },
+  {
+    "id": "a864d798-b04c-47b2-8380-50635e75d5ea",
+    "title": "deepagents SKILL.md: malformed or misplaced skills are skipped with only a logger WARNING; custom subagents don't inherit skills",
+    "score": 0
+  },
+  {
+    "id": "79fd3dc1-a1bc-4f01-af2c-07054837a169",
+    "title": "deepagents 0.7.38 context: eviction at 80k chars, summarization at 170k tokens, memory not reloaded within a thread",
+    "score": 0
+  },
+  {
+    "id": "8e80a6d2-bb7f-4b99-9d92-57cef2c0a213",
+    "title": "deepagents 0.7.x: no harness system prompt for Claude 5.x / gpt-5.5 / gemini; seed files need create_file_data",
+    "score": 0
+  },
+  {
+    "id": "60ae1886-49f0-45c5-8fdf-fcc5cedd8ecd",
+    "title": "deepagents StoreBackend: namespace is required and a missing store crashes at first call, not at build",
+    "score": 0
+  },
+  {
+    "id": "f0d83009-c785-4433-8974-08cf574658b7",
+    "title": "deepagents LocalShellBackend: empty env by default, no sandbox, incompatible with permissions",
+    "score": 0
+  },
+  {
+    "id": "4a53255b-bedf-424e-96db-494aa50274e7",
+    "title": "Reconciling two drifted Supabase projects: don't replay migrations blindly",
+    "score": 0
+  },
+  {
+    "id": "2c874910-8108-40dc-a030-a4589825610c",
+    "title": "Supabase migration timestamps can collide across merged PRs",
+    "score": 0
+  },
+  {
+    "id": "c8432ec7-ce2d-4bd1-9d18-8df62e6336bb",
+    "title": "Catch unapplied Supabase migrations in CI with db push --dry-run",
+    "score": 0
+  },
+  {
+    "id": "5e0b0083-7c81-4483-8d99-21050f817d6c",
+    "title": "Supabase/pgvector migrations: schema-qualify opclasses and set search_path",
+    "score": 0
+  },
+  {
+    "id": "246ea23a-1d06-4434-bb7a-9557b087fd12",
+    "title": "Supabase CLI: ad-hoc SQL without Docker via temporary migration",
+    "score": 0
+  },
+  {
+    "id": "144a396f-0408-4468-9628-f64a1ef3c0be",
+    "title": "asyncio.create_task background jobs die on restart and leave rows stuck",
+    "score": 0
+  },
+  {
+    "id": "90a34418-85c3-48fa-b77a-811b2dd27665",
+    "title": "asyncio.gather plus Semaphore: work before acquire runs for every task",
+    "score": 0
+  },
+  {
+    "id": "c577cd8e-0f7d-4216-be3b-35603ea0256f",
+    "title": "Resend bulk sends: the batch endpoint beats per-email calls at 5 req/s",
+    "score": 0
+  },
+  {
+    "id": "640091c4-0742-4282-a2a5-1f5dc91bba8e",
+    "title": "Prevent double sends: claim rows with a conditional UPDATE",
+    "score": 0
+  },
+  {
+    "id": "c99e26ad-d138-4c5d-8a9a-717c937d1a27",
+    "title": "Batch backend uploads small enough to answer within the worker timeout",
+    "score": 0
+  },
+  {
+    "id": "7a2b98eb-a01c-4d88-8ccf-62406d2ca5a6",
+    "title": "Start child workers in the server's listen callback",
+    "score": 0
+  },
+  {
+    "id": "54793fe4-305e-4c83-b054-7071aa97682c",
+    "title": "Keep pgvector embeddings fresh with a trigger that nulls them",
+    "score": 0
+  },
+  {
+    "id": "a2a58fd2-0d1f-4e7b-8d11-42bd46aab264",
+    "title": "Email renderers: persisted design JSON isn't type-checked at runtime",
+    "score": 0
+  },
+  {
+    "id": "2c6102b1-4c7f-4610-aacb-ea2d6b6fcd3f",
+    "title": "Freeze bulk-send audiences at confirmation; don't re-resolve at fire time",
+    "score": 0
+  },
+  {
+    "id": "a8563172-7922-4f90-9b2c-088c24afc56a",
+    "title": "HTML email merge fields: escape values in the body, not the subject",
+    "score": 0
+  },
+  {
+    "id": "021b5951-f34d-4f1c-a88a-de9b68813b27",
+    "title": "Unique-slug generation races: catch 23505 and retry",
+    "score": 0
+  },
+  {
+    "id": "fe63e8f0-2d22-46a4-a0c8-00cc5f21c9cf",
+    "title": "pytest hangs: while-True retry loop meets a truthy MagicMock",
+    "score": 0
+  },
+  {
+    "id": "78386005-5185-4f53-a846-a050afe747d2",
+    "title": "Virtualized list: clamp windowStart when the list shrinks",
+    "score": 0
+  },
+  {
+    "id": "15d7589f-b310-4669-a9bb-8f46f2a8a94d",
+    "title": "buildGraph resolves reads before the statement's own definitions",
+    "score": 0
+  },
+  {
+    "id": "24c69878-14cb-4f97-b236-e06fb1642ec7",
+    "title": "The checker's LLM produces relations in the same output as verdicts",
+    "score": 0
+  },
+  {
+    "id": "4ced7e18-bab6-44e1-88a2-ac63422b2067",
+    "title": "Supabase grants EXECUTE on new functions to anon by default",
+    "score": 0
+  },
+  {
+    "id": "89cf6e5f-c88a-4f36-a4c7-6aab5429bf38",
+    "title": "Supabase realtime DELETE payloads only carry the primary key",
+    "score": 0
+  },
+  {
+    "id": "3e1465a0-aef7-43e8-8224-f1f8db7f2854",
+    "title": "Supabase migrations: SET pg_trgm.similarity_threshold needs superuser",
+    "score": 0
+  },
+  {
+    "id": "c1f70e5e-d5d0-4fc7-a2fb-0027397e5661",
+    "title": "Resend domain stays 'pending' until the tracking CNAME verifies",
+    "score": 0
+  },
+  {
+    "id": "7382cf59-b442-4057-acb5-6358fe546255",
+    "title": "Resend returns relative DNS record names, not FQDNs",
+    "score": 0
+  },
+  {
+    "id": "6aeb8865-221e-4f0e-84ff-75049a8e5f4d",
+    "title": "Inline callbacks break React.memo rows; hover state lags tables",
+    "score": 0
+  },
+  {
+    "id": "3501f361-c889-4385-af41-a2c6e4db7961",
+    "title": "Supabase realtime: an effect keyed on list length drops events",
+    "score": 0
+  },
+  {
+    "id": "156e821a-6cfc-43c2-bd99-c8a861937ae1",
+    "title": "Moving supabase calls to await breaks every plain MagicMock test",
+    "score": 0
+  },
+  {
+    "id": "287ef2e8-4d7c-484b-bdd5-779f88516f6b",
+    "title": "Stripe amounts: zero-decimal currencies and refunds",
+    "score": 0
+  },
+  {
+    "id": "0cb96897-460d-4990-9a53-e2b8412712ef",
+    "title": "Next.js 15: webpack aliases for react break SSR (useContext of null)",
+    "score": 0
+  },
+  {
+    "id": "aadebea3-bb4d-4d8f-b2c3-8fdda7005583",
+    "title": "Pydantic drops unknown request fields: a rename mismatch can mass-send",
+    "score": 0
+  },
+  {
+    "id": "8b014806-8bc1-4cb8-bf07-d2262da62788",
+    "title": "Chat history validators must allow long assistant replies",
+    "score": 0
+  },
+  {
+    "id": "a69a1143-e900-400b-bfff-900a78fa8df8",
+    "title": "Dropping usually-empty output fields cuts checker output tokens",
+    "score": 0
+  }
+]

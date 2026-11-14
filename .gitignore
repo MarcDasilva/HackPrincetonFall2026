@@ -33,3 +33,11 @@ buildinggym/
 # personal photos
 IMG_*.jpg
 IMG_*.HEIC
+
+# Personal dev-only ear photo for the z shortcut (Dashboard.tsx) — biometric, never commit
+frontend/public/dev/
+
+# Local agent state and scraped scratch dumps
+.claude/settings.local.json
+.claude/*.lock
+notes/.*

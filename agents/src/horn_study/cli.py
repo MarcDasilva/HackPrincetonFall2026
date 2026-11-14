@@ -5,6 +5,7 @@ horn-study validate request.json     check inputs without running anything
 horn-study capabilities              print what the evaluator supports
 horn-study follow-up PARENT FU1 ...  build (and optionally run) a user-requested follow-up
 horn-study replay STUDY_ID           re-emit a recorded study's events, labeled as a replay
+horn-study earpiece STUDY_ID --patient-dir DIR   shape and build the selected design's earpiece
 """
 
 from __future__ import annotations
@@ -230,6 +231,35 @@ def cmd_replay(args: argparse.Namespace) -> int:
     return asyncio.run(_replay(args))
 
 
+def cmd_earpiece(args: argparse.Namespace) -> int:
+    from horn_study.earpiece import EarpieceError, produce_earpiece
+    from horn_study.llm import ModelNotConfigured, load_model
+
+    try:
+        record = produce_earpiece(
+            _studies_dir(args) / args.study_id,
+            Path(args.patient_dir).resolve(),
+            load_model("designer"),
+            max_builds=args.max_builds,
+        )
+    except ModelNotConfigured as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return EXIT_CONFIGURATION
+    except EarpieceError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return EXIT_FAILED
+    for b in record["builds"]:
+        reasons = "; ".join(r["message"] for r in b["report"].get("reasons", []))
+        print(f"{b['design_id']}: {'built' if b['report'].get('ok') else 'rejected'}  {b['why']}  {reasons}")
+    chosen = record["chosen"]
+    print(
+        f"chosen: {chosen['design_id']} ({chosen['chosen_by']}) {chosen['explanation']}"
+        if chosen
+        else "no buildable design"
+    )
+    return EXIT_COMPLETED if chosen else EXIT_FAILED
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="horn-study",
@@ -279,6 +309,16 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--speed", type=float, default=4.0, help="Playback speed-up. 0 prints at once.")
     replay.add_argument("--json", action="store_true", help="Print events as JSON lines.")
     replay.set_defaults(handler=cmd_replay)
+
+    earpiece = commands.add_parser(
+        "earpiece",
+        parents=[common],
+        help="Shape and build the earpiece for a finished study's selected design.",
+    )
+    earpiece.add_argument("study_id")
+    earpiece.add_argument("--patient-dir", required=True, help="Backend patient folder (holds context/).")
+    earpiece.add_argument("--max-builds", type=int, default=4)
+    earpiece.set_defaults(handler=cmd_earpiece)
     return parser
 
 

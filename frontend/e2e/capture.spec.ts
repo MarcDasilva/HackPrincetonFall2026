@@ -14,7 +14,8 @@ test("captured picture auto-attaches to the chat", async ({ page }) => {
   await expect(chip.getByAltText("Captured ear attachment")).toBeVisible();
   await page.waitForTimeout(800); // camera panel retract animation
   await page.screenshot({ path: "test-results/capture-attached.png" });
-  // Sending clears the attachment.
-  await page.getByRole("button", { name: "Send" }).click();
+  // A photo alone cannot start a run (the arrow also needs a hearing test), and the chip is removable.
+  await expect(page.getByRole("button", { name: "Send" })).toBeDisabled();
+  await page.getByRole("button", { name: "Remove attachment" }).click();
   await expect(chip).toHaveCount(0);
 });
