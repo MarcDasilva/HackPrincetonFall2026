@@ -29,7 +29,7 @@ from . import ear_world as ew
 DEFAULT = {
     "throat_mm2": 1.0, "mouth_mm2": 22.2,        # handoff doc's example areas (area ratio 22.2)
     "max_path_mm": 130, "min_wall_mm": 0.6,
-    "tip_length_mm": 6.0, "tip_clearance_mm": 0.6,
+    "tip_length_mm": 9.0, "tip_clearance_mm": 0.6,
     "vent_diameter_mm": 0.8, "vent_offset_mm": 2.2,
 }
 
@@ -229,7 +229,17 @@ def build(context_dir, out_dir, overrides=None, log=print):
         "vent_diameter_mm": D["vent_diameter_mm"], "vent_wall_to_bore_mm": round(float(vent_clear), 2),
         "shell_volume_cc": round(shell.volume / 1000, 2), "bore_volume_cc": round(bore_in.volume / 1000, 2),
         "printable_solid_watertight": bool(solid.is_watertight), "print_volume_cc": round(solid.volume / 1000, 2),
-        "notes": ["est_* use the simple horn formulas; the design loop replaces them with the 1D model + losses.",
+        # what the acoustic model needs: area along the bore (mouth -> throat outlet), vent, fit
+        "acoustic": {
+            "s_mm": np.round(np.interp(np.linspace(0, 1, 240), np.linspace(0, 1, len(full)),
+                                       np.r_[0, np.cumsum(np.linalg.norm(np.diff(full, axis=0), axis=1))]), 3).tolist(),
+            "area_mm2": np.round(np.pi * np.interp(np.linspace(0, 1, 240), np.linspace(0, 1, len(full)), full_r) ** 2, 4).tolist(),
+            "vent_diameter_mm": D["vent_diameter_mm"],
+            "vent_length_mm": round(float(np.linalg.norm(vent_path[-1] - vent_path[0])), 2),
+            "concha_fill": 1.0,            # this shell fills the whole concha
+            "tip_length_mm": D["tip_length_mm"],
+        },
+        "notes": ["est_* use the simple horn formulas; see acoustics.json for the modelled insertion gain.",
                   "Canal opening position/size are assumed (not visible in a photo)."],
     }
     json.dump(design, open(os.path.join(out, "design.json"), "w"), indent=1)

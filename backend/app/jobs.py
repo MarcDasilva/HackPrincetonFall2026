@@ -15,7 +15,7 @@ from .settings import settings
 _pool = ThreadPoolExecutor(max_workers=settings.workers)
 _write_lock = threading.Lock()
 
-STEPS = ["ear", "context", "aid"]
+STEPS = ["ear", "context", "aid", "acoustics", "score"]
 
 
 def patient_dir(pid):
@@ -56,6 +56,26 @@ def _logger(pid):
     return log
 
 
+def _finish_aid(pid, d, design, log):
+    """After the geometry: model its acoustics, then score it for this patient."""
+    from hornsim import acoustics, score
+
+    job = read_job(pid)
+    job["results"]["aid"] = {k: v for k, v in design.items() if k != "acoustic"}
+    job["step"] = "acoustics"
+    write_job(pid, job)
+    ac = acoustics.evaluate(d, log=log)
+    job = read_job(pid)
+    job["results"]["acoustics"] = ac["summary"]
+    job["step"] = "score"
+    write_job(pid, job)
+    sc = score.score(d, log=log)
+    job = read_job(pid)
+    job["results"]["score"] = sc
+    job.update(status="done", step=None, finished_at=time.time())
+    write_job(pid, job)
+
+
 def run_full(pid, request):
     """Whole pipeline for a new patient."""
     from earrecon import reconstruct as er
@@ -85,10 +105,7 @@ def run_full(pid, request):
         write_job(pid, job)
 
         design = aid.build(os.path.join(d, "context"), os.path.join(d, "aid"), request.get("design"), log=log)
-        job = read_job(pid)
-        job["results"]["aid"] = design
-        job.update(status="done", step=None, finished_at=time.time())
-        write_job(pid, job)
+        _finish_aid(pid, d, design, log)
     except Exception as e:  # report to the client; keep the trace in the log
         log(traceback.format_exc(limit=3))
         _update(pid, status="error", error=str(e))
@@ -103,10 +120,7 @@ def run_aid(pid, overrides):
     try:
         _update(pid, status="running", step="aid", error=None)
         design = aid.build(os.path.join(d, "context"), os.path.join(d, "aid"), overrides, log=log)
-        job = read_job(pid)
-        job["results"]["aid"] = design
-        job.update(status="done", step=None, finished_at=time.time())
-        write_job(pid, job)
+        _finish_aid(pid, d, design, log)
     except Exception as e:
         log(traceback.format_exc(limit=3))
         _update(pid, status="error", error=str(e))

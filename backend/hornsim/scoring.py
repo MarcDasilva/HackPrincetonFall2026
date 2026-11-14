@@ -14,8 +14,8 @@ HASPI_FREQS = np.array([250, 500, 1000, 2000, 4000, 6000])
 
 
 def audiogram(levels_by_freq: dict) -> Audiogram:
-    f = np.array(sorted(levels_by_freq), float)
-    return Audiogram(levels=np.array([levels_by_freq[k] for k in sorted(levels_by_freq)], float), frequencies=f)
+    pairs = sorted((float(k), float(v)) for k, v in levels_by_freq.items())   # JSON keys arrive as strings
+    return Audiogram(levels=np.array([v for _, v in pairs]), frequencies=np.array([k for k, _ in pairs]))
 
 
 def haspi(reference, processed, fs, ag: Audiogram, level_db, seed=0):

@@ -3,6 +3,7 @@
 import { supabase } from "@/lib/supabase";
 import { useState } from "react";
 import { MetalFx } from "metal-fx";
+import { useMounted } from "@/lib/useMounted";
 
 const buttonStyle: React.CSSProperties = {
   display: "inline-flex",
@@ -35,6 +36,7 @@ const GoogleG = () => (
 
 export default function GoogleSignIn() {
   const [open, setOpen] = useState(false);
+  const mounted = useMounted();
 
   const signIn = () =>
     // redirectTo must be listed in Supabase Auth > URL Configuration > Redirect URLs — otherwise Supabase falls back to the Site URL and /auth/callback never exchanges the code.
@@ -43,8 +45,7 @@ export default function GoogleSignIn() {
       options: { redirectTo: `${location.origin}/auth/callback` },
     });
 
-  return (
-    <MetalFx preset="silver" variant="button" innerShadow>
+  const button = (
       <button
         type="button"
         aria-label="Sign in with Google"
@@ -73,6 +74,15 @@ export default function GoogleSignIn() {
           sign in
         </span>
       </button>
+  );
+
+  // MetalFx renders differently on the server (no WebGL) and in the browser; add the ring
+  // only after hydration so the server HTML matches the first client render.
+  return mounted ? (
+    <MetalFx preset="silver" variant="button" innerShadow>
+      {button}
     </MetalFx>
+  ) : (
+    button
   );
 }
