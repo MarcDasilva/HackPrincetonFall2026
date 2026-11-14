@@ -92,8 +92,10 @@ so they work at the same time. Give each a direction: what you most need from it
 profile and these needs. Each returns its report and its findings, and each finding quotes a \
 passage from a source the investigator read.
 2. Read the evidence critically. The reports are saved under /research/ and the full text of \
-every source that was read is under /sources/. Before you build a hypothesis on a finding, \
-you can open its source with grep or read_file and check what the passage really supports. \
+every source that was read is under /sources/. Check the findings your plan will rest on: \
+for each one a hypothesis is going to cite, open its source with grep or read_file and \
+confirm the passage supports the claim the way you intend to use it. A finding taken from an \
+abstract, or about a different device or population, supports less than its claim suggests. \
 Note thin or conflicting evidence. You may send an investigator back with a sharper \
 direction. Follow-up assignments are limited, so spend one where it matters most: usually on \
 the investigator whose evidence is weakest for the plan (few findings, abstracts only, or \
