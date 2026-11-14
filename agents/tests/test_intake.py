@@ -108,6 +108,23 @@ def test_conflicting_duplicate_values_are_rejected():
     assert reject(raw) == ["hearing.duplicate_measurement"]
 
 
+def test_a_budget_too_small_for_the_required_coverage_is_rejected_before_anything_runs():
+    assert CAPS.minimum_scenarios == 2
+    raw = make_request()
+    raw["budget"]["max_evaluation_cases"] = 3
+    with pytest.raises(InputRejected) as caught:
+        accept(raw)
+    (issue,) = caught.value.issues
+    assert (issue.code, issue.field) == ("budget.below_required_coverage", "budget.max_evaluation_cases")
+    assert issue.message == (
+        "The budget allows 3 evaluation cases, but the smallest study this evaluator accepts needs 4: "
+        "the control and one design in each of at least 2 scenarios. Raise budget.max_evaluation_cases."
+    )
+
+    raw["budget"]["max_evaluation_cases"] = 4
+    assert accept(raw).budget.max_evaluation_cases == 4
+
+
 def test_personalized_mode_requires_a_hearing_profile():
     raw = make_request()
     del raw["hearing_profile"]

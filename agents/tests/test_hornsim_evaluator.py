@@ -1,0 +1,866 @@
+"""The hornsim evaluator: the real pipeline behind the contract, with the bridge process stubbed.
+
+These tests need no backend environment. `FakeBridge` answers the four bridge
+commands the way `bridges/hornsim_bridge.py` does. The one test that runs the
+real pipeline is skipped unless the backend variables are set.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+import os
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+
+import pytest
+from helpers import Harness, coordinator_responder, make_request, valid_draft
+
+import horn_study.hornsim_evaluator as hornsim_evaluator
+from horn_study.contracts import (
+    EvaluatorHearingInput,
+    ExperimentSpec,
+    HearingMeasurement,
+    StudyState,
+)
+from horn_study.evaluator_adapter import (
+    REAL_EVALUATOR_ENV,
+    CallableEvaluator,
+    EvaluatorNotConfigured,
+    TransientEvaluatorError,
+    evaluator_for,
+)
+from horn_study.hornsim_evaluator import (
+    BACKEND_DIR_ENV,
+    BASELINE_ID,
+    CALIBRATION_REF,
+    EAR_MESH_ENV,
+    FAMILY_ID,
+    FIDELITY,
+    WORK_DIR_ENV,
+    BridgeProcessError,
+    HornsimConfig,
+    HornsimEvaluator,
+    process_runner,
+)
+from horn_study.intake import InputRejected, parse_request, validate_request
+from horn_study.runner import check_result
+from horn_study.workflow import run_study
+
+VERSION = "hornsim-abc1234"
+THRESHOLDS = {250: 15, 500: 20, 1000: 30, 2000: 45, 4000: 55, 6000: 55}
+DEFAULT_DESIGN = {
+    "throat_mm2": 1.0,
+    "mouth_mm2": 22.2,
+    "vent_diameter_mm": 0.8,
+    "min_wall_mm": 0.6,
+    "max_path_mm": 130.0,
+    "tip_clearance_mm": 0.6,
+}
+# A design the first version could not build: a wide throat, a large mouth, and no vent.
+WIDE_DESIGN = {**DEFAULT_DESIGN, "throat_mm2": 20.0, "mouth_mm2": 150.0, "vent_diameter_mm": 0.0}
+BRIDGE = Path(__file__).resolve().parents[1] / "bridges" / "hornsim_bridge.py"
+
+# What `hornsim_bridge.py describe` printed for the backend this adapter was written against.
+DESCRIBED: dict[str, Any] = {
+    "ok": True,
+    "version": VERSION,
+    "dependencies": {"pyclarity": "0.9.0"},
+    "aid_design_fields": {
+        "throat_mm2": {"default": 1.0, "minimum": 0.3, "maximum": 31},
+        "mouth_mm2": {"default": 22.2, "minimum": 2, "maximum": 200},
+        "vent_diameter_mm": {"default": 0.8, "minimum": 0, "maximum": 2.5},
+        "min_wall_mm": {"default": 0.6, "minimum": 0.4, "maximum": 2},
+        "max_path_mm": {"default": 130, "minimum": 20, "maximum": 300},
+        "tip_clearance_mm": {"default": 0.6, "minimum": 0.2, "maximum": 1.5},
+    },
+    "aid_defaults": {
+        "throat_mm2": 1.0,
+        "mouth_mm2": 22.2,
+        "max_path_mm": 130,
+        "min_wall_mm": 0.6,
+        "tip_length_mm": 9.0,
+        "tip_clearance_mm": 0.6,
+        "vent_diameter_mm": 0.8,
+        "vent_offset_mm": 2.2,
+    },
+    "levels_db_spl": [50, 65, 80],
+    "clips": [
+        {"name": "clean_1", "type": "clean"},
+        {"name": "clean_2", "type": "clean"},
+        {"name": "clean_3", "type": "clean"},
+        {"name": "babble_1", "type": "babble", "snr_db": 5},
+        {"name": "babble_2", "type": "babble", "snr_db": 5},
+        {"name": "babble_3", "type": "babble", "snr_db": 5},
+        {"name": "babble_4", "type": "babble", "snr_db": 5},
+    ],
+    "babble_talkers": 6,
+    "haspi_seed": 0,
+    "reference_db_spl": 65.0,
+    "haspi_frequencies_hz": [250.0, 500.0, 1000.0, 2000.0, 4000.0, 6000.0],
+    "hornsim_haspi_frequencies_hz": [250.0, 500.0, 1000.0, 2000.0, 4000.0, 6000.0],
+    "ceiling_prescriptions": ["nal_r", "half_gain", "full_gain"],
+    "canal": {"residual_volume_cc": [0.5, 0.9], "samples": 32, "scored": 5, "assumed_diameter_mm": 7.5},
+    "ear_mesh": {
+        "file_name": "ear.ply",
+        "sha256": "f" * 64,
+        "provenance": {"source": "AudioEar average ear. A template, not a person's ear."},
+    },
+}
+
+
+class FakeBridge:
+    """Answers bridge commands in memory and records every call."""
+
+    def __init__(self, *, build_delay: float = 0.0) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.build_delay = build_delay
+        self.does_not_fit: set[float] = set()  # mouth areas that cannot be routed
+        self.crashes: set[float] = set()  # mouth areas whose build raises inside a library
+        self.vent_wall_to_bore_mm = 0.74
+        self.version = VERSION
+        self._lock = threading.Lock()
+
+    def count(self, command: str) -> int:
+        return sum(1 for name, _ in self.calls if name == command)
+
+    def payloads(self, command: str) -> list[dict[str, Any]]:
+        return [payload for name, payload in self.calls if name == command]
+
+    def __call__(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            self.calls.append((command, copy.deepcopy(payload)))
+        return getattr(self, f"_{command}")(payload)
+
+    def _describe(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {**copy.deepcopy(DESCRIBED), "version": self.version}
+
+    def _context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+        folder = f"{payload['work_dir']}/contexts/{key}"
+        return {
+            "ok": True,
+            "version": self.version,
+            "context_key": key,
+            "context_dir": folder,
+            "reused": False,
+            "seconds": 60.0,
+            "audiogram_db_hl": {k: float(v) for k, v in payload["audiogram_db_hl"].items()},
+            "ear_mesh": DESCRIBED["ear_mesh"],
+            "ear_world": {"bowl_volume_cc": 3.4},
+            "assets": {
+                "references_json": f"{folder}/references.json",
+                "canals_json": f"{folder}/canals.json",
+            },
+        }
+
+    def _build(self, payload: dict[str, Any]) -> dict[str, Any]:
+        time.sleep(self.build_delay)
+        parameters = payload["parameters"]
+        mouth = parameters["mouth_mm2"]
+        key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+        folder = f"{payload['work_dir']}/candidates/{key}"
+        answer: dict[str, Any] = {
+            "ok": True,
+            "version": self.version,
+            "candidate_key": key,
+            "candidate_dir": folder,
+            "reused": False,
+            "seconds": 120.0,
+            "build_seconds": 120.0,
+        }
+        if mouth in self.crashes:
+            return {"ok": False, "error": {"code": "bridge_crashed", "message": "ValueError: boom"}}
+        if mouth in self.does_not_fit:
+            return {**answer, "fits": False, "error": "no bore route fits this concha with these areas"}
+        return {
+            **answer,
+            "fits": True,
+            "design": {
+                "bore_length_mm": 50.0 + mouth,
+                "printable_solid_watertight": True,
+                # hornsim.aid writes null here for a design with no vent.
+                "vent_wall_to_bore_mm": self.vent_wall_to_bore_mm if parameters["vent_diameter_mm"] else None,
+                **parameters,
+            },
+            "acoustics_summary": {
+                "mean_ig_500_1k_db": -10.5,
+                "mean_ig_1k_2k_db": -20.2,
+                "mean_ig_2k_4k_db": -25.2,
+                "mean_ig_4k_8k_db": -22.5,
+                "peak_ig_db": 7.3,
+                "peak_ig_hz": 285,
+            },
+            "assets": {
+                "design_json": f"{folder}/aid/design.json",
+                "aid_glb": f"{folder}/aid/aid.glb",
+                "aid_print_stl": f"{folder}/aid/aid_print.stl",
+                "acoustics_json": f"{folder}/aid/acoustics.json",
+            },
+        }
+
+    def _score(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # The bridge scores every clip of the type and reports their mean.
+        clips = [clip["name"] for clip in DESCRIBED["clips"] if clip["type"] == payload["clip_type"]]
+        unaided = 0.5 if payload["clip_type"] == "clean" else 0.25
+        aided = unaided if payload["candidate_dir"] is None else unaided + 0.125
+        return {
+            "ok": True,
+            "version": self.version,
+            "clip_type": payload["clip_type"],
+            "level_db_spl": payload["level_db_spl"],
+            "haspi_mean": aided,
+            "haspi_worst_canal": aided - (0.0 if payload["candidate_dir"] is None else 0.03125),
+            "unaided_haspi_mean": unaided,
+            "canals_used_cc": [0.5, 0.6, 0.7, 0.8, 0.9],
+            "haspi_seed": 0,
+            "per_clip": [{"clip": name, "unaided_haspi": unaided} for name in clips],
+            "seconds": 5.0,
+        }
+
+
+def make_config(tmp_path: Path) -> HornsimConfig:
+    return HornsimConfig(
+        backend_dir=tmp_path / "backend",
+        python=tmp_path / "backend" / ".venv" / "bin" / "python",
+        ear_mesh=tmp_path / "ear.ply",
+        work_dir=tmp_path / "work",
+    )
+
+
+def make_evaluator(tmp_path: Path, bridge: FakeBridge | None = None) -> tuple[HornsimEvaluator, FakeBridge]:
+    bridge = bridge or FakeBridge()
+    return HornsimEvaluator(make_config(tmp_path), run_bridge=bridge), bridge
+
+
+def hearing(thresholds: dict[int, float] | None = None) -> EvaluatorHearingInput:
+    return EvaluatorHearingInput(
+        profile_id="entered_test_example",
+        source="user_entered_test_results",
+        target_ear="right",
+        measurements=tuple(
+            HearingMeasurement(ear="right", frequency_hz=f, threshold_db_hl=t)
+            for f, t in (thresholds or THRESHOLDS).items()
+        ),
+    )
+
+
+def make_spec(
+    candidate_id: str = "default_horn",
+    scenario_id: str = "clean_speech_65_db_spl",
+    *,
+    parameters: dict[str, float] | None = None,
+    baseline: bool = False,
+    thresholds: dict[int, float] | None = None,
+) -> ExperimentSpec:
+    return ExperimentSpec(
+        study_id="study_test_001",
+        experiment_id=f"{candidate_id}--{scenario_id}",
+        candidate_id=candidate_id,
+        candidate_kind="baseline" if baseline else "design",
+        family_id=None if baseline else FAMILY_ID,
+        baseline_id=BASELINE_ID if baseline else None,
+        parameters={} if baseline else dict(parameters or DEFAULT_DESIGN),
+        hearing_input=hearing(thresholds),
+        scenario_id=scenario_id,
+        canal_config_id="sampled_canals",
+        fidelity=FIDELITY,
+        calibration_ref=CALIBRATION_REF,
+    )
+
+
+def as_contract(evaluator: HornsimEvaluator) -> CallableEvaluator:
+    """Wrap the evaluator the way `load_evaluator` does."""
+    return CallableEvaluator(evaluator.get_evaluator_capabilities, evaluator.evaluate_experiment)
+
+
+# --------------------------------------------------------------------------
+# Capabilities
+# --------------------------------------------------------------------------
+
+
+def test_capabilities_validate_against_the_contract_and_come_from_the_backend(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    capabilities = as_contract(evaluator).get_evaluator_capabilities()
+
+    assert capabilities.kind == "real"
+    assert capabilities.evaluator_version == VERSION
+    assert bridge.payloads("describe") == [{"ear_mesh": str(tmp_path / "ear.ply")}]
+
+    (family,) = capabilities.geometry_families
+    assert family.family_id == FAMILY_ID
+    assert {p.name: (p.minimum, p.maximum, p.unit) for p in family.parameters} == {
+        "throat_mm2": (0.3, 31, "mm^2"),
+        "mouth_mm2": (2, 200, "mm^2"),
+        # 0 is a design with no vent, which hornsim.aid builds.
+        "vent_diameter_mm": (0, 2.5, "mm"),
+        "min_wall_mm": (0.4, 2, "mm"),
+        "max_path_mm": (20, 300, "mm"),
+        "tip_clearance_mm": (0.2, 1.5, "mm"),
+    }
+    assert all(p.description for p in family.parameters)
+    assert [(b.baseline_id, b.kind) for b in capabilities.baselines] == [("unaided", "unaided")]
+
+    assert capabilities.hearing_input.required_frequencies_hz == (250, 500, 1000, 2000, 4000, 6000)
+    assert capabilities.hearing_input.optional_frequencies_hz == ()
+    assert not capabilities.hearing_input.accepts_additional_frequencies
+    assert not capabilities.hearing_input.accepts_no_response
+    assert capabilities.demo_profiles == ()
+
+    assert [s.scenario_id for s in capabilities.scenarios] == [
+        "clean_speech_50_db_spl",
+        "clean_speech_65_db_spl",
+        "clean_speech_80_db_spl",
+        "speech_in_babble_50_db_spl",
+        "speech_in_babble_65_db_spl",
+        "speech_in_babble_80_db_spl",
+    ]
+    assert [s.source_level_db_spl for s in capabilities.scenarios] == [50, 65, 80, 50, 65, 80]
+    babble = capabilities.scenarios[4].description
+    assert babble.startswith("4 Harvard sentences")
+    assert "at +5 dB" in babble
+    assert "means over the 4 clips" in babble
+    names = [m.name for m in capabilities.metrics]
+    assert len(names) == len(set(names))
+    assert names[:3] == ["haspi_v2_mean", "haspi_v2_worst_canal", "haspi_v2_improvement_over_unaided"]
+    assert all(m.unit and m.direction for m in capabilities.metrics)
+
+    assert not capabilities.supports_seeds
+    assert capabilities.calibration.calibration_ref == CALIBRATION_REF
+    assert "65 dB SPL" in capabilities.calibration.description
+    assert "(level - 65) dB" in capabilities.calibration.source_level_convention
+    assert capabilities.default_fidelity in capabilities.fidelity_levels
+    unsupported = {u.requirement for u in capabilities.unsupported_requirements}
+    assert {"secure_retention", "comfort", "hearing_protection", "music_quality"} <= unsupported
+    for simplification in ("eardrum", "concha", "assumed 7.5 mm diameter"):
+        assert simplification in capabilities.model_description
+
+    # The mesh identity is part of the snapshot, so cached results never cross ears.
+    dumped = capabilities.model_dump(mode="json")
+    assert dumped["ear_mesh"]["sha256"] == "f" * 64
+    assert dumped["fixed_design_values"] == {"tip_length_mm": 9.0, "vent_offset_mm": 2.2}
+
+
+def test_capabilities_follow_the_backend_when_it_changes(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    assert evaluator.get_evaluator_capabilities()["evaluator_version"] == VERSION
+    bridge.version = "hornsim-def5678"
+    assert evaluator.get_evaluator_capabilities()["evaluator_version"] == "hornsim-def5678"
+
+
+def test_written_text_has_no_em_dash(tmp_path):
+    evaluator, _ = make_evaluator(tmp_path)
+    assert chr(0x2014) not in json.dumps(evaluator.get_evaluator_capabilities(), ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------
+# Results
+# --------------------------------------------------------------------------
+
+
+def test_design_and_control_results_pass_the_runner_checks(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    contract = as_contract(evaluator)
+    capabilities = contract.get_evaluator_capabilities()
+    declared = {m.name: m.unit for m in capabilities.metrics}
+
+    for spec in (make_spec(), make_spec("unaided", baseline=True)):
+        result = contract.evaluate_experiment(spec)
+        assert check_result(spec, result, capabilities) == []
+        assert result.status == "completed"
+        assert (result.experiment_id, result.candidate_id, result.spec_hash) == (
+            spec.experiment_id,
+            spec.candidate_id,
+            spec.spec_hash(),
+        )
+        assert {m.name: m.unit for m in result.metrics} == declared
+        assert all(math.isfinite(m.value) for m in result.metrics)
+        assert result.provenance.kind == "real"
+        assert result.seed is None
+
+    design = contract.evaluate_experiment(make_spec())
+    values = {m.name: m.value for m in design.metrics}
+    assert values["haspi_v2_mean"] == 0.625
+    assert values["haspi_v2_worst_canal"] == 0.59375
+    assert values["haspi_v2_improvement_over_unaided"] == 0.125
+    assert values["insertion_gain_2000_4000_hz_db"] == -25.2
+    assert values["bore_length_mm"] == 72.2
+    kinds = {a.kind: a.ref for a in design.assets}
+    assert kinds["design_json"].endswith("/aid/design.json")
+    assert kinds["aid_print_stl"].endswith("/aid/aid_print.stl")
+    assert kinds["acoustics_json"].endswith("/aid/acoustics.json")
+    assert kinds["references_json"].endswith("/references.json")
+    assert design.evaluation_config["level_db_spl"] == 65
+    assert design.evaluation_config["haspi_seed"] == 0
+
+    control = contract.evaluate_experiment(make_spec("unaided", baseline=True))
+    values = {m.name: m.value for m in control.metrics}
+    assert values["haspi_v2_mean"] == values["haspi_v2_worst_canal"] == 0.5
+    assert values["haspi_v2_improvement_over_unaided"] == 0
+    assert values["insertion_gain_2000_4000_hz_db"] == 0
+    assert values["bore_length_mm"] == 0
+    assert bridge.payloads("score")[-1]["candidate_dir"] is None
+
+
+def test_a_wide_throat_design_with_no_vent_is_built_and_scored(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    contract = as_contract(evaluator)
+    capabilities = contract.get_evaluator_capabilities()
+    spec = make_spec("wide_funnel", "speech_in_babble_65_db_spl", parameters=WIDE_DESIGN)
+    result = contract.evaluate_experiment(spec)
+
+    assert check_result(spec, result, capabilities) == []
+    assert result.status == "completed", result.error
+    assert bridge.payloads("build")[0]["parameters"] == WIDE_DESIGN
+    saved = result.model_dump(mode="json")
+    assert saved["design"]["vent_wall_to_bore_mm"] is None
+    # A babble scenario is the mean over every babble clip, like a clean one over the clean clips.
+    assert [entry["clip"] for entry in saved["haspi_per_clip"]] == [
+        "babble_1",
+        "babble_2",
+        "babble_3",
+        "babble_4",
+    ]
+    assert bridge.payloads("score")[0]["clip_type"] == "babble"
+    assert {m.name: m.value for m in result.metrics}["haspi_v2_improvement_over_unaided"] == 0.125
+
+
+def test_supplied_thresholds_reach_the_model_unmodified(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    odd = {250: 12.5, 500: 20, 1000: 33, 2000: 47.5, 4000: 55, 6000: 61}
+    as_contract(evaluator).evaluate_experiment(make_spec("unaided", baseline=True, thresholds=odd))
+    (sent,) = bridge.payloads("context")
+    assert sent["audiogram_db_hl"] == {
+        "250": 12.5,
+        "500": 20,
+        "1000": 33,
+        "2000": 47.5,
+        "4000": 55,
+        "6000": 61,
+    }
+    assert sent["side"] == "right"
+    assert sent["ear_mesh"] == str(tmp_path / "ear.ply")
+
+
+def test_a_spec_without_every_haspi_frequency_is_refused_not_filled_in(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    partial = {f: t for f, t in THRESHOLDS.items() if f != 6000}
+    spec = make_spec("unaided", baseline=True, thresholds=partial)
+    result = as_contract(evaluator).evaluate_experiment(spec)
+
+    assert result.status == "unsupported"
+    assert result.error is not None
+    assert result.error.code == "missing_thresholds"
+    assert "6000" in result.error.message
+    assert result.metrics == ()
+    assert bridge.count("context") == bridge.count("score") == 0
+
+
+@pytest.mark.parametrize(
+    ("change", "code"),
+    [
+        ({"scenario_id": "quiet_conversation"}, "unsupported_scenario"),
+        ({"seed": 3}, "seeds_unsupported"),
+        ({"calibration_ref": "fixture-cal-v1"}, "calibration_mismatch"),
+        ({"ear_mesh_ref": "/somewhere/else.ply"}, "ear_mesh_mismatch"),
+        ({"family_id": "conical_horn_fixture"}, "unsupported_family"),
+        ({"parameters": {**DEFAULT_DESIGN, "throat_mm2": 0.1}}, "out_of_bounds"),
+        ({"parameters": {**DEFAULT_DESIGN, "throat_mm2": 40.0, "mouth_mm2": 150.0}}, "out_of_bounds"),
+        ({"parameters": {**DEFAULT_DESIGN, "vent_diameter_mm": -0.1}}, "out_of_bounds"),
+        ({"parameters": {**DEFAULT_DESIGN, "tip_clearance_mm": 0.05}}, "out_of_bounds"),
+        ({"parameters": {**DEFAULT_DESIGN, "mouth_mm2": 2.0, "throat_mm2": 5.0}}, "out_of_bounds"),
+        ({"parameters": {k: v for k, v in DEFAULT_DESIGN.items() if k != "max_path_mm"}}, "bad_parameter"),
+    ],
+)
+def test_specs_outside_the_declared_capabilities_are_unsupported(tmp_path, change, code):
+    evaluator, bridge = make_evaluator(tmp_path)
+    spec = make_spec().model_copy(update=change)
+    result = as_contract(evaluator).evaluate_experiment(spec)
+
+    assert result.status == "unsupported"
+    assert result.error is not None
+    assert result.error.code == code
+    assert bridge.count("build") == 0
+
+
+# --------------------------------------------------------------------------
+# One build per candidate
+# --------------------------------------------------------------------------
+
+
+def test_each_candidate_is_built_once_across_scenarios_and_threads(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path, FakeBridge(build_delay=0.05))
+    contract = as_contract(evaluator)
+    capabilities = contract.get_evaluator_capabilities()
+    wide = {**DEFAULT_DESIGN, "mouth_mm2": 40.0}
+    specs = [make_spec("unaided", s.scenario_id, baseline=True) for s in capabilities.scenarios]
+    specs += [make_spec("default_horn", s.scenario_id) for s in capabilities.scenarios]
+    specs += [make_spec("wide_mouth", s.scenario_id, parameters=wide) for s in capabilities.scenarios]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(contract.evaluate_experiment, specs))
+
+    assert all(
+        check_result(spec, result, capabilities) == [] for spec, result in zip(specs, results, strict=True)
+    )
+    assert [r.status for r in results] == ["completed"] * 18
+    assert bridge.count("context") == 1
+    assert bridge.count("build") == 2
+    assert sorted(p["parameters"]["mouth_mm2"] for p in bridge.payloads("build")) == [22.2, 40.0]
+    assert bridge.count("score") == 18
+    lengths = {r.candidate_id: {m.name: m.value for m in r.metrics}["bore_length_mm"] for r in results}
+    assert lengths == {"unaided": 0, "default_horn": 72.2, "wide_mouth": 90.0}
+
+
+def test_a_different_audiogram_gets_its_own_context(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    contract = as_contract(evaluator)
+    contract.evaluate_experiment(make_spec("unaided", baseline=True))
+    contract.evaluate_experiment(make_spec("unaided", "speech_in_babble_65_db_spl", baseline=True))
+    contract.evaluate_experiment(make_spec("unaided", baseline=True, thresholds={**THRESHOLDS, 4000: 60}))
+    assert bridge.count("context") == 2
+
+
+# --------------------------------------------------------------------------
+# Failures stay failures
+# --------------------------------------------------------------------------
+
+
+def test_a_design_that_does_not_fit_the_ear_is_a_failed_case_with_no_score(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    bridge.does_not_fit.add(60.0)
+    contract = as_contract(evaluator)
+    capabilities = contract.get_evaluator_capabilities()
+    too_big = {**DEFAULT_DESIGN, "mouth_mm2": 60.0}
+
+    results = []
+    for scenario in ("clean_speech_65_db_spl", "speech_in_babble_65_db_spl"):
+        spec = make_spec("too_big", scenario, parameters=too_big)
+        result = contract.evaluate_experiment(spec)
+        assert check_result(spec, result, capabilities) == []
+        results.append(result)
+
+    for result in results:
+        assert result.status == "failed"
+        assert result.metrics == ()
+        assert result.error is not None
+        assert result.error.code == "geometry_does_not_fit"
+        assert "no bore route fits this concha" in result.error.message
+        assert not result.error.transient
+    assert bridge.count("build") == 1
+    assert bridge.count("score") == 0
+
+
+def test_a_vent_that_cuts_into_the_bore_is_a_failed_case_with_no_score(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    bridge.vent_wall_to_bore_mm = -0.97
+    contract = as_contract(evaluator)
+    capabilities = contract.get_evaluator_capabilities()
+    spec = make_spec("vent_large", parameters={**DEFAULT_DESIGN, "vent_diameter_mm": 2.0})
+    result = contract.evaluate_experiment(spec)
+
+    assert check_result(spec, result, capabilities) == []
+    assert result.status == "failed"
+    assert result.metrics == ()
+    assert result.error is not None
+    assert result.error.code == "vent_intersects_bore"
+    assert "-0.97" in result.error.message
+    assert bridge.count("score") == 0
+    # The built files are still referenced, so the overlap can be inspected.
+    assert "design_json" in {asset.kind for asset in result.assets}
+
+
+def test_a_build_that_crashes_is_a_failed_case_and_is_not_repeated(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    bridge.crashes.add(30.0)
+    contract = as_contract(evaluator)
+    spec = make_spec("crashing", parameters={**DEFAULT_DESIGN, "mouth_mm2": 30.0})
+    first = contract.evaluate_experiment(spec)
+    second = contract.evaluate_experiment(spec)
+
+    assert first.status == second.status == "failed"
+    assert first.error is not None
+    assert first.error.code == "build_failed"
+    assert "boom" in first.error.message
+    assert bridge.count("build") == 1
+
+
+def test_a_backend_that_changed_under_a_frozen_plan_is_caught_by_the_runner(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    contract = as_contract(evaluator)
+    capabilities = contract.get_evaluator_capabilities()
+    bridge.version = "hornsim-def5678"
+    spec = make_spec("unaided", baseline=True)
+    issues = check_result(spec, contract.evaluate_experiment(spec), capabilities)
+    assert any("evaluator version 'hornsim-def5678'" in issue for issue in issues)
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+
+def test_missing_configuration_names_every_variable(monkeypatch):
+    with pytest.raises(EvaluatorNotConfigured) as raised:
+        HornsimConfig.from_env({})
+    message = str(raised.value)
+    for name in (BACKEND_DIR_ENV, EAR_MESH_ENV, WORK_DIR_ENV):
+        assert name in message
+
+
+def test_configuration_that_points_nowhere_says_what_is_wrong(tmp_path):
+    env = {
+        BACKEND_DIR_ENV: str(tmp_path / "backend"),
+        EAR_MESH_ENV: str(tmp_path / "ear.ply"),
+        WORK_DIR_ENV: str(tmp_path / "work"),
+    }
+    with pytest.raises(EvaluatorNotConfigured) as raised:
+        HornsimConfig.from_env(env)
+    message = str(raised.value)
+    assert "has no hornsim/ package" in message
+    assert "backend interpreter" in message
+    assert "is not a file" in message
+
+
+def test_complete_configuration_is_read_from_the_environment(tmp_path):
+    backend = tmp_path / "backend"
+    (backend / "hornsim").mkdir(parents=True)
+    (backend / ".venv" / "bin").mkdir(parents=True)
+    (backend / ".venv" / "bin" / "python").write_text("")
+    (tmp_path / "ear.ply").write_text("ply")
+    config = HornsimConfig.from_env(
+        {
+            BACKEND_DIR_ENV: str(backend),
+            EAR_MESH_ENV: str(tmp_path / "ear.ply"),
+            WORK_DIR_ENV: str(tmp_path / "work"),
+            "HORNSIM_EAR_HEIGHT_MM": "62",
+        }
+    )
+    assert config.python == backend.resolve() / ".venv" / "bin" / "python"
+    assert config.ear_height_mm == 62
+    assert config.bridge == BRIDGE
+
+
+def test_the_module_loads_by_path_and_reports_missing_configuration(monkeypatch):
+    for name in (BACKEND_DIR_ENV, EAR_MESH_ENV, WORK_DIR_ENV):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(hornsim_evaluator, "_default", None)
+    evaluator = evaluator_for("real", env={REAL_EVALUATOR_ENV: "horn_study.hornsim_evaluator"})
+    with pytest.raises(EvaluatorNotConfigured, match="HORNSIM_BACKEND_DIR is not set"):
+        evaluator.get_evaluator_capabilities()
+
+
+# --------------------------------------------------------------------------
+# Intake and the whole workflow with the real capabilities
+# --------------------------------------------------------------------------
+
+
+def hornsim_request(thresholds: dict[int, float], **overrides: Any) -> dict[str, Any]:
+    request = make_request(evaluation_mode="real", needs=False, **overrides)
+    request["hearing_profile"]["measurements"] = [
+        {
+            "ear": "right",
+            "frequency_hz": frequency,
+            "threshold_db_hl": threshold,
+            "measurement_type": "air_conduction",
+            "status": "measured",
+        }
+        for frequency, threshold in thresholds.items()
+    ]
+    return request
+
+
+def test_a_request_missing_a_required_frequency_is_rejected_at_intake(tmp_path):
+    evaluator, _ = make_evaluator(tmp_path)
+    capabilities = as_contract(evaluator).get_evaluator_capabilities()
+
+    # The usual clinical set, which stops short of what HASPI needs.
+    without_6000 = {250: 15, 500: 20, 1000: 30, 2000: 45, 4000: 55, 8000: 50}
+    with pytest.raises(InputRejected) as raised:
+        validate_request(parse_request(hornsim_request(without_6000)), capabilities)
+    (issue,) = raised.value.issues
+    assert issue.code == "hearing.required_frequency_missing"
+    assert "6000 Hz" in issue.message
+
+    package = validate_request(parse_request(hornsim_request({**THRESHOLDS, 8000: 50})), capabilities)
+    assert [m.frequency_hz for m in package.hearing_input.measurements] == [250, 500, 1000, 2000, 4000, 6000]
+    assert [m.threshold_db_hl for m in package.hearing_input.measurements] == [15, 20, 30, 45, 55, 55]
+    assert [m.frequency_hz for m in package.hearing_input.retained_but_unused] == [8000]
+
+
+def hornsim_draft() -> dict[str, Any]:
+    def design(candidate_id: str, mouth: float) -> dict[str, Any]:
+        values = {**DEFAULT_DESIGN, "mouth_mm2": mouth}
+        return {
+            "candidate_id": candidate_id,
+            "kind": "design",
+            "family_id": FAMILY_ID,
+            "baseline_id": "",
+            "parameters": [{"name": name, "value": value, "choice": ""} for name, value in values.items()],
+            "label": f"Mouth {mouth:g} mm^2",
+            "rationale": "Mouth area sweep.",
+        }
+
+    draft = valid_draft(needs=False)
+    draft["hypotheses"][0].update(
+        candidate_ids=["mouth22", "mouth40"],
+        metric="haspi_v2_mean",
+        varied_parameter="mouth_mm2",
+    )
+    draft["candidates"] = [draft["candidates"][0], design("mouth22", 22.2), design("mouth40", 40.0)]
+    draft["scenario_ids"] = [
+        "clean_speech_50_db_spl",
+        "clean_speech_65_db_spl",
+        "speech_in_babble_50_db_spl",
+        "speech_in_babble_65_db_spl",
+    ]
+    draft["selection"] = {
+        "primary_metric": "haspi_v2_mean",
+        "reference_candidate_id": "unaided",
+        "tie_breaker_metrics": ["haspi_v2_worst_canal"],
+        "constraints": [],
+    }
+    return draft
+
+
+async def test_a_study_runs_end_to_end_on_the_hornsim_evaluator(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path, FakeBridge(build_delay=0.02))
+    harness = Harness(
+        tmp_path / "studies",
+        evaluator=as_contract(evaluator),
+        coordinator=coordinator_responder(hornsim_draft()),
+    )
+    outcome = await run_study(hornsim_request(THRESHOLDS), harness.deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    assert bridge.count("context") == 1
+    assert bridge.count("build") == 2
+    assert bridge.count("score") == 12  # 3 candidates x 4 scenarios
+    report = outcome.report
+    assert report is not None
+    assert report.result_kind == "real"
+    assert report.evaluator_version == VERSION
+    assert report.experiments_completed == 12
+    # The stub scores both designs identically, and bore length is informational, so nothing in
+    # the plan can separate them: the study reports a tie instead of forcing a winner.
+    assert report.selected_candidate_id is None
+    assert report.selection.reason_code == "tie"
+    saved = json.loads((outcome.directory / "experiment_results.json").read_text())
+    assert all(record["outcome"] == "completed" for record in saved["records"])
+    assert saved["records"][-1]["result"]["design"]["printable_solid_watertight"] is True
+
+
+# --------------------------------------------------------------------------
+# The bridge process
+# --------------------------------------------------------------------------
+
+
+def script_config(tmp_path: Path, script: str) -> HornsimConfig:
+    bridge = tmp_path / "bridge.py"
+    bridge.write_text(script)
+    return HornsimConfig(
+        backend_dir=tmp_path,
+        python=Path(sys.executable),
+        ear_mesh=tmp_path / "ear.ply",
+        work_dir=tmp_path / "work",
+        bridge=bridge,
+        timeout_seconds=30,
+    )
+
+
+def test_the_process_runner_passes_json_both_ways_and_withholds_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "not-for-the-backend")
+    script = (
+        "import json, os, sys\n"
+        "print('progress chatter', file=sys.stderr)\n"
+        "json.dump({'ok': True, 'command': sys.argv[1], 'payload': json.load(sys.stdin),\n"
+        "           'has_key': 'ANTHROPIC_API_KEY' in os.environ,\n"
+        "           'pythonpath': os.environ['PYTHONPATH'], 'cwd': os.getcwd()}, sys.stdout)\n"
+    )
+    answer = process_runner(script_config(tmp_path, script))("score", {"level_db_spl": 65})
+    assert answer["command"] == "score"
+    assert answer["payload"] == {"level_db_spl": 65}
+    assert answer["has_key"] is False
+    assert answer["pythonpath"] == str(tmp_path)
+    assert Path(answer["cwd"]).resolve() == tmp_path.resolve()
+
+
+def test_a_bridge_that_dies_without_an_answer_is_a_transient_failure(tmp_path):
+    run = process_runner(
+        script_config(tmp_path, "import sys\nprint('Killed', file=sys.stderr)\nsys.exit(137)\n")
+    )
+    with pytest.raises(BridgeProcessError, match="exited with code 137") as raised:
+        run("build", {})
+    assert isinstance(raised.value, TransientEvaluatorError)
+    assert "Killed" in str(raised.value)
+
+
+def test_the_bridge_script_starts_without_the_backend_environment():
+    done = subprocess.run(
+        [sys.executable, str(BRIDGE), "no-such-command"],
+        input="{}",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    answer = json.loads(done.stdout)
+    assert answer["ok"] is False
+    assert answer["error"]["code"] == "usage"
+
+
+# --------------------------------------------------------------------------
+# Opt-in: the real backend
+# --------------------------------------------------------------------------
+
+_BACKEND_CONFIGURED = all(os.environ.get(name) for name in (BACKEND_DIR_ENV, EAR_MESH_ENV, WORK_DIR_ENV))
+
+
+@pytest.mark.skipif(
+    not _BACKEND_CONFIGURED,
+    reason=f"set {BACKEND_DIR_ENV}, {EAR_MESH_ENV}, and {WORK_DIR_ENV} to run the real hornsim pipeline",
+)
+def test_the_real_backend_scores_the_control_the_default_and_a_wide_design():
+    """Minutes on first run (one context and two aid builds), seconds once they exist in the work dir."""
+    evaluator = evaluator_for("real", env={REAL_EVALUATOR_ENV: "horn_study.hornsim_evaluator"})
+    capabilities = evaluator.get_evaluator_capabilities()
+    assert capabilities.kind == "real"
+    assert capabilities.evaluator_version.startswith("hornsim-")
+    assert capabilities.hearing_input.required_frequencies_hz == (250, 500, 1000, 2000, 4000, 6000)
+    declared = {m.name for m in capabilities.metrics}
+
+    scenario = "speech_in_babble_65_db_spl"
+    control_spec = make_spec("unaided", scenario, baseline=True)
+    design_spec = make_spec("default_horn", scenario)
+    wide_spec = make_spec("wide_funnel", scenario, parameters=WIDE_DESIGN)
+    control = evaluator.evaluate_experiment(control_spec)
+    design = evaluator.evaluate_experiment(design_spec)
+    wide = evaluator.evaluate_experiment(wide_spec)
+
+    for spec, result in ((control_spec, control), (design_spec, design), (wide_spec, wide)):
+        assert check_result(spec, result, capabilities) == []
+        assert result.status == "completed", result.error
+        assert {m.name for m in result.metrics} == declared
+    control_values = {m.name: m.value for m in control.metrics}
+    design_values = {m.name: m.value for m in design.metrics}
+    wide_values = {m.name: m.value for m in wide.metrics}
+    # The wide throat with no vent builds, and attenuates far less than the default across speech.
+    for band in ("insertion_gain_1000_2000_hz_db", "insertion_gain_2000_4000_hz_db"):
+        assert wide_values[band] > design_values[band] + 10
+    assert wide_values["bore_length_mm"] < design_values["bore_length_mm"]
+    assert len(control.model_dump(mode="json")["haspi_per_clip"]) >= 4
+    assert 0 <= control_values["haspi_v2_mean"] <= 1
+    assert 0 <= design_values["haspi_v2_worst_canal"] <= design_values["haspi_v2_mean"] <= 1
+    assert design_values["haspi_v2_improvement_over_unaided"] == pytest.approx(
+        design_values["haspi_v2_mean"] - control_values["haspi_v2_mean"]
+    )
+    assert design_values["bore_length_mm"] > 0
+    for asset in design.assets:
+        assert Path(asset.ref).is_file(), asset.ref
+    assert control.evaluation_config["audiogram_db_hl"] == {str(f): float(t) for f, t in THRESHOLDS.items()}

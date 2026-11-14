@@ -50,7 +50,7 @@ point it at the API with `?api=https://your-api` or `window.API_BASE`.
 | GET | `/api/health` | weights and AudioEar present |
 | POST | `/api/patients` | multipart: `photo`, `box` (`x0,y0,x1,y1` px after EXIF rotation), `side`, `ear_height_mm`, `audiogram` (JSON dB HL; blank = example) → `{id}` (202) |
 | GET | `/api/patients/{id}` | `status` (queued/running/done/error), `step`, `log`, `results` (ear, context, aid), `files` |
-| POST | `/api/patients/{id}/aid` | JSON `throat_mm2`, `mouth_mm2`, `vent_diameter_mm`, `min_wall_mm`, `max_path_mm` → rebuilds the aid |
+| POST | `/api/patients/{id}/aid` | JSON `throat_mm2`, `mouth_mm2`, `vent_diameter_mm` (0 = no vent), `min_wall_mm`, `max_path_mm`, `tip_clearance_mm` → rebuilds the aid |
 | GET | `/api/patients/{id}/files/{name}` | `ear.glb`, `overlay.jpg`, `mask.png`, `summary.png`, `aid.glb`, `aid_in_ear.glb`, `aid_print.stl`, `design.json`, `references.json`, … |
 
 Example:

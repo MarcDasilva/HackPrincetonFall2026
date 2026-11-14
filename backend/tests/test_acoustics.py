@@ -93,6 +93,24 @@ def test_canal_size_horn_is_close_to_the_open_ear():
     assert np.abs(ig[(F > 500) & (F < 4000)]).max() < 6
 
 
+def test_wider_throat_moves_the_speech_band_toward_the_open_ear():
+    # the narrow throat's mass against the canal's air is the low-pass; losses are not what costs the highs
+    c, band = [ac.Canal(0.7)], (F > 1000) & (F < 4000)
+    wide = lambda t, lossy=True: ac.insertion_gain_db(ac.Design(*exp_horn(51.0, max(22.2, 1.2 * t), t)), c, F, lossy)[0][band].mean()
+    gains = [wide(t) for t in (1, 3, 10, 20, 30)]
+    assert all(a < b for a, b in zip(gains, gains[1:]))
+    assert gains[0] < -15 and gains[-1] > -6
+    assert abs(wide(1) - wide(1, lossy=False)) < 2
+
+
+def test_filling_the_concha_costs_the_highs_whatever_the_bore():
+    s = np.linspace(0, 12, 60)
+    tube = lambda fill: ac.Design(s, np.full(60, 44.2), concha_fill=fill)      # bore as wide as the canal itself
+    hi = (F > 2000) & (F < 8000)
+    filled, left_open = (ac.insertion_gain_db(tube(f), [ac.Canal(0.7)], F)[0][hi].mean() for f in (1.0, 0.0))
+    assert filled < -3 and abs(left_open) < 1.5
+
+
 def test_passive_device_gain_is_bounded_and_finite():
     ig = ac.insertion_gain_db(_design(vent=0.8), [ac.Canal(v) for v in (0.5, 0.7, 0.9)], F)
     assert np.isfinite(ig).all()

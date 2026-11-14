@@ -334,7 +334,7 @@ def build_graph(
         progress.report = report
         events.emit(
             "report.completed",
-            report.selection.explanation[:300],
+            _whole_sentences(report.selection.explanation, 300),
             component="results_interpreter",
             candidate_ids=[report.selected_candidate_id] if report.selected_candidate_id else [],
             hypothesis_ids=[h.hypothesis_id for h in report.hypotheses],
@@ -362,6 +362,14 @@ def build_graph(
     builder.add_edge(NODE_EVALUATE, NODE_INTERPRET)
     builder.add_edge(NODE_INTERPRET, END)
     return builder.compile(name="study")
+
+
+def _whole_sentences(text: str, limit: int) -> str:
+    """Shorten text for an event summary, ending on a full sentence when one fits."""
+    if len(text) <= limit:
+        return text
+    end = text.rfind(". ", 0, limit)
+    return text[: end + 1] if end > 0 else text[:limit]
 
 
 def results_document(

@@ -113,11 +113,16 @@ def get_patient(pid: str):
 
 
 class AidDesign(BaseModel):
-    throat_mm2: float = Field(1.0, ge=0.3, le=10)
-    mouth_mm2: float = Field(22.2, ge=2, le=60)
-    vent_diameter_mm: float = Field(0.8, ge=0, le=2.5)
+    # Bounds are what hornsim.aid can route in some ear; a design that misses this ear fails its job with the reason.
+    # throat: the bore passes the canal tip with a wall left, so at most pi * (7.5 / 2 - tip clearance - wall)^2:
+    # 20.4 mm2 with the defaults, 31 mm2 with the snuggest tip (0.2) and thinnest wall (0.4).
+    # A throat above ~3 mm2 leaves no room for a vent beside it: use vent 0 (the bore vents the canal itself).
+    throat_mm2: float = Field(1.0, ge=0.3, le=31)
+    mouth_mm2: float = Field(22.2, ge=2, le=200)
+    vent_diameter_mm: float = Field(0.8, ge=0, le=2.5)      # 0 = no vent
     min_wall_mm: float = Field(0.6, ge=0.4, le=2)
     max_path_mm: float = Field(130, ge=20, le=300)
+    tip_clearance_mm: float = Field(0.6, ge=0.2, le=1.5)    # gap between the canal tip and the assumed canal wall
 
 
 @app.post("/api/patients/{pid}/aid", status_code=202)

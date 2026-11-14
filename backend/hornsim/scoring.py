@@ -1,8 +1,12 @@
 """Intelligibility scoring with HASPI v2 (Kates & Arehart 2021) from pyclarity.
 
-Convention: the clean reference is normalised to RMS 1 and HASPI's `level1` is set to
-the presentation level, so "RMS 1 = L dB SPL". Gains are applied to the reference
-(or the noisy mixture), never to the HASPI reference itself.
+Convention: the clean reference is normalised to RMS 1 and always stands for 65 dB SPL, the
+level HASPI's ear model expects its normal-hearing reference at (pyclarity `ear_model`:
+"reference signal: should be adjusted to 65 dB SPL"). The presentation level moves only
+what the listener hears: it is scaled by (L - 65) dB. Presenting the reference at L as well
+hides the audibility loss at soft levels: unaided HASPI then stays flat or even rises as
+speech gets quieter. Gains are applied to the reference (or the noisy mixture), never to
+the HASPI reference itself.
 """
 import numpy as np
 from clarity.evaluator.haspi import haspi_v2
@@ -11,6 +15,7 @@ from clarity.utils.audiogram import Audiogram
 from .audio import apply_gain
 
 HASPI_FREQS = np.array([250, 500, 1000, 2000, 4000, 6000])
+REFERENCE_DB_SPL = 65.0     # what RMS 1 means to HASPI
 
 
 def audiogram(levels_by_freq: dict) -> Audiogram:
@@ -20,7 +25,8 @@ def audiogram(levels_by_freq: dict) -> Audiogram:
 
 def haspi(reference, processed, fs, ag: Audiogram, level_db, seed=0):
     np.random.seed(seed)  # HASPI adds random noise internally; fix it so scores repeat
-    score, _ = haspi_v2(reference, fs, processed, fs, ag, level1=level_db)
+    heard = np.asarray(processed) * 10 ** ((level_db - REFERENCE_DB_SPL) / 20)
+    score, _ = haspi_v2(reference, fs, heard, fs, ag, level1=REFERENCE_DB_SPL)
     return float(score)
 
 
