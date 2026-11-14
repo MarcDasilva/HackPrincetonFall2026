@@ -178,6 +178,10 @@ choosing between them.
 The hearing measurements are user-supplied inputs. Do not alter, extend, or reinterpret \
 them, and do not describe a diagnosis.
 
+Some evaluators test-build each design before the plan is frozen. If a design comes back as \
+unbuildable, change the dials its message names, or replace the design: the same values will \
+fail the same way.
+
 If the plan comes back with validation errors, correct exactly those problems and resubmit \
 the complete plan.\
 """

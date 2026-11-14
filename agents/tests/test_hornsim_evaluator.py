@@ -453,7 +453,9 @@ def earpiece_spec(
 
 def as_contract(evaluator: HornsimEvaluator) -> CallableEvaluator:
     """Wrap the evaluator the way `load_evaluator` does."""
-    return CallableEvaluator(evaluator.get_evaluator_capabilities, evaluator.evaluate_experiment)
+    return CallableEvaluator(
+        evaluator.get_evaluator_capabilities, evaluator.evaluate_experiment, evaluator.check_buildable
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1659,3 +1661,25 @@ def test_the_real_backend_builds_and_scores_earpieces_and_reports_what_the_ear_c
         assert "stem_throat: the throat does not fit inside the canal stem" in rejected.error.message
     checks = {reason["check"] for reason in rejected.model_dump(mode="json")["build_reasons"]}
     assert "mouth_fit" in checks
+
+
+def test_a_design_can_be_test_built_without_scoring_and_the_build_is_reused(tmp_path):
+    evaluator, bridge = make_evaluator(tmp_path)
+    bridge.does_not_fit.add(60.0)
+    contract = as_contract(evaluator)
+    assert contract.check_buildable is not None
+
+    good = make_spec("default_horn")
+    assert contract.check_buildable(good) is None
+    assert (bridge.count("build"), bridge.count("score")) == (1, 0)
+
+    assert contract.evaluate_experiment(good).status == "completed"
+    assert (bridge.count("build"), bridge.count("score")) == (1, 1)
+
+    problem = contract.check_buildable(make_spec("too_big", parameters={**DEFAULT_DESIGN, "mouth_mm2": 60.0}))
+    assert problem is not None
+    assert problem.code == "geometry_does_not_fit"
+    assert "no bore route fits this concha" in problem.message
+    assert bridge.count("score") == 1
+
+    assert contract.check_buildable(make_spec("unaided", baseline=True)) is None
