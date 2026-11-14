@@ -80,6 +80,7 @@ Every one of these is a gate that code controls:
 
 - `task` reaches investigators only. The framework's general-purpose helper, shell, and file deletion are not offered and are refused if called.
 - An investigator can be assigned again only as a follow-up, and `budget.max_research_follow_ups` (default 2) caps follow-ups for the whole study.
+  A follow-up gets half the search and read calls of a first pass.
 - `review_findings` records an acceptance only when the finding exists, a reason was given, and the orchestrator opened that finding's source first. A rejection needs a reason only.
 - `submit_plan` is refused until every investigator has reported and every finding has been reviewed, and a hypothesis may cite accepted findings only. The first plan that passes those checks closes research.
 - `run_experiments` works once, only on a frozen plan, and runs exactly its cases.
@@ -558,6 +559,12 @@ Sources are fetched over HTTP.
 PubMed records and PubMed Central articles are read through NCBI E-utilities, because those sites answer automated page requests with a browser check.
 E-utilities calls from all investigators share one pace of two per second, under the three per second NCBI allows without an API key, and a rate-limit answer is waited out and tried once more.
 When the API has no full text for an article, the reader tries the article page, and after that the abstract from the search result.
+
+A search result names every copy of a paper that OpenAlex knows: a PubMed Central copy, open-access PDFs, and the publisher's landing page.
+The result points at the PubMed Central copy when there is one, because landing pages often refuse automated readers.
+When the page that was asked for will not load, or holds less than 5,000 characters, the reader tries up to three other copies and keeps the longest text.
+The source keeps the address that was asked for as `url`, and `final_url` says where the text came from.
+This is still one read call.
 No key is required.
 OpenAlex without a key shares a small daily allowance per network, so set `OPENALEX_API_KEY` at an event.
 Investigators are told to keep user data out of queries.

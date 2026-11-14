@@ -201,6 +201,8 @@ async def test_one_follow_up_assignment_is_allowed_and_its_direction_reaches_the
         ("acoustic_design_research", True),
     ]
     assert assigned[-1].data["direction"] == "Find measured horn gain near 3 kHz."
+    # A follow-up is a narrower task, so it gets half the search and read calls of a first pass.
+    assert [e.data["max_research_tool_calls"] for e in _starts(outcome)] == [6, 6, 6, 3]
     assert assigned[-1].component == "study_orchestrator"
     assert all(e.sequence < s.sequence for e, s in zip(assigned, _starts(outcome), strict=True))
     research_record = load(outcome, "research.json")

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -68,16 +69,13 @@ from horn_study.research import (
     run_investigator,
 )
 from horn_study.runner import EvaluateFn, EvaluationCache, execute_experiment
-from horn_study.sources import Reader, Search
+from horn_study.sources import FULL_TEXT_MIN_CHARS, Reader, Search
 
 ORCHESTRATOR_NAME = "study_orchestrator"
 NOTES_DIR = "/work/"
 _READ_TOOLS = ("ls", "read_file", "glob", "grep")
 _NOTE_TOOLS = ("write_file", "edit_file")
 _STUDY_TOOLS = ("review_findings", "submit_plan", "run_experiments", "write_report")
-# A source counts as full text when it is not an abstract and is at least this long. Shorter
-# pages are usually a landing page or a summary, and support a claim no better than an abstract.
-FULL_TEXT_MIN_CHARS = 5000
 MIN_REVIEW_REASON_CHARS = 20
 # Turns the orchestrator may take in one study. Reading, planning, and each phase need a few
 # each, so this is generous. The workflow finishes a frozen plan if the limit is reached.
@@ -107,17 +105,21 @@ under /sources/.
 3. Review every finding with review_findings. Open its source with grep or read_file and \
 decide whether the passage supports the claim the way this study would use it. Accept it or \
 reject it, with a reason that says what the passage does or does not show. Code records an \
-acceptance only after you opened the source. A finding taken from an abstract, or about a \
-different device or population, supports less than its claim suggests: reject what you \
-cannot stand behind. Each review returns the scorecard and names any investigator left with \
-no accepted finding.
-4. Send an investigator back when its evidence does not hold up. That is the expected move, \
-not a last resort: assign it again with a direction that names what was missing and what to \
-look for. The study allows a few follow-up assignments, and the scorecard says how many are \
-left. Review what comes back.
+acceptance only after you opened the source. Judge the passage, not where it came from. An \
+abstract can carry a finding when the quoted passage itself states the claim: accept it and \
+name the limit in your reason. Reject a finding when the passage does not say what the claim \
+says, or when it is about something this study cannot use. Each review returns the scorecard \
+and names any investigator left with no accepted finding.
+4. Send an investigator back when it is left with no accepted finding, or when a comparison \
+you intend to make has nothing behind it. That is the expected move, not a last resort: \
+assign it again with a direction that names what was missing and what to look for. A \
+follow-up gets half the calls of a first pass, the study allows a few, and the scorecard says \
+how many are left. Review what comes back. When every investigator has accepted evidence for \
+what you plan to test, go straight to the plan.
 5. Keep notes. Write your reasoning and decisions to files under /work/, for example \
 /work/decisions.md. They are kept with the study record and marked as your notes.
-6. Design the plan and call submit_plan. A hypothesis may cite accepted findings only. Code \
+6. Design the plan and call submit_plan. Every hypothesis must cite at least one accepted \
+finding, and no rejected one, or the plan is sent back. Code \
 checks the plan against the evaluator's capabilities and the budget, and may test-build each \
 design. If it comes back with problems, correct exactly those and submit the complete plan \
 again. The first plan that passes the review check closes research: no investigator can be \
@@ -289,9 +291,18 @@ class StudyControl:
             component=ORCHESTRATOR_NAME,
             data={"investigator": spec.name, "follow_up": is_follow_up, "direction": asked},
         )
+        package = self.package
+        if is_follow_up:
+            # A follow-up is a narrower task than a first pass, so it gets half the calls.
+            calls = math.ceil(package.budget.max_research_tool_calls_per_agent / 2)
+            package = package.model_copy(
+                update={
+                    "budget": package.budget.model_copy(update={"max_research_tool_calls_per_agent": calls})
+                }
+            )
         branch = await run_investigator(
             spec,
-            self.package,
+            package,
             model=self._research_model,
             search=self._search,
             reader=self._reader,
