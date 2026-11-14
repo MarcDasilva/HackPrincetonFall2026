@@ -84,7 +84,7 @@ def test_a_rejected_build_cannot_be_chosen_and_the_locked_numbers_hold(tmp_path:
     assert record["chosen"] == {"design_id": "s1-e2", "explanation": "faces the talker", "chosen_by": "agent"}
     assert all(c["throat_mm2"] == 40.0 and c["mouth_mm2"] == 300.0 for c in builder.calls)
     # S and L reuse the chosen shaping exactly; only the cast size differs
-    assert [c.get("fit_offset_mm") for c in builder.calls[-2:]] == [-0.5, 0.5]
+    assert [c.get("fit_offset_mm") for c in builder.calls[-2:]] == [-0.5, 0.5]  # both built at the full step
     assert all(c["aim_yaw_deg"] == 100 for c in builder.calls[-2:])
     assert record["sizes"]["S"]["design_id"] == "s1-e2-S"
     assert record["sizes"]["L"]["ok"]
@@ -330,8 +330,136 @@ def test_a_piece_over_the_studys_size_limit_is_sent_back_and_reported(tmp_path: 
         study, tmp_path, ScriptedChatModel(responder=respond), build=builder, dials=BUILDER_DIALS
     )
 
-    assert "stands out 24 mm, over the study's limit of 20 mm" in replies[0]
+    assert "stands out 24 mm, over the limit of 20 mm from the study" in replies[0]
     assert replies[1].startswith("Rejected: s1-e1 differs from the design the study tested")
     assert record["chosen"]["design_id"] == "s1-e2"
     assert record["departures_from_study"] == []
-    assert record["size_mm"] == {"stood_out_in_study": 17.1, "study_limit": 20.0, "built": 19.0}
+    assert record["size_mm"] == {
+        "stood_out_in_study": 17.1,
+        "limit": 20.0,
+        "limit_source": "study",
+        "built": 19.0,
+    }
+
+
+def _study_with_size(tmp_path: Path, constraints: list[dict[str, Any]]) -> Path:
+    study = tmp_path / "s1"
+    study.mkdir()
+    results = {
+        "study_id": "s1",
+        "selected_candidate_id": "E1",
+        "selected_candidate": _earpiece_selected(),
+        "plan": {"selection_rule": {"constraints": constraints}},
+        "report": {
+            "candidates": [{"candidate_id": "E1", "metrics": [{"name": "protrusion_mm", "mean": 17.1}]}]
+        },
+    }
+    (study / "results.json").write_text(json.dumps(results))
+    return study
+
+
+def test_with_no_limit_in_the_study_the_tested_size_is_the_limit(tmp_path: Path) -> None:
+    """A study that set no size limit still verified one size. Shaping may not make the part much bigger."""
+    heights = iter([21.9, 18.0, 18.0, 18.0])
+
+    def builder(patient_dir: Path, params: dict[str, Any], design_id: str) -> dict[str, Any]:
+        geometry = {
+            "canal_stem_mm": 0.0,
+            "collector": True,
+            "collector_mouth_mm2": 450.0,
+            "proud_of_concha_mm": next(heights),
+        }
+        return {"ok": True, "checks": {"bore_wall_mm": 2.0}, "geometry": geometry}
+
+    replies: list[str] = []
+
+    def respond(messages: list[Any], bound: list[str]) -> AIMessage:
+        step = _tool_results(messages)
+        if step:
+            replies.append(str(messages[-1].content))
+        if step in (0, 2):
+            return call("build_earpiece", {**SHAPING, "aim_yaw_deg": 100}, f"b{step}")
+        return call("finish", {"design_id": f"s1-e{1 if step == 1 else 2}", "explanation": "x"}, f"f{step}")
+
+    record = produce_earpiece(
+        _study_with_size(tmp_path, []),
+        tmp_path,
+        ScriptedChatModel(responder=respond),
+        build=builder,
+        dials=BUILDER_DIALS,
+    )
+    assert "stands out 21.9 mm, over the limit of 18.6 mm from the study" in replies[0]
+    assert replies[1].startswith("Rejected: s1-e1 differs from the design the study tested")
+    assert record["chosen"]["design_id"] == "s1-e2"
+    assert record["size_mm"] == {
+        "stood_out_in_study": 17.1,
+        "limit": 18.6,
+        "limit_source": "tested_size_plus_allowance",
+        "built": 18.0,
+    }
+
+
+def test_a_size_that_fails_at_the_full_step_is_tried_at_smaller_ones(tmp_path: Path) -> None:
+    """A wide bore leaves little wall, so the S cast may not survive the full shrink. A smaller one still helps."""
+    offsets: list[float | None] = []
+
+    def builder(patient_dir: Path, params: dict[str, Any], design_id: str) -> dict[str, Any]:
+        offset = params.get("fit_offset_mm")
+        offsets.append(offset)
+        if offset is not None and offset < -0.3:
+            return {
+                "ok": False,
+                "reasons": [{"check": "bore_wall", "message": "the bore breaks out of the seat"}],
+            }
+        geometry = {"canal_stem_mm": 0.0, "collector": True, "collector_mouth_mm2": 450.0}
+        return {"ok": True, "checks": {"bore_wall_mm": 2.0}, "geometry": geometry}
+
+    def respond(messages: list[Any], bound: list[str]) -> AIMessage:
+        if _tool_results(messages) == 0:
+            return call("build_earpiece", {**SHAPING, "aim_yaw_deg": 100}, "c1")
+        return call("finish", {"design_id": "s1-e1", "explanation": "x"}, "c2")
+
+    record = produce_earpiece(
+        _study(tmp_path, _earpiece_selected()),
+        tmp_path,
+        ScriptedChatModel(responder=respond),
+        build=builder,
+        dials=BUILDER_DIALS,
+    )
+    assert offsets == [None, -0.5, -0.4, -0.3, 0.5]
+    assert record["sizes"]["S"] == {
+        "design_id": "s1-e1-S",
+        "ok": True,
+        "fit_offset_mm": -0.3,
+        "full_step": False,
+        "reasons": [],
+    }
+    assert record["sizes"]["L"]["full_step"] is True
+    assert record["sizes"]["L"]["fit_offset_mm"] == 0.5
+
+
+def test_a_size_that_never_builds_is_still_reported_as_missing(tmp_path: Path) -> None:
+    def builder(patient_dir: Path, params: dict[str, Any], design_id: str) -> dict[str, Any]:
+        if params.get("fit_offset_mm", 0) < 0:
+            return {"ok": False, "reasons": [{"check": "bore_wall", "message": "no"}]}
+        return {
+            "ok": True,
+            "checks": {"bore_wall_mm": 2.0},
+            "geometry": {"canal_stem_mm": 0.0, "collector": True, "collector_mouth_mm2": 450.0},
+        }
+
+    def respond(messages: list[Any], bound: list[str]) -> AIMessage:
+        if _tool_results(messages) == 0:
+            return call("build_earpiece", {**SHAPING, "aim_yaw_deg": 100}, "c1")
+        return call("finish", {"design_id": "s1-e1", "explanation": "x"}, "c2")
+
+    record = produce_earpiece(
+        _study(tmp_path, _earpiece_selected()),
+        tmp_path,
+        ScriptedChatModel(responder=respond),
+        build=builder,
+        dials=BUILDER_DIALS,
+    )
+    assert record["sizes"]["S"]["ok"] is False
+    assert record["sizes"]["S"]["fit_offset_mm"] is None
+    assert record["sizes"]["S"]["reasons"] == [{"check": "bore_wall", "message": "no"}]
