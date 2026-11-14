@@ -307,6 +307,23 @@ def validate_request(
             )
         )
 
+    # A plan needs the control and at least one design, each in every required scenario.
+    smallest_plan = 2 * capabilities.minimum_scenarios
+    if request.budget.max_evaluation_cases < smallest_plan:
+        issues.append(
+            InputIssue(
+                code="budget.below_required_coverage",
+                field="budget.max_evaluation_cases",
+                message=(
+                    f"The budget allows {request.budget.max_evaluation_cases} evaluation cases, but the "
+                    f"smallest study this evaluator accepts needs {smallest_plan}: the control and one "
+                    f"design in each of at least {capabilities.minimum_scenarios} "
+                    f"scenario{'' if capabilities.minimum_scenarios == 1 else 's'}. "
+                    "Raise budget.max_evaluation_cases."
+                ),
+            )
+        )
+
     if request.parent_study_id and prior_study is None:
         issues.append(
             InputIssue(

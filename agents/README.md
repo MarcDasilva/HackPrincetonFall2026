@@ -57,7 +57,7 @@ No edge leads from evaluation or interpretation back to planning.
 | Phase | Who | Can do | Cannot do |
 | --- | --- | --- | --- |
 | Research | Three Deep Agents, run concurrently by LangGraph | Search literature, read sources, record findings, read saved source text | Run the evaluator, write files, run shell commands, spawn subagents |
-| Planning | Coordinator model with no tools | Propose hypotheses, candidates, scenarios, and a selection rule | Freeze its own plan. Code validates it against capabilities and budget. |
+| Planning | Coordinator model with no tools | Propose hypotheses, candidates, scenarios, and a selection rule | Freeze its own plan, skip the coverage the evaluator requires, or relax the per-scenario rule. Code validates the plan against capabilities and budget. |
 | Evaluation | Bounded runner (code) | Evaluate each frozen spec, retry the identical spec after a transient failure | Change a spec, add a case, turn a failure into a number |
 | Interpretation | Model with no tools | Explain the computed comparison, judge hypotheses, suggest follow-ups | Change scores or the selection, run anything |
 
@@ -66,8 +66,30 @@ No edge leads from evaluation or interpretation back to planning.
 - Whether supplied hearing data is usable (`intake.py`).
 - Whether a finding is accepted: its source must have been read in this study, and its quoted passage must appear in the text that was read (`research.py`).
 - Whether a plan is executable and within budget (`planner.py`).
+- Whether a plan covers what the evaluator requires of every study: enough scenarios, and at least one of each required kind (`planner.py`).
 - Every aggregate, the candidate ranking, and `selected_candidate_id` (`reporting.py`).
 - A hypothesis verdict is forced to `inconclusive` when any of its cases did not complete.
+
+### The selection rule
+
+The rule is frozen with the plan as `selection_rule` and applied by code in `reporting.py`.
+A design is eligible only if all of these hold:
+
+- It completed every planned case.
+- It meets every constraint in the plan.
+- In every scenario of the plan, its primary-metric result is not worse than the reference control's result in that same scenario.
+- Its primary-metric mean over all cases is better than the control's.
+
+The per-scenario check is always on.
+The coordinator cannot turn it off, and `selection_rule.require_not_worse_than_reference_in_every_scenario` is always `true`.
+"Not worse" allows for metric noise: a design may fall short of the control in a scenario by at most `selection_rule.scenario_tolerance`.
+That tolerance is the primary metric's declared `resolution`, copied into the plan when it is built, and it is 0 when the evaluator declares none.
+A design that only equals the control in a scenario, for example where both sit at the metric's ceiling, is not disqualified by that scenario.
+It still has to beat the control on the mean over all cases.
+With several canal configurations or seeds, a scenario is compared on its mean over that scenario's cases.
+A scenario where either side is missing a case is never counted as "not worse".
+Eligible designs are ranked by improvement over the control, then by the plan's tie-breakers.
+When no design is eligible, `selected_candidate_id` is `null` and the explanation names the scenarios each design lost in.
 
 ## For the frontend
 
@@ -106,6 +128,9 @@ Request fields that matter:
 
 Only target-ear measurements of a supported type are used.
 Other-ear and unsupported-type values are kept under `retained_but_unused` and never substituted.
+
+`budget.max_evaluation_cases` must fit the smallest study the evaluator accepts: the control and one design in each of its `minimum_scenarios`.
+A smaller budget is rejected with the code `budget.below_required_coverage` before anything runs.
 
 ### Progress events
 
@@ -157,6 +182,13 @@ In `results.json`:
 - `selected_candidate` is that candidate's record, with its geometry family and parameters.
 - `experiments[]` lists every evaluation case with its `experiment_id`, `candidate_id`, scenario, outcome, metrics, and asset references.
 - `report.candidates[]` has the per-candidate aggregates, eligibility, reasons, and rank.
+- `report.candidates[].primary_metric_by_scenario[]` has one entry per scenario of the plan, in plan order, for the primary metric.
+  Each entry has `scenario_id`, `mean` and `reference_mean` (the candidate's and the reference control's mean over that scenario's cases), `n_completed`, `n_planned`, `difference_from_reference`, and `standing`.
+- `difference_from_reference` is signed so that positive means better than the control, whichever direction the metric runs.
+  It is `null` unless both the candidate and the control completed every case in that scenario.
+- `standing` is `better`, `within_tolerance`, `worse`, or `not_compared`.
+  A design with any `worse` scenario is not eligible, and its `ineligibility_reasons` name the scenario and both numbers.
+- `plan.selection_rule.scenario_tolerance` is the tolerance behind `standing`, in the primary metric's unit.
 - `report.needs[]` sorts each user need into `addressed`, `evaluated_unsuccessfully`, or `untested`.
 - `report.follow_up_proposals[]` are suggestions only.
 - `result_label` and `fixture_notice` say whether the numbers are fixture output. Show them.
@@ -189,6 +221,21 @@ The team's real evaluator is `horn_study.hornsim_evaluator`, described below.
 Capabilities declare the geometry families and parameter bounds, baselines, required hearing frequencies and measurement types, scenarios, metrics with units and direction, canal configurations, the calibration convention, seed support, fidelity levels, output assets, and explicitly unsupported requirements.
 See `EvaluatorCapabilities` in `src/horn_study/contracts.py`, or run `horn-study capabilities` for a filled-in example.
 The planner can only propose what the capabilities declare.
+
+Capabilities also say what every study must cover and how to spend its budget.
+All four fields are optional:
+
+| Field | Meaning | Default |
+| --- | --- | --- |
+| `required_scenario_tags` | A plan must include at least one scenario carrying each listed tag. Tags are the ones on `scenarios[].tags`. | none |
+| `minimum_scenarios` | A plan must include at least this many scenarios. | 1 |
+| `planning_notes` | Short sentences the coordinator reads before it plans, such as which of candidates and scenarios is the expensive one. | none |
+| `metrics[].resolution` | The smallest difference in that metric that is meaningful, in the metric's unit. | 0 |
+
+A draft that misses the coverage is sent back to the coordinator, with the scenarios it can add, before anything is frozen.
+Capabilities whose coverage no plan could meet are rejected when they are read: a required tag that no scenario carries, or a minimum above the number of scenarios.
+The primary metric's `resolution` becomes the per-scenario tolerance of the selection rule.
+Set it to the metric's run-to-run noise, because a design may fall that far below the unaided control in a scenario and still be selected.
 
 `evaluate_experiment` receives one spec: `experiment_id`, `candidate_id`, `candidate_kind`, `family_id` or `baseline_id`, `parameters`, `hearing_input` (the supplied target-ear measurements, unmodified), `scenario_id`, `canal_config_id`, `ear_mesh_ref`, `seed`, `fidelity`, `calibration_ref`, and `spec_hash`.
 
@@ -301,6 +348,7 @@ Its last test runs the real pipeline and is skipped unless `HORNSIM_BACKEND_DIR`
 `evaluation_mode: "development_fixture"` uses a deterministic placeholder with the same contract.
 It is not a simulation.
 Its metrics are prefixed `fixture_`, every result carries `provenance.kind = "development_fixture"`, and reports are labeled "Development fixture output. Not simulation results."
+It requires at least two scenarios in every study, one tagged `quiet` and one tagged `noise`, and declares a resolution of 0.01 for `fixture_audible_speech_fraction`.
 
 ## LangSmith tracing
 
@@ -344,10 +392,12 @@ Tests drive the real workflow with a scripted stand-in model and offline sources
 | Findings need a read source and a verbatim passage | `test_research.py` |
 | Investigators and the interpreter cannot reach the evaluator | `test_investigators_hold_evidence_tools_only`, `test_the_interpreter_cannot_change_the_selection_or_run_anything` |
 | Plans respect capabilities, controls, and budget | `test_planner.py` |
+| Plans cover what the evaluator requires of every study | `test_a_plan_missing_a_required_kind_of_scenario_is_rejected_until_it_is_added`, `test_a_plan_without_required_coverage_is_sent_back_before_freezing` |
 | The plan is frozen before any result, and only its cases run | `test_the_plan_is_frozen_before_any_result_and_only_its_cases_run` |
 | Retries repeat the identical case and are bounded | `test_runner.py`, `test_transient_failures_retry_only_the_identical_case` |
 | Failed cases cannot help a design win, and no winner is forced | `test_a_design_with_a_failed_case_cannot_win`, `test_no_winner_is_forced_when_every_design_fails` |
-| Reported numbers are the evaluator's numbers | `test_reported_numbers_are_the_evaluators_numbers` |
+| A design that is worse than the control in any scenario cannot win | `test_a_design_that_loses_to_the_control_in_one_scenario_cannot_win`, `test_nothing_is_selected_when_every_design_loses_somewhere`, `test_reporting.py` |
+| Reported numbers are the evaluator's numbers | `test_reported_numbers_are_the_evaluators_numbers`, `test_per_scenario_numbers_in_the_report_are_the_evaluators_numbers` |
 | The real evaluator never fills in a threshold, builds each design once, and reports a misfit as a failure | `test_hornsim_evaluator.py` |
 | No path from results back to planning or evaluation | `test_nothing_leads_from_results_back_to_planning_or_evaluation` |
 | A follow-up runs nothing until requested, and keeps the parent record | `test_a_suggested_follow_up_causes_no_evaluation_until_requested`, `test_a_follow_up_is_a_new_study_and_the_parent_record_is_kept` |
