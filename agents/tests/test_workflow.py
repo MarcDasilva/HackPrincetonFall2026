@@ -154,6 +154,52 @@ async def test_investigators_hold_evidence_tools_only(tmp_path):
     assert harness.interpreter_model.log.bound_tool_sets == [["ReportNarrative"]]
 
 
+async def test_the_report_states_how_much_of_the_evidence_is_scholarly(tmp_path):
+    def cites_documentation(messages, bound):
+        """The design investigator reads a repository directly instead of searching the literature."""
+        who = investigator_of(messages)
+        if who != "acoustic_design_research":
+            return research_responder(messages, bound)
+        step = sum(1 for m in messages if isinstance(m, AIMessage))
+        url = "https://github.com/example/acoustics-tool"
+        if step == 0:
+            return call("read_source", {"url": url, "focus": "horn"}, "d-1")
+        if step == 1:
+            return call(
+                "record_finding",
+                {
+                    "question": "q",
+                    "source": url,
+                    "claim": "The tool models path length.",
+                    "evidence_passage": "The acoustic path length of a horn shifts the frequency region where its response peaks.",
+                    "applicability": "a",
+                    "limitations": "l",
+                    "related_user_goal": "g",
+                    "motivates": "m",
+                },
+                "d-2",
+            )
+        return call("InvestigatorOutput", investigator_report(who), "d-3")
+
+    outcome = await run_study(make_request(), Harness(tmp_path, research=cites_documentation).deps)
+    report = outcome.report
+    assert report is not None
+    assert report.findings_by_source_tier == {"scholarly": 2, "technical_documentation": 1}
+    assert any(
+        text.startswith("2 of 3 research findings rest on scholarly literature.")
+        for text in report.limitations
+    )
+    research = load(outcome, "research.json")
+    assert {f["finding_id"]: f["source_tier"] for f in research["findings"]}[
+        "design-F1"
+    ] == "technical_documentation"
+
+    all_scholarly = await run_study(make_request("all_papers"), Harness(tmp_path).deps)
+    assert all_scholarly.report is not None
+    assert all_scholarly.report.findings_by_source_tier == {"scholarly": 3}
+    assert not any("rest on scholarly literature" in text for text in all_scholarly.report.limitations)
+
+
 async def test_an_investigator_cannot_reach_tools_outside_its_allowlist(tmp_path):
     forbidden = ("execute", "task", "write_file")
     refusals: dict[str, str] = {}

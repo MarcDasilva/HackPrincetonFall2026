@@ -841,6 +841,10 @@ class StudyReport(Contract):
     inconclusive_findings: tuple[str, ...]
     follow_up_proposals: tuple[FollowUpProposal, ...]
     narrative_source: Literal["model", "unavailable"]
+    findings_by_source_tier: dict[str, int] = Field(
+        default_factory=dict,
+        description="How many accepted findings rest on each kind of source, for example scholarly.",
+    )
 
 
 # --------------------------------------------------------------------------

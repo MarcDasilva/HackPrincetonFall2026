@@ -706,6 +706,23 @@ def build_report(
                 f"The {branch.investigator.replace('_', ' ')} branch ended as '{branch.status}', "
                 "so its evidence is partial."
             )
+    by_tier: dict[str, int] = {}
+    for finding in research.findings:
+        by_tier[finding.source_tier] = by_tier.get(finding.source_tier, 0) + 1
+    scholarly = by_tier.get("scholarly", 0)
+    if research.findings and scholarly < len(research.findings):
+        limitations.append(
+            f"{scholarly} of {len(research.findings)} research findings rest on scholarly literature. "
+            "The others cite software documentation or general web pages, which can describe the "
+            "tools but are not evidence about acoustics or hearing."
+        )
+    abstract_only = {s.source_id for s in research.sources if s.content_type == "abstract_only"}
+    from_abstracts = sum(1 for finding in research.findings if finding.source_id in abstract_only)
+    if from_abstracts:
+        limitations.append(
+            f"{from_abstracts} of {len(research.findings)} research findings were drawn from an abstract "
+            "because the full text could not be retrieved."
+        )
     untested = [n.need for n in needs if n.status == "untested"]
     if untested:
         limitations.append(f"Not tested by this study: {', '.join(untested)}.")
@@ -758,4 +775,5 @@ def build_report(
         inconclusive_findings=tuple(narrative.inconclusive_findings) if narrative else (),
         follow_up_proposals=proposals,
         narrative_source="model" if narrative else "unavailable",
+        findings_by_source_tier=by_tier,
     )
