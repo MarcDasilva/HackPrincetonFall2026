@@ -42,30 +42,40 @@ from horn_study.research import render_package
 _ID = re.compile(ID_PATTERN)
 
 
+# Model-facing schemas. Every field is required and none is a union: providers
+# compile these into a constrained-output grammar, and optional or union fields
+# multiply its size. "Not applicable" is an empty string or an empty list.
+
+
 class DraftParameter(BaseModel):
     name: str
-    value: float | str
+    value: float = Field(description="Numeric value in the parameter's unit. Use 0 for a choice parameter.")
+    choice: str = Field(description="Only for choice parameters: the chosen option. Otherwise empty.")
 
 
 class DraftCandidate(BaseModel):
     candidate_id: str
     kind: Literal["design", "baseline"]
-    family_id: str | None = None
-    baseline_id: str | None = None
-    parameters: list[DraftParameter] = Field(default_factory=list)
-    label: str = ""
-    rationale: str = ""
+    family_id: str = Field(description="Geometry family of a design. Empty for a baseline.")
+    baseline_id: str = Field(description="Baseline ID of a baseline. Empty for a design.")
+    parameters: list[DraftParameter] = Field(
+        description="One entry per family parameter. Empty for a baseline."
+    )
+    label: str
+    rationale: str
 
 
 class DraftHypothesis(BaseModel):
     hypothesis_id: str
     statement: str
     supporting_finding_ids: list[str]
-    user_goals: list[str] = Field(default_factory=list)
+    user_goals: list[str]
     candidate_ids: list[str]
     metric: str
-    varied_parameter: str | None = None
-    scenario_ids: list[str] = Field(default_factory=list)
+    varied_parameter: str = Field(description="The one parameter this comparison varies, or empty.")
+    scenario_ids: list[str] = Field(
+        description="Scenarios this comparison uses. Empty means all in the plan."
+    )
     supports_if: str
     contradicts_if: str
 
@@ -73,9 +83,9 @@ class DraftHypothesis(BaseModel):
 class DraftNeedCoverage(BaseModel):
     need: str
     classification: Literal["modeled", "untested"]
-    scenario_ids: list[str] = Field(default_factory=list)
-    metric_names: list[str] = Field(default_factory=list)
-    explanation: str = ""
+    scenario_ids: list[str]
+    metric_names: list[str]
+    explanation: str
 
 
 class DraftConstraint(BaseModel):
@@ -87,8 +97,8 @@ class DraftConstraint(BaseModel):
 class DraftSelection(BaseModel):
     primary_metric: str
     reference_candidate_id: str
-    tie_breaker_metrics: list[str] = Field(default_factory=list)
-    constraints: list[DraftConstraint] = Field(default_factory=list)
+    tie_breaker_metrics: list[str]
+    constraints: list[DraftConstraint]
 
 
 class PlanDraft(BaseModel):
@@ -98,13 +108,13 @@ class PlanDraft(BaseModel):
     hypotheses: list[DraftHypothesis]
     candidates: list[DraftCandidate]
     scenario_ids: list[str]
-    canal_config_ids: list[str] = Field(default_factory=list)
-    seeds: list[int] = Field(default_factory=list)
-    fidelity: str | None = None
+    canal_config_ids: list[str] = Field(description="Empty means the evaluator's default.")
+    seeds: list[int] = Field(description="Empty means one run per case.")
+    fidelity: str = Field(description="A supported fidelity level, or empty for the default.")
     selection: DraftSelection
-    needs_coverage: list[DraftNeedCoverage] = Field(default_factory=list)
-    conflicting_goals: list[str] = Field(default_factory=list)
-    future_work: list[str] = Field(default_factory=list)
+    needs_coverage: list[DraftNeedCoverage]
+    conflicting_goals: list[str]
+    future_work: list[str]
 
 
 COORDINATOR_PROMPT = """\
@@ -232,11 +242,11 @@ def _coerce_parameters(
     candidate: DraftCandidate, family: GeometryFamily, errors: list[str]
 ) -> dict[str, ParameterValue]:
     where = f"candidate '{candidate.candidate_id}'"
-    given: dict[str, float | str] = {}
+    given: dict[str, DraftParameter] = {}
     for parameter in candidate.parameters:
         if parameter.name in given:
             errors.append(f"{where}: parameter '{parameter.name}' is given more than once.")
-        given[parameter.name] = parameter.value
+        given[parameter.name] = parameter
     declared = {p.name: p for p in family.parameters}
     for name in given:
         if name not in declared:
@@ -249,14 +259,14 @@ def _coerce_parameters(
         if name not in given:
             errors.append(f"{where}: missing a value for parameter '{name}'.")
             continue
-        value = given[name]
         if spec.kind == "choice":
-            if not isinstance(value, str) or value not in spec.choices:
+            if given[name].choice not in spec.choices:
                 errors.append(f"{where}: '{name}' must be one of {list(spec.choices)}.")
                 continue
-            values[name] = value
+            values[name] = given[name].choice
             continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        value = given[name].value
+        if not math.isfinite(value):
             errors.append(f"{where}: '{name}' must be a number in {spec.unit or 'its unit'}.")
             continue
         if spec.kind == "int" and float(value) != int(value):
@@ -459,7 +469,7 @@ def build_plan(
                     user_goals=tuple(item.user_goals),
                     candidate_ids=tuple(dict.fromkeys(item.candidate_ids)),
                     metric=item.metric,
-                    varied_parameter=item.varied_parameter,
+                    varied_parameter=item.varied_parameter or None,
                     scenario_ids=tuple(item.scenario_ids) or tuple(draft.scenario_ids),
                     supports_if=item.supports_if,
                     contradicts_if=item.contradicts_if,

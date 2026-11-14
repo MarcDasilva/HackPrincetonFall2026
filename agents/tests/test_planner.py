@@ -63,7 +63,7 @@ def test_over_budget_workload_counts_scenarios_canals_and_seeds():
             "missing a value for parameter 'mouth_diameter_mm'",
         ),
         (
-            lambda d: d["candidates"][1]["parameters"].append({"name": "wall_mm", "value": 1}),
+            lambda d: d["candidates"][1]["parameters"].append({"name": "wall_mm", "value": 1, "choice": ""}),
             "'wall_mm' is not a parameter",
         ),
         (

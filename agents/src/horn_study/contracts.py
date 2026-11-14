@@ -397,23 +397,27 @@ class ResearchFinding(Contract):
 
 class SuggestedHypothesis(BaseModel):
     statement: str
-    supporting_finding_ids: list[str] = Field(default_factory=list)
-    suggested_comparison: str = ""
+    supporting_finding_ids: list[str]
+    suggested_comparison: str
 
 
 class InvestigatorOutput(BaseModel):
-    """Structured final answer of one investigator (produced by the model)."""
+    """Structured final answer of one investigator (produced by the model).
+
+    Every field is required so the provider's output grammar stays small.
+    An empty list means there is nothing to report under that heading.
+    """
 
     summary: str
-    candidate_hypotheses: list[SuggestedHypothesis] = Field(default_factory=list)
-    suggested_scenario_ids: list[str] = Field(default_factory=list)
-    suggested_metric_names: list[str] = Field(default_factory=list)
-    suggested_comparisons: list[str] = Field(default_factory=list)
-    model_limitations: list[str] = Field(default_factory=list)
-    untested_needs: list[str] = Field(default_factory=list)
-    conflicting_goals: list[str] = Field(default_factory=list)
-    evidence_gaps: list[str] = Field(default_factory=list)
-    future_work: list[str] = Field(default_factory=list)
+    candidate_hypotheses: list[SuggestedHypothesis]
+    suggested_scenario_ids: list[str]
+    suggested_metric_names: list[str]
+    suggested_comparisons: list[str]
+    model_limitations: list[str]
+    untested_needs: list[str]
+    conflicting_goals: list[str]
+    evidence_gaps: list[str]
+    future_work: list[str]
 
 
 class BranchResult(Contract):
@@ -682,12 +686,20 @@ class Selection(Contract):
     explanation: str
 
 
+class ScenarioMean(Contract):
+    scenario_id: str
+    mean: float | None = None
+    n_completed: int
+    n_planned: int
+
+
 class HypothesisDataPoint(Contract):
     candidate_id: str
     varied_parameter_value: ParameterValue | None = None
     mean: float | None = None
     n_completed: int
     n_planned: int
+    by_scenario: tuple[ScenarioMean, ...] = ()
 
 
 class HypothesisOutcome(Contract):

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from helpers import PASSAGES, FakeReader, FakeSearch
 
@@ -121,6 +123,23 @@ async def test_unreadable_source_falls_back_to_the_abstract_and_says_so():
     message, files = await blind.read_source(URL, "horn")
     assert message.startswith(f"Could not read {URL}")
     assert files == {}
+
+
+async def test_two_branches_reading_the_same_url_at_once_share_one_source():
+    events = EventBus("s")
+    ledger = ResearchLedger()
+    reader = FakeReader()
+    sessions = [
+        ResearchSession(
+            spec, max_tool_calls=6, search=FakeSearch(), reader=reader, ledger=ledger, events=events
+        )
+        for spec in INVESTIGATORS[:2]
+    ]
+    replies = await asyncio.gather(*(s.read_source(URL, "horn") for s in sessions))
+
+    assert [record.source_id for record in ledger.sources] == ["S1"]
+    assert all("Source S1:" in message for message, _ in replies)
+    assert all(list(files) == ["/sources/S1.txt"] for _, files in replies)
 
 
 def test_quote_matching_tolerates_typography_but_not_rewording():

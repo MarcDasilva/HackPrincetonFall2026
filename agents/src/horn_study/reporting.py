@@ -16,7 +16,7 @@ from typing import Any, Literal
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelRetryMiddleware
 from langchain_core.language_models.chat_models import BaseChatModel
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from horn_study.contracts import (
     Candidate,
@@ -30,6 +30,7 @@ from horn_study.contracts import (
     MetricAggregate,
     NeedOutcome,
     ResearchRecord,
+    ScenarioMean,
     Selection,
     StartingPackage,
     StudyPlan,
@@ -54,13 +55,13 @@ class DraftFollowUp(BaseModel):
 
 
 class ReportNarrative(BaseModel):
-    """The model-written part of the report: explanation only."""
+    """The model-written part of the report: explanation only. Lists may be empty."""
 
     summary: str
-    hypothesis_verdicts: list[HypothesisVerdict] = Field(default_factory=list)
-    limitations: list[str] = Field(default_factory=list)
-    inconclusive_findings: list[str] = Field(default_factory=list)
-    follow_up_proposals: list[DraftFollowUp] = Field(default_factory=list)
+    hypothesis_verdicts: list[HypothesisVerdict]
+    limitations: list[str]
+    inconclusive_findings: list[str]
+    follow_up_proposals: list[DraftFollowUp]
 
 
 # --------------------------------------------------------------------------
@@ -274,6 +275,18 @@ def hypothesis_data(
             values = _metric_values(specs, by_experiment, hypothesis.metric)
             if not specs or len(values) != len(specs):
                 complete = False
+            by_scenario = []
+            for scenario_id in hypothesis.scenario_ids:
+                in_scenario = [e for e in specs if e.scenario_id == scenario_id]
+                scenario_values = _metric_values(in_scenario, by_experiment, hypothesis.metric)
+                by_scenario.append(
+                    ScenarioMean(
+                        scenario_id=scenario_id,
+                        mean=fmean(scenario_values) if scenario_values else None,
+                        n_completed=len(scenario_values),
+                        n_planned=len(in_scenario),
+                    )
+                )
             points.append(
                 HypothesisDataPoint(
                     candidate_id=candidate_id,
@@ -285,6 +298,7 @@ def hypothesis_data(
                     mean=fmean(values) if values else None,
                     n_completed=len(values),
                     n_planned=len(specs),
+                    by_scenario=tuple(by_scenario),
                 )
             )
         output[hypothesis.hypothesis_id] = (tuple(points), complete)
@@ -300,7 +314,6 @@ def need_outcomes(
     by_experiment = {record.experiment_id: record for record in records}
     directions = {m.name: m.direction for m in capabilities.metrics}
     rule = plan.selection_rule
-    constrained = {c.metric for c in rule.constraints}
     outcomes: list[NeedOutcome] = []
     for coverage in plan.needs_coverage:
         if coverage.classification == "untested":
@@ -325,15 +338,22 @@ def need_outcomes(
             continue
         scenarios = coverage.scenario_ids or plan.scenario_ids
         metrics = coverage.metric_names or (rule.primary_metric,)
+        where = ", ".join(scenarios)
         shortfalls: list[str] = []
+        achieved: list[str] = []
         for metric in metrics:
-            if metric in constrained:
-                continue  # the selected design already satisfies the plan's limit on it
             chosen = _metric_values(
                 [e for e in plan.experiments if e.candidate_id == selected and e.scenario_id in scenarios],
                 by_experiment,
                 metric,
             )
+            limit = next((c for c in rule.constraints if c.metric == metric), None)
+            if limit is not None:
+                # The selected design is eligible, so it already meets the plan's limit.
+                side = "at most" if limit.bound == "max" else "at least"
+                value = f" (mean {fmean(chosen):.4g})" if chosen else ""
+                achieved.append(f"{metric} stayed within the plan's limit of {side} {limit.value:g}{value}")
+                continue
             control = _metric_values(
                 [
                     e
@@ -344,12 +364,15 @@ def need_outcomes(
                 metric,
             )
             if not chosen or not control:
-                shortfalls.append(f"no complete {metric} data in {', '.join(scenarios)}")
+                shortfalls.append(f"no complete {metric} data in {where}")
                 continue
             direction = directions.get(metric, "higher_is_better")
             if _signed(direction, fmean(chosen)) <= _signed(direction, fmean(control)):
-                shortfalls.append(
-                    f"{metric} did not improve on the reference control in {', '.join(scenarios)}"
+                shortfalls.append(f"{metric} did not improve on the reference control in {where}")
+            else:
+                achieved.append(
+                    f"{metric} improved on the reference control in {where} "
+                    f"({fmean(chosen):.4g} against {fmean(control):.4g})"
                 )
         if shortfalls:
             outcomes.append(
@@ -364,10 +387,7 @@ def need_outcomes(
                 NeedOutcome(
                     need=coverage.need,
                     status="addressed",
-                    explanation=(
-                        f"The selected design '{selected}' improved on the reference control for "
-                        f"{', '.join(metrics)} in {', '.join(scenarios)} (modeled result)."
-                    ),
+                    explanation=f"For the selected design '{selected}': {'; '.join(achieved)} (modeled result).",
                 )
             )
     return tuple(outcomes)

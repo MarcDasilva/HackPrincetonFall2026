@@ -133,6 +133,7 @@ class FakeReader:
 
     async def fetch(self, url: str) -> FetchedSource:
         self.fetched.append(url)
+        await asyncio.sleep(0)
         if url in self.unavailable:
             raise SourceUnavailable("The server answered HTTP 403.")
         return FetchedSource(
@@ -170,22 +171,30 @@ def research_responder(messages: list[BaseMessage], bound: list[str]) -> AIMessa
             },
             f"{who}-3",
         )
-    return call(
-        "InvestigatorOutput",
-        {
-            "summary": f"{who} finished.",
-            "candidate_hypotheses": [
-                {
-                    "statement": "Path length changes the response in the target region.",
-                    "supporting_finding_ids": [f"{PREFIX[who]}-F1"],
-                    "suggested_comparison": "Vary length_mm.",
-                }
-            ],
-            "suggested_scenario_ids": ["quiet_conversation"],
-            "suggested_metric_names": ["fixture_audible_speech_fraction"],
-        },
-        f"{who}-4",
-    )
+    return call("InvestigatorOutput", investigator_report(who), f"{who}-4")
+
+
+def investigator_report(who: str, **overrides: Any) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "summary": f"{who} finished.",
+        "candidate_hypotheses": [
+            {
+                "statement": "Path length changes the response in the target region.",
+                "supporting_finding_ids": [f"{PREFIX[who]}-F1"],
+                "suggested_comparison": "Vary length_mm.",
+            }
+        ],
+        "suggested_scenario_ids": ["quiet_conversation"],
+        "suggested_metric_names": ["fixture_audible_speech_fraction"],
+        "suggested_comparisons": [],
+        "model_limitations": [],
+        "untested_needs": [],
+        "conflicting_goals": [],
+        "evidence_gaps": [],
+        "future_work": [],
+    }
+    report.update(overrides)
+    return report
 
 
 def design(candidate_id: str, length: float, mouth: float = 30.0) -> dict[str, Any]:
@@ -193,13 +202,25 @@ def design(candidate_id: str, length: float, mouth: float = 30.0) -> dict[str, A
         "candidate_id": candidate_id,
         "kind": "design",
         "family_id": "conical_horn_fixture",
+        "baseline_id": "",
         "parameters": [
-            {"name": "length_mm", "value": length},
-            {"name": "throat_diameter_mm", "value": 4.0},
-            {"name": "mouth_diameter_mm", "value": mouth},
+            {"name": "length_mm", "value": length, "choice": ""},
+            {"name": "throat_diameter_mm", "value": 4.0, "choice": ""},
+            {"name": "mouth_diameter_mm", "value": mouth, "choice": ""},
         ],
         "label": f"Conical {length:g} mm",
         "rationale": "Length sweep.",
+    }
+
+
+def need(name: str, classification: str = "modeled", **fields: Any) -> dict[str, Any]:
+    return {
+        "need": name,
+        "classification": classification,
+        "scenario_ids": [],
+        "metric_names": [],
+        "explanation": "",
+        **fields,
     }
 
 
@@ -221,12 +242,23 @@ def valid_draft(needs: bool = True) -> dict[str, Any]:
             }
         ],
         "candidates": [
-            {"candidate_id": "unaided", "kind": "baseline", "baseline_id": "unaided", "label": "Unaided"},
+            {
+                "candidate_id": "unaided",
+                "kind": "baseline",
+                "family_id": "",
+                "baseline_id": "unaided",
+                "parameters": [],
+                "label": "Unaided",
+                "rationale": "Control.",
+            },
             design("len30", 30),
             design("len45", 45),
             design("len90", 90),
         ],
         "scenario_ids": ["quiet_conversation", "speech_in_babble", "distant_talker"],
+        "canal_config_ids": [],
+        "seeds": [],
+        "fidelity": "",
         "selection": {
             "primary_metric": "fixture_audible_speech_fraction",
             "reference_candidate_id": "unaided",
@@ -235,42 +267,18 @@ def valid_draft(needs: bool = True) -> dict[str, Any]:
         },
         "needs_coverage": (
             [
-                {
-                    "need": "sports",
-                    "classification": "modeled",
-                    "scenario_ids": ["distant_talker"],
-                    "explanation": "Coach at a distance.",
-                },
-                {
-                    "need": "busy_restaurants",
-                    "classification": "modeled",
-                    "scenario_ids": ["speech_in_babble"],
-                },
-                {
-                    "need": "follow_conversation",
-                    "classification": "modeled",
-                    "metric_names": ["fixture_audible_speech_fraction"],
-                },
-                {"need": "hear_coach", "classification": "modeled", "scenario_ids": ["distant_talker"]},
-                {
-                    "need": "speech_clarity",
-                    "classification": "modeled",
-                    "metric_names": ["fixture_audible_speech_fraction"],
-                },
-                {
-                    "need": "compact_size",
-                    "classification": "modeled",
-                    "metric_names": ["fixture_device_length_mm"],
-                },
-                {
-                    "need": "secure_retention",
-                    "classification": "untested",
-                    "explanation": "No mechanical model.",
-                },
+                need("sports", scenario_ids=["distant_talker"], explanation="Coach at a distance."),
+                need("busy_restaurants", scenario_ids=["speech_in_babble"]),
+                need("follow_conversation", metric_names=["fixture_audible_speech_fraction"]),
+                need("hear_coach", scenario_ids=["distant_talker"]),
+                need("speech_clarity", metric_names=["fixture_audible_speech_fraction"]),
+                need("compact_size", metric_names=["fixture_device_length_mm"]),
+                need("secure_retention", "untested", explanation="No mechanical model."),
             ]
             if needs
             else []
         ),
+        "conflicting_goals": [],
         "future_work": ["Physical retention testing."],
     }
 

@@ -215,6 +215,10 @@ class ResearchLedger:
         return record, self._text[source_id]
 
     def add_source(self, fetched: FetchedSource, investigator: InvestigatorName) -> SourceRecord:
+        """Register a read source. Two branches reading the same URL share one record."""
+        known = self.lookup(fetched.url) or self.lookup(fetched.final_url)
+        if known is not None:
+            return known[0]
         record = SourceRecord(
             source_id=f"S{len(self._records) + 1}",
             url=fetched.url,
@@ -592,7 +596,16 @@ async def run_investigator(
         status = "incomplete"
         output = InvestigatorOutput(
             summary=_last_text(result.get("messages", []))
-            or "The investigator ended without a structured report."
+            or "The investigator ended without a structured report.",
+            candidate_hypotheses=[],
+            suggested_scenario_ids=[],
+            suggested_metric_names=[],
+            suggested_comparisons=[],
+            model_limitations=[],
+            untested_needs=[],
+            conflicting_goals=[],
+            evidence_gaps=["This investigator did not deliver a structured report."],
+            future_work=[],
         )
     events.emit(
         "research.agent_completed",

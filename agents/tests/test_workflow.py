@@ -17,6 +17,7 @@ from helpers import (
     coordinator_responder,
     design,
     investigator_of,
+    investigator_report,
     make_request,
     narrative,
     research_responder,
@@ -250,7 +251,11 @@ async def test_a_failed_branch_is_reported_and_the_study_continues_on_the_rest(t
 
 async def test_no_evidence_means_no_plan_and_no_evaluation(tmp_path):
     def reports_nothing(messages, bound):
-        return call("InvestigatorOutput", {"summary": "Found nothing usable."})
+        who = investigator_of(messages)
+        return call(
+            "InvestigatorOutput",
+            investigator_report(who, summary="Found nothing usable.", candidate_hypotheses=[]),
+        )
 
     harness = Harness(tmp_path, research=reports_nothing)
     outcome = await run_study(make_request(), harness.deps)
@@ -449,6 +454,37 @@ async def test_no_winner_when_the_control_is_incomplete_or_nothing_improves(tmp_
         "Does not improve on the reference control" in " ".join(c.ineligibility_reasons)
         for c in flat.report.candidates
         if c.kind == "design"
+    )
+
+
+async def test_hypotheses_get_per_scenario_data_and_needs_say_how_they_were_met(tmp_path):
+    outcome = await run_study(make_request(), Harness(tmp_path).deps)
+    document = load(outcome, "results.json")
+    report = outcome.report
+    assert report is not None
+
+    point = next(p for p in report.hypotheses[0].data if p.candidate_id == "len45")
+    assert [s.scenario_id for s in point.by_scenario] == [
+        "quiet_conversation",
+        "speech_in_babble",
+        "distant_talker",
+    ]
+    for scenario in point.by_scenario:
+        (case,) = [
+            c
+            for c in document["experiments"]
+            if c["candidate_id"] == "len45" and c["scenario_id"] == scenario.scenario_id
+        ]
+        (value,) = [m["value"] for m in case["metrics"] if m["name"] == "fixture_audible_speech_fraction"]
+        assert scenario.mean == value
+        assert (scenario.n_completed, scenario.n_planned) == (1, 1)
+
+    needs = {n.need: n for n in report.needs}
+    assert needs["compact_size"].status == "addressed"
+    assert "stayed within the plan's limit of at most 100 (mean 45)" in needs["compact_size"].explanation
+    assert "improved on the reference control" not in needs["compact_size"].explanation
+    assert "fixture_audible_speech_fraction improved on the reference control in distant_talker" in (
+        needs["hear_coach"].explanation
     )
 
 
