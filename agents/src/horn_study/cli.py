@@ -251,6 +251,8 @@ def cmd_earpiece(args: argparse.Namespace) -> int:
     for b in record["builds"]:
         reasons = "; ".join(r["message"] for r in b["report"].get("reasons", []))
         print(f"{b['design_id']}: {'built' if b['report'].get('ok') else 'rejected'}  {b['why']}  {reasons}")
+    for difference in record.get("departures_from_study", []):
+        print(f"differs from the study: {difference}")
     chosen = record["chosen"]
     print(
         f"chosen: {chosen['design_id']} ({chosen['chosen_by']}) {chosen['explanation']}"

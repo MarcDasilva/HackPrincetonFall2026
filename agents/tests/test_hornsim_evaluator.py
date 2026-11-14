@@ -1429,8 +1429,17 @@ async def test_a_study_with_both_families_completes_and_can_select_an_earpiece(t
     selected = saved["selected_candidate"]
     assert selected["family_id"] == EARPIECE_FAMILY_ID
     assert selected["parameters"] == EARPIECE_COLLECTOR
-    # The names the final step (`horn-study earpiece`) locks: the throat and the faceplate mouth.
-    assert final_step.locked_params(selected["parameters"]) == {"throat_mm2": 60.0, "mouth_mm2": 300.0}
+    # The final step (`horn-study earpiece`) locks everything the study evaluated: throat, faceplate
+    # mouth, stem, and the collector's reach and opening.
+    assert final_step.locked_params(selected["parameters"]) == {
+        "throat_mm2": 60.0,
+        "mouth_mm2": 300.0,
+        "canal_stem_mm": selected["parameters"]["canal_stem_mm"],
+    }
+    assert final_step.study_collector(selected["parameters"]) == (
+        selected["parameters"]["collector_reach_mm"],
+        selected["parameters"]["collector_mouth_mm2"],
+    )
     records = json.loads((outcome.directory / "experiment_results.json").read_text())["records"]
     assert all(record["outcome"] == "completed" for record in records)
     built = [r["result"]["design"]["family"] for r in records if "earpiece" in r["result"]["candidate_id"]]
