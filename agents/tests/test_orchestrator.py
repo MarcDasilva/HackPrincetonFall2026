@@ -190,6 +190,87 @@ async def test_one_follow_up_assignment_is_allowed_and_its_direction_reaches_the
     }
 
 
+async def test_two_assignments_of_one_investigator_in_one_turn_are_a_first_pass_and_a_follow_up(tmp_path):
+    twice = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "task",
+                "args": {"description": "First.", "subagent_type": "hearing_research"},
+                "id": "a1",
+            },
+            {
+                "name": "task",
+                "args": {"description": "Second.", "subagent_type": "hearing_research"},
+                "id": "a2",
+            },
+            {
+                "name": "task",
+                "args": {"description": "Third.", "subagent_type": "hearing_research"},
+                "id": "a3",
+            },
+        ],
+    )
+    lead = scripted(twice, delegate("use_context_research", "acoustic_design_research"))
+    outcome = await run_study(make_request(), Harness(tmp_path, coordinator=lead).deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    assigned = [e for e in outcome.events.history if e.type == "orchestrator.assigned"]
+    assert sorted((e.data["direction"], e.data["follow_up"]) for e in assigned[:2]) == [
+        ("First.", False),
+        ("Second.", True),
+    ]
+    assert (
+        sum(1 for name, text in lead.seen["results"] if name == "task" and text.startswith("Not assigned"))
+        == 1
+    )
+
+
+async def test_an_assignment_the_framework_rejects_is_not_counted(tmp_path):
+    """A real model once added a stray argument to its first task call. The retry is the first pass."""
+    malformed = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "task",
+                "args": {
+                    "description": "Profile first.",
+                    "subagent_type": "hearing_research",
+                    "subpath": "x",
+                },
+                "id": "bad",
+            },
+            {
+                "name": "task",
+                "args": {"description": "Needs.", "subagent_type": "use_context_research"},
+                "id": "ok1",
+            },
+            {
+                "name": "task",
+                "args": {"description": "Shapes.", "subagent_type": "acoustic_design_research"},
+                "id": "ok2",
+            },
+        ],
+    )
+    lead = scripted(
+        malformed,
+        delegate("hearing_research", direction="Profile, second try."),
+        delegate("acoustic_design_research", direction="A real follow-up."),
+    )
+    outcome = await run_study(make_request(), Harness(tmp_path, coordinator=lead).deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    assigned = [e for e in outcome.events.history if e.type == "orchestrator.assigned"]
+    assert [(e.data["investigator"], e.data["follow_up"]) for e in assigned] == [
+        ("use_context_research", False),
+        ("acoustic_design_research", False),
+        ("hearing_research", False),
+        ("acoustic_design_research", True),
+    ]
+    assert not any(text.startswith("Not assigned") for name, text in lead.seen["results"] if name == "task")
+    assert count(outcome, "research.agent_started") == 4
+
+
 async def test_a_request_can_forbid_follow_up_assignments(tmp_path):
     lead = scripted(delegate(*INVESTIGATOR_NAMES), delegate("hearing_research", direction="Again."))
     request = make_request()

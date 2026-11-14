@@ -28,7 +28,7 @@ from deepagents.backends.utils import create_file_data
 from langchain.agents.middleware import ModelCallLimitMiddleware, ModelRequest, ModelRetryMiddleware
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.graph.state import CompiledStateGraph
 
@@ -193,14 +193,17 @@ class StudyControl:
         self._ledger = ResearchLedger()
         self._branches: list[BranchResult] = []
         self._assigned: dict[str, int] = {}
+        # Assignments the gate accepted that have not started yet: tool call ID -> (investigator,
+        # is a follow-up). One that never starts, because the framework rejected the call, is released.
+        self._reserved: dict[str, tuple[str, bool]] = {}
         self._follow_ups_used = 0
         self._plan_revision = 0
         self._phase = asyncio.Lock()
 
     # -- research ----------------------------------------------------------
 
-    def assignment_refusal(self, name: str) -> str | None:
-        """Decide whether an investigator may be assigned now. An accepted assignment is counted."""
+    def assignment_refusal(self, name: str, call_id: str) -> str | None:
+        """Decide whether an investigator may be assigned now. An accepted assignment is reserved."""
         specs = {spec.name for spec in INVESTIGATORS}
         if name not in specs:
             return (
@@ -212,7 +215,8 @@ class StudyControl:
                 "Not assigned: research is closed. It closed when the first plan was submitted, and a "
                 "study cannot go back. " + self._next_step()
             )
-        if self._assigned.get(name, 0) > 0:
+        is_follow_up = self._assigned.get(name, 0) > 0
+        if is_follow_up:
             limit = self.package.budget.max_research_follow_ups
             if self._follow_ups_used >= limit:
                 return (
@@ -222,12 +226,28 @@ class StudyControl:
                 )
             self._follow_ups_used += 1
         self._assigned[name] = self._assigned.get(name, 0) + 1
+        self._reserved[call_id] = (name, is_follow_up)
         return None
 
-    async def investigate(self, spec: InvestigatorSpec, direction: str) -> tuple[str, dict[str, Any]]:
+    def release_assignment(self, call_id: str) -> None:
+        """Give back an accepted assignment whose investigator never started."""
+        reserved = self._reserved.pop(call_id, None)
+        if reserved is None:
+            return
+        name, is_follow_up = reserved
+        self._assigned[name] -= 1
+        if is_follow_up:
+            self._follow_ups_used -= 1
+
+    async def investigate(
+        self, spec: InvestigatorSpec, direction: str, call_id: str | None = None
+    ) -> tuple[str, dict[str, Any]]:
         """Run one investigator. Returns what the orchestrator reads, and the files it gains."""
         earlier = [branch for branch in self._branches if branch.investigator == spec.name]
-        is_follow_up = self._assigned.get(spec.name, 0) > 1
+        if call_id not in self._reserved:
+            # The framework did not pass the call's ID through. Take this investigator's oldest one.
+            call_id = next((key for key, (name, _) in self._reserved.items() if name == spec.name), None)
+        is_follow_up = self._reserved.pop(call_id, (spec.name, False))[1] if call_id else False
         known = {f"/sources/{record.source_id}.txt": text for record, text in self._source_texts()}
         asked = direction.strip()
         self._events.emit(
@@ -593,13 +613,14 @@ def _whole_sentences(text: str, limit: int) -> str:
 def investigator_subagent(spec: InvestigatorSpec, control: StudyControl) -> CompiledSubAgent:
     """Offer an investigator to the orchestrator as a subagent. The investigator itself is unchanged."""
 
-    async def assignment(state: dict[str, Any]) -> dict[str, Any]:
+    async def assignment(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
         direction = ""
         for message in reversed(state.get("messages", [])):
             if isinstance(message, HumanMessage):
                 direction = message.text if isinstance(message.text, str) else str(message.content)
                 break
-        report, files = await control.investigate(spec, direction)
+        call_id = (config.get("metadata") or {}).get("lc_subagent_tool_call_id")
+        report, files = await control.investigate(spec, direction, call_id)
         return {"messages": [AIMessage(content=report)], "files": files}
 
     return {
@@ -635,25 +656,41 @@ class OrchestratorGate(ToolAllowlistMiddleware):
         if name not in self._allowed:
             return self._refused(call, f"Error: {name} is not available to the study orchestrator.")
         if name == "task":
-            refusal = self._control.assignment_refusal(str((call.get("args") or {}).get("subagent_type", "")))
+            wanted = str((call.get("args") or {}).get("subagent_type", ""))
+            refusal = self._control.assignment_refusal(wanted, call["id"] or "")
             if refusal:
                 return self._refused(call, refusal)
         return None
+
+    def _settle(self, request: Any, result: Any) -> None:
+        call = request.tool_call
+        if call["name"] == "task":
+            # An accepted assignment that never reached its investigator does not count.
+            self._control.release_assignment(call["id"] or "")
+        self._control.observe(call, result)
 
     def wrap_tool_call(self, request: Any, handler: Callable[..., Any]) -> Any:
         refused = self._rejection(request)
         if refused is not None:
             return refused
-        result = handler(request)
-        self._control.observe(request.tool_call, result)
+        try:
+            result = handler(request)
+        except BaseException:
+            self._settle(request, None)
+            raise
+        self._settle(request, result)
         return result
 
     async def awrap_tool_call(self, request: Any, handler: Callable[..., Awaitable[Any]]) -> Any:
         refused = self._rejection(request)
         if refused is not None:
             return refused
-        result = await handler(request)
-        self._control.observe(request.tool_call, result)
+        try:
+            result = await handler(request)
+        except BaseException:
+            self._settle(request, None)
+            raise
+        self._settle(request, result)
         return result
 
     @staticmethod
