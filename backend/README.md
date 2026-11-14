@@ -48,7 +48,7 @@ point it at the API with `?api=https://your-api` or `window.API_BASE`.
 | Method | Path | Body / result |
 |---|---|---|
 | GET | `/api/health` | weights and AudioEar present |
-| POST | `/api/patients` | multipart: `photo`, `box` (`x0,y0,x1,y1` px after EXIF rotation), `side`, `ear_height_mm`, `audiogram` (JSON dB HL; blank = example) → `{id}` (202) |
+| POST | `/api/patients` | multipart: `photo`, `box` (`x0,y0,x1,y1` px after EXIF rotation; blank = detected), `side` (`left`/`right`, the person's own ear; blank = detected), `ear_height_mm`, `audiogram` (JSON dB HL, or `{"left": {...}, "right": {...}}` so the detected ear picks; blank = example) → `{id}` (202) |
 | GET | `/api/patients/{id}` | `status` (queued/running/done/error), `step`, `log`, `results` (ear, context, aid), `files` |
 | POST | `/api/patients/{id}/aid` | JSON `throat_mm2`, `mouth_mm2`, `vent_diameter_mm`, `min_wall_mm`, `max_path_mm` → rebuilds the aid |
 | GET | `/api/patients/{id}/files/{name}` | `ear.glb`, `overlay.jpg`, `mask.png`, `summary.png`, `aid.glb`, `aid_in_ear.glb`, `aid_print.stl`, `design.json`, `references.json`, … |
@@ -60,6 +60,12 @@ curl -F photo=@ear.jpg -F box=585,340,2240,3310 -F side=right -F ear_height_mm=6
      -F 'audiogram={"250":15,"500":20,"1000":30,"2000":45,"4000":55,"6000":55}' \
      http://localhost:8000/api/patients
 ```
+
+## Ear detection (sends the photo to Anthropic)
+
+When a request leaves `box` or `side` blank, `earrecon/detect.py` sends the photo to Claude to find the ear and its side.
+It needs `ANTHROPIC_API_KEY` (503 without it) and takes `EAR_DETECT_MODEL` (default `claude-sonnet-5-5`). A client that
+sends BOTH `box` and `side` never triggers a call, so an offline or private deployment can require the client to draw the box.
 
 ## Licences and limits
 

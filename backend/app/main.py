@@ -18,10 +18,13 @@ import uuid
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
+
+from earrecon.detect import DetectError, detect_ear
 
 from . import jobs
 from .settings import settings
@@ -31,7 +34,7 @@ app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_me
 
 ID_RE = re.compile(r"^[a-f0-9]{12}$")
 FILES = {
-    "ear.glb": "ear/ear.glb", "ear.obj": "ear/ear.obj", "mask.png": "ear/mask.png",
+    "ear.glb": "ear/ear.glb", "ear_skin.glb": "ear/ear_skin.glb", "ear.obj": "ear/ear.obj", "mask.png": "ear/mask.png", "depth.png": "ear/depth.png",
     "overlay.jpg": "ear/overlay.jpg", "input.jpg": "ear/input.jpg",
     "ear_world.glb": "context/ear_world.glb", "summary.png": "context/summary.png",
     "references.json": "context/references.json", "canals.json": "context/canals.json",
@@ -57,23 +60,25 @@ def health():
 @app.post("/api/patients", status_code=202)
 async def create_patient(
     photo: UploadFile = File(..., description="side-on photo of the ear (JPEG, PNG or HEIC)"),
-    box: str = Form(..., description="x0,y0,x1,y1 around the ear, in the photo's pixels (after EXIF rotation)"),
-    side: str = Form("right"),
+    box: str = Form("", description="x0,y0,x1,y1 around the ear, in the photo's pixels (after EXIF rotation); blank = detected by Claude"),
+    side: str = Form("", description="left or right (the person's own ear); blank = detected by Claude"),
     ear_height_mm: float = Form(62.0),
-    audiogram: str = Form("", description='JSON {"250": 15, ...} dB HL; blank = example audiogram'),
+    audiogram: str = Form("", description='JSON {"250": 15, ...} dB HL, or {"left": {...}, "right": {...}} so the detected ear picks its own; blank = example audiogram'),
 ):
-    if side not in ("right", "left"):
+    if side not in ("", "right", "left"):
         raise HTTPException(422, "side must be right or left")
     if not 40 <= ear_height_mm <= 90:
         raise HTTPException(422, "ear height should be 40-90 mm")
+    b = None
+    if box.strip():
+        try:
+            b = [int(float(v)) for v in box.split(",")]
+            assert len(b) == 4
+        except Exception:
+            raise HTTPException(422, "box must be x0,y0,x1,y1")
     try:
-        b = [int(float(v)) for v in box.split(",")]
-        assert len(b) == 4
-    except Exception:
-        raise HTTPException(422, "box must be x0,y0,x1,y1")
-    try:
-        ag = {int(k): float(v) for k, v in (json.loads(audiogram) if audiogram.strip() else DEFAULT_AUDIOGRAM).items()}
-        assert len(ag) >= 3 and all(-10 <= v <= 120 for v in ag.values())
+        ag_raw = json.loads(audiogram) if audiogram.strip() else DEFAULT_AUDIOGRAM
+        assert isinstance(ag_raw, dict)
     except Exception:
         raise HTTPException(422, "audiogram must be JSON like {\"250\": 15, \"500\": 20, ...} in dB HL")
 
@@ -89,6 +94,22 @@ async def create_patient(
         img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
     except Exception:
         raise HTTPException(422, "could not read the photo; use JPEG, PNG or HEIC")
+
+    # A blank box or side is the ONLY case that sends the photo to Claude (earrecon/detect.py).
+    if b is None or not side:
+        try:
+            found = await run_in_threadpool(detect_ear, img)
+        except DetectError as e:
+            raise HTTPException(e.status, str(e))
+        b, side = b or found["box"], side or found["side"]
+    # Per-ear audiogram: the detected side is only known now, so the client may send both ears.
+    if "left" in ag_raw or "right" in ag_raw:
+        ag_raw = ag_raw.get(side) or {}
+    try:
+        ag = {int(k): float(v) for k, v in ag_raw.items()}
+        assert len(ag) >= 3 and all(-10 <= v <= 120 for v in ag.values())
+    except Exception:
+        raise HTTPException(422, "audiogram must be JSON like {\"250\": 15, \"500\": 20, ...} in dB HL")
 
     pid = uuid.uuid4().hex[:12]
     d = jobs.patient_dir(pid)
@@ -108,7 +129,34 @@ def get_patient(pid: str):
     job = jobs.read_job(pid)
     d = jobs.patient_dir(pid)
     job["files"] = {k: f"/api/patients/{pid}/files/{k}" for k, v in FILES.items() if os.path.exists(os.path.join(d, v))}
+    if os.path.exists(os.path.join(d, "waves", "runs.json")):
+        job["files"]["waves"] = f"/api/patients/{pid}/waves/index.html"
     return job
+
+
+WAVE_FILE_RE = re.compile(r"^[A-Za-z0-9_.+-]+\.(html|json|png|wav)$")
+
+
+@app.post("/api/patients/{pid}/waves", status_code=202)
+def rerun_waves(pid: str):
+    _check_id(pid)
+    if jobs.read_job(pid)["status"] in ("queued", "running"):
+        raise HTTPException(409, "this patient is still being processed")
+    jobs.submit(jobs.run_waves, pid)
+    return {"id": pid, "status_url": f"/api/patients/{pid}"}
+
+
+@app.get("/api/patients/{pid}/waves/{name}")
+def get_wave_file(pid: str, name: str):
+    """The wave viewer and its frames. Names are flat and pattern-checked, so a request can NEVER
+    leave the patient's waves folder."""
+    _check_id(pid)
+    if not WAVE_FILE_RE.match(name):
+        raise HTTPException(404, "unknown file")
+    p = os.path.join(jobs.patient_dir(pid), "waves", name)
+    if not os.path.isfile(p):
+        raise HTTPException(404, "file not ready")
+    return FileResponse(p)
 
 
 class AidDesign(BaseModel):

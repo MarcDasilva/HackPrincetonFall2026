@@ -5,3 +5,23 @@ body { margin: 0; font-family: system-ui, sans-serif; }
 .metal-fx-root[data-theme] {
   background: transparent !important;
 }
+
+/* Orb loading sub text rises into place under the sphere. cubic-bezier(0.33, 0, 0.67, 1) is After Effects' Easy Ease, matching the orb's GSAP power1.inOut. */
+@keyframes orb-sub-rise {
+  from { opacity: 0; transform: translateY(12px); }
+}
+/* Shimmer: a slightly lighter band sweeps across the text for as long as it shows. The fill is clipped from the gradient, so the element's own `color` (#757575, the Capture pills' grey) is NOT what paints — keep it set: it is the fallback where clipping is unsupported and what e2e/orb-state.spec.ts compares. */
+@keyframes orb-sub-shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: -100% 0; }
+}
+.orb-sub {
+  animation: orb-sub-rise 0.6s cubic-bezier(0.33, 0, 0.67, 1) both, orb-sub-shimmer 2.4s linear infinite;
+  background: linear-gradient(100deg, #757575 40%, #a3a3a3 50%, #757575 60%) 0 0 / 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+@media (prefers-reduced-motion: reduce) {
+  .orb-sub { animation: orb-sub-rise 0.6s cubic-bezier(0.33, 0, 0.67, 1) both; background: none; -webkit-text-fill-color: currentColor; }
+}

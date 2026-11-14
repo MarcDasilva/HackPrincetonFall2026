@@ -9,3 +9,6 @@ if (typeof WebGL2RenderingContext !== "undefined" && typeof OffscreenCanvas !== 
     return getExtension.call(this, name);
   } as typeof getExtension;
 }
+
+/** Chrome ramp as a CSS gradient, for borders MetalFx cannot draw (it bakes its ring from the element size once, so animated sizes break it). Same stops as the title and dock icon strokes. */
+export const SILVER = "linear-gradient(135deg, #ffffff 0%, #c9ccd1 30%, #7d8189 52%, #e6e8eb 75%, #9aa0a8 100%)";
