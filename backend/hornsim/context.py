@@ -47,8 +47,14 @@ def cached_clip(name, make):
     return x
 
 
-def build(cfg, out, log=print):
-    """Patient context for the design loop. Returns the context dict."""
+def build(cfg, out, log=print, on_ready=None, stop_when_ready=False):
+    """Patient context for the design loop. Returns the context dict.
+
+    on_ready(): called once the ear world and canal samples are on disk, with a preliminary
+    context.json (config only, "partial": true). That is everything the scene grid (/sim) and the
+    earpiece builder read, so they can start while the HASPI references (~2.5 min) are still running;
+    the full context.json replaces it at the end. stop_when_ready: return right after on_ready, with
+    only the ear world summary (the scene grid's "sim" stage; the references can be built later)."""
     P, E, C, S, V = cfg["patient"], cfg["ear_world"], cfg["canal"], cfg["speech"], cfg["evaluation"]
     os.makedirs(os.path.join(out, "speech"), exist_ok=True)
     rel = lambda p: p
@@ -79,6 +85,17 @@ def build(cfg, out, log=print):
     json.dump({"assumed_diameter_mm": E["canal_opening_diameter_mm"], "canals": canals},
               open(os.path.join(out, "canals.json"), "w"), indent=1)
     log(f"canals: {len(canals)} samples, {canals[0]['volume_cc']}-{canals[-1]['volume_cc']} cc")
+    if not os.path.exists(os.path.join(out, "context.json")) or json.load(open(os.path.join(out, "context.json"))).get("partial"):
+        tmp = os.path.join(out, "context.json.tmp")
+        json.dump({"patient": P, "config": cfg, "partial": True,
+                   "notes": ["Preliminary: ear world and canal samples only; HASPI references still running."]},
+                  open(tmp, "w"), indent=1, default=float)
+        os.replace(tmp, os.path.join(out, "context.json"))
+    if on_ready:
+        on_ready()
+    if stop_when_ready:
+        return {"partial": True, "ear_world": {k: float(getattr(world, k)) for k in
+                                               ("bowl_volume_cc", "shell_volume_cc", "opening_area_mm2", "max_depth_mm")}}
 
     # 3. speech clips
     fs = S["sample_rate"]
@@ -136,7 +153,9 @@ def build(cfg, out, log=print):
         ],
     }
     context["ear_world"].pop("rim_points", None)
-    json.dump(context, open(os.path.join(out, "context.json"), "w"), indent=1, default=float)
+    tmp = os.path.join(out, "context.json.tmp")
+    json.dump(context, open(tmp, "w"), indent=1, default=float)
+    os.replace(tmp, os.path.join(out, "context.json"))     # atomic: /sim may be reading the preliminary one
 
     summary_figure(mesh, world, ag, rx, refs, V["levels_db_spl"], os.path.join(out, "summary.png"))
     context["references_data"] = refs

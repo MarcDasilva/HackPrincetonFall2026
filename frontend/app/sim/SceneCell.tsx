@@ -7,16 +7,19 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { HeadGrid, Side } from "./lib/fdtd";
 import { SIDES, speakerMm } from "./lib/fdtd";
+import { playbackOffsetDb, type Condition } from "./lib/binaural";
+import { isTarget } from "./lib/hearing";
+import { ROLES, SOUNDS } from "./lib/sounds";
 import { dirKey, type Scene, type Source } from "./lib/scenes";
 import type { FrameStore } from "./SimGrid";
 import styles from "./sim.module.css";
 
-export const ROLE_COLOR = { talker: "#d95926", babble: "#3987e5" } as const;
+export const ROLE_COLOR = Object.fromEntries(ROLES.map((r) => [r, SOUNDS[r].color])) as Record<Source["role"], string>;
 const DUMMY = 0x76797c;      // matte grey, like a measurement head
 const DUMMY_EAR = 0x8a8d90;
 
 export type CellStatus = { state: "idle" | "queued" | "running" | "done"; done: number; total: number };
-export type EarSii = Record<Side, { healthy: number; unaided: number; aided?: number } | null>;
+export type EarSii = Record<Side, { healthy: number; unaided: number; aided?: number; metric: string } | null>;
 
 type Props = {
   grid: HeadGrid;
@@ -31,7 +34,17 @@ type Props = {
   onChange: (s: Scene) => void;
   onRemoveSource: (sourceId: string) => void;
   onAddSource: (role: Source["role"]) => void;
+  /** highlighted; listening = this scene is playing through the simulated head */
+  selected: boolean;
+  listening: boolean;
+  cond: Condition;
+  canAided: boolean;
+  onSelect: () => void;
+  onToggleListen: () => void;
+  onCond: (c: Condition) => void;
 };
+
+const COND_LABEL: Record<Condition, string> = { healthy: "healthy ears", unaided: "patient, no earpieces", aided: "patient + earpieces" };
 
 /** Head, neck and shoulders from the SAME shape the wave grid voxelized (hornsim.head_grid.HEAD). */
 function buildDummy(grid: HeadGrid) {
@@ -279,6 +292,7 @@ export default function SceneCell(props: Props) {
         let m = markers.get(s.id);
         if (!m) {
           m = new THREE.Mesh(new THREE.SphereGeometry(9, 20, 14), new THREE.MeshStandardMaterial({ color: ROLE_COLOR[s.role], emissive: ROLE_COLOR[s.role], emissiveIntensity: 0.35 }));
+          m.userData.role = s.role;
           m.userData.id = s.id;
           const line = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineDashedMaterial({ color: ROLE_COLOR[s.role], transparent: true, opacity: 0.55, dashSize: 8, gapSize: 6 }));
           m.userData.line = line;
@@ -286,6 +300,7 @@ export default function SceneCell(props: Props) {
           markers.set(s.id, m);
         }
         m.position.set(...speakerMm(grid, s.az, s.el));
+        m.scale.setScalar(isTarget(s) ? 1.25 : 0.8);                   // the sound you want to hear stands out
         const line = m.userData.line as THREE.Line;
         line.geometry.setFromPoints([m.position.clone().multiplyScalar(0.62), m.position.clone()]);
         line.computeLineDistances();
@@ -364,42 +379,89 @@ export default function SceneCell(props: Props) {
   const pct = status.total ? Math.round((status.done / status.total) * 100) : 0;
   const fmt = (v?: number) => (v === undefined ? "–" : v.toFixed(2));
   return (
-    <div className={styles.cell}>
+    <div className={styles.cell} data-selected={props.selected || undefined} data-listening={props.listening || undefined}
+      onPointerDownCapture={() => { if (!props.selected) props.onSelect(); }}>
       <div className={styles.cellHead}>
-        <input className={styles.cellName} value={scene.name} aria-label="Scene name"
+        <input className={styles.cellName} value={scene.name} aria-label="Scene name" title={scene.why || undefined}
           onChange={(e) => props.onChange({ ...scene, name: e.target.value })} />
         {scene.condition && <span className={styles.tag}>{scene.condition}</span>}
+        <button className={styles.listenBtn} data-on={props.listening || undefined} onClick={props.onToggleListen}
+          title="Hear this scene through the simulated head (use headphones)" aria-label={props.listening ? "Stop listening" : "Listen to this scene"}>
+          {props.listening ? "■ stop" : "▶ listen"}
+        </button>
         <span className={styles.status} data-state={status.state}>
           {status.state === "done" ? "done" : status.state === "idle" ? "—" : `${status.state} ${pct}%`}
         </span>
       </div>
+      {scene.why && <div className={styles.why}>{scene.why}</div>}
       <div ref={mount} className={styles.view} />
+      {props.listening && (
+        <div className={styles.listenBar}>
+          <span className={styles.pulse} aria-hidden />
+          <label>hearing as
+            <select value={props.cond} onChange={(e) => props.onCond(e.target.value as Condition)}>
+              {(Object.keys(COND_LABEL) as Condition[]).map((c) => (
+                <option key={c} value={c} disabled={c === "aided" && !props.canAided}>{COND_LABEL[c]}{c === "aided" && !props.canAided ? " (design first)" : ""}</option>
+              ))}
+            </select>
+          </label>
+          <span className={styles.note}>headphones · drag a speaker to move the sound</span>
+          {playbackOffsetDb(scene.sources) > 0 && (
+            <span className={styles.note}>played {playbackOffsetDb(scene.sources).toFixed(0)} dB quieter than real, to protect your hearing</span>
+          )}
+          {Math.max(...scene.sources.map((s) => s.levelDb)) >= 90 && (
+            <p className={styles.warnBox}>
+              At {Math.max(...scene.sources.map((s) => s.levelDb))} dB this scene is loud enough to damage hearing with long exposure. A passive
+              earpiece that adds gain makes it louder still; here the ear needs protection, not amplification.
+            </p>
+          )}
+        </div>
+      )}
       <div className={styles.cellFoot}>
         {scene.sources.map((s) => (
           <div key={s.id} className={styles.srcRow}>
-            <span className={styles.dot} style={{ background: ROLE_COLOR[s.role] }} />
-            <span className={styles.srcLabel}>{s.role}</span>
+            <button className={styles.targetBtn} data-on={isTarget(s) || undefined} style={{ ["--c" as string]: ROLE_COLOR[s.role] }}
+              title={isTarget(s) ? "Listening for this sound (scored); click to make it background" : "Background sound; click to listen for it (score it)"}
+              aria-label={isTarget(s) ? `Stop listening for the ${s.role}` : `Listen for the ${s.role}`} aria-pressed={isTarget(s)}
+              onClick={() => props.onChange({ ...scene, sources: scene.sources.map((x) => (x.id === s.id ? { ...x, target: !isTarget(x) } : x)) })} />
+            <span className={styles.srcLabel}>{s.custom ? s.custom.name.replace(/\.[a-z0-9]+$/i, "") : s.role}</span>
             <span className={styles.num}>{Math.round(s.az)}°/{Math.round(s.el)}°</span>
-            <input type="range" min={40} max={85} step={1} value={s.levelDb} aria-label={`${s.role} level`}
+            {s.role === "music" && (
+              <label className={styles.btn} title={s.custom ? `Playing ${s.custom.name} (stays in this browser)` : "Play your own audio file for this source (stays in this browser)"}>
+                {s.custom ? "♪ mine" : "use my audio"}
+                <input type="file" accept="audio/*" hidden onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  e.target.value = "";
+                  if (!file) return;
+                  if (s.custom) URL.revokeObjectURL(s.custom.url);
+                  props.onChange({ ...scene, sources: scene.sources.map((x) => (x.id === s.id ? { ...x, custom: { name: file.name, url: URL.createObjectURL(file) } } : x)) });
+                }} />
+              </label>
+            )}
+            <input type="range" min={40} max={110} step={1} value={s.levelDb} aria-label={`${s.role} level`}
               onChange={(e) => props.onChange({ ...scene, sources: scene.sources.map((x) => (x.id === s.id ? { ...x, levelDb: +e.target.value } : x)) })} />
             <span className={styles.num}>{s.levelDb} dB</span>
             <button className={styles.x} aria-label="Remove source" onClick={() => props.onRemoveSource(s.id)}>×</button>
           </div>
         ))}
         <div className={styles.srcRow}>
-          <button className={styles.btn} onClick={() => props.onAddSource("talker")}>+ talker</button>
-          <button className={styles.btn} onClick={() => props.onAddSource("babble")}>+ babble</button>
+          <select className={styles.addSource} value="" aria-label="Add a sound source"
+            onChange={(e) => { const r = e.target.value as Source["role"]; if (r) props.onAddSource(r); }}>
+            <option value="">+ add source</option>
+            {ROLES.map((r) => <option key={r} value={r}>{SOUNDS[r].menu}</option>)}
+          </select>
           <label className={styles.weight}>weight
             <input type="number" min={0} max={10} step={0.5} value={scene.weight}
               onChange={(e) => props.onChange({ ...scene, weight: Math.max(0, +e.target.value) })} />
           </label>
         </div>
-        <div className={styles.siiRow} title="SII per ear: healthy ear / this ear unaided → with its earpiece">
+        {!scene.sources.some(isTarget) && <div className={styles.note}>Nothing marked to listen for: click a source&apos;s dot to score it.</div>}
+        <div className={styles.siiRow} title="Per ear, for the sounds you are listening for: healthy ear / this ear unaided → with its earpiece. SII for speech; AI (audibility index) for other sounds.">
           {SIDES.map((s) => {
             const v = props.sii[s];
             return (
               <span key={s} className={styles.num}>
-                <b>{s === "left" ? "L" : "R"}</b> SII {fmt(v?.healthy)} / {fmt(v?.unaided)}{v?.aided !== undefined && <> → {fmt(v.aided)}</>}
+                <b>{s === "left" ? "L" : "R"}</b> {v?.metric ?? "SII"} {fmt(v?.healthy)} / {fmt(v?.unaided)}{v?.aided !== undefined && <> → {fmt(v.aided)}</>}
               </span>
             );
           })}

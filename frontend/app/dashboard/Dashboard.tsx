@@ -255,7 +255,7 @@ export default function Dashboard() {
         try {
           const pid = await uploadEar(p.blob, side, p.box);
           next[side] = pid;
-          say({ id, text: `${KIND_LABEL[side]}: reconstructing the ear (patient ${pid}, about 2–3 minutes; ears queue one at a time)…` });
+          say({ id, text: `${KIND_LABEL[side]}: reconstructing the ear (patient ${pid}, about 15 seconds)…` });
           const t = window.setInterval(async () => {
             try {
               const j = await patientStatus(pid);

@@ -10,12 +10,13 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import Aggregate, { type SceneRow } from "./Aggregate";
 import HeadPhoto from "./HeadPhoto";
 import SceneCell, { type CellStatus, type EarSii } from "./SceneCell";
-import { AVERAGE_IDS, designStatus, fetchHead, isAverage, startDesign, startWaveCheck, waveStatus, type DesignStatus, type HeadWithPatients, type WaveStatus } from "./lib/api";
+import { AVERAGE_IDS, designStatus, fetchHead, fetchSceneSet, isAverage, startDesign, startWaveCheck, waveStatus, type DesignStatus, type HeadWithPatients, type WaveStatus } from "./lib/api";
 import { bandGainDb } from "./lib/bands";
 import { decodeSolid, SIDES, type Side } from "./lib/fdtd";
 import { EXAMPLE_AUDIOGRAM, sceneDeficit, targetGain, toAudiogram } from "./lib/hearing";
+import { conditionGains, ScenePlayer, type Condition, type EarTF } from "./lib/binaural";
 import { SimPool, type EarSpectra } from "./lib/pool";
-import { defaultScenes, dirKey, newSource, PRESETS, sceneFromPreset, type Scene } from "./lib/scenes";
+import { defaultScenes, dirKey, newSource, PRESETS, sceneFromPreset, scenesFromSet, type Scene } from "./lib/scenes";
 import styles from "./sim.module.css";
 
 const REF = dirKey(0, 0);
@@ -47,6 +48,8 @@ const urlFor = (ids: Record<Side, string>, head: string | null) => {
   const q = new URLSearchParams();
   if (!isAverage(ids.left) || !isAverage(ids.right)) { q.set("left", ids.left); q.set("right", ids.right); }
   if (head) q.set("head", head);
+  const sc = new URLSearchParams(window.location.search).get("scenes");     // keep a loaded scene set
+  if (sc && ID_RE.test(sc)) q.set("scenes", sc);
   return `?${q.toString()}`;
 };
 
@@ -58,7 +61,25 @@ export default function SimGrid() {
   const [offline, setOffline] = useState<string | null>(null);   // backend unreachable: static average head, no design
   const [n, setN] = useState(3);
   const [scenes, setScenes] = useState<Scene[]>(() => defaultScenes(9));
+  const [sceneSource, setSceneSource] = useState<string | null>(null);   // where the scenes came from (a research plan)
+  // ?scenes=<id>: the scenes the research step chose for this user (backend hornsim/scene_spec.py)
+  useEffect(() => {
+    const sid = new URLSearchParams(window.location.search).get("scenes");
+    if (!sid || !ID_RE.test(sid)) return;
+    fetchSceneSet(sid).then((set) => {
+      const sc = scenesFromSet(set);
+      setScenes(sc);
+      setN(Math.min(4, Math.max(1, Math.ceil(Math.sqrt(sc.length)))));
+      setSceneSource(set.source);
+      setCommitTick((t) => t + 1);
+    }, (e) => setError(`scene set ${sid}: ${(e as Error).message}`));
+  }, []);
   const [spectra, setSpectra] = useState<Record<string, EarSpectra>>({});
+  const [tfs, setTfs] = useState<Record<string, EarTF>>({});        // per direction: both eardrums' transfer functions (listening)
+  const [selected, setSelected] = useState<string | null>(null);     // the highlighted scene
+  const [listening, setListening] = useState(false);
+  const [cond, setCond] = useState<Condition>("unaided");
+  const player = useRef<ScenePlayer | null>(null);
   const pending = useRef(new Set<string>());
   const [error, setError] = useState<string | null>(null);
   const store = useMemo(() => new FrameStore(), []);
@@ -78,7 +99,7 @@ export default function SimGrid() {
   const needsHead = !!ids && !head && (!isAverage(ids.left) || !isAverage(ids.right));
   useEffect(() => {
     if (!ids || needsHead) return;
-    setGrid(null); setSpectra({}); setDesign(perEar(() => ({ status: "none" }))); setWave(perEar(() => ({ status: "none" }))); setAgEdit(perEar(() => null));
+    setGrid(null); setSpectra({}); setTfs({}); setDesign(perEar(() => ({ status: "none" }))); setWave(perEar(() => ({ status: "none" }))); setAgEdit(perEar(() => null));
     fetchHead(ids, head).then((g) => { setGrid(g); setOffline(null); }, (e) => {
       if (!isAverage(ids.left) || !isAverage(ids.right) || head) { setError(`ears ${ids.left} / ${ids.right}${head ? `, head ${head}` : ""}: ${e.message}`); return; }
       setOffline(String(e.message));
@@ -122,7 +143,7 @@ export default function SimGrid() {
     const [a, e] = key.split(",").map(Number);
     store.reset(key);
     pool.run(owner, a, e, (_, slice) => store.add(key, slice)).then(
-      (spec) => setSpectra((s) => ({ ...s, [key]: spec })),
+      (r) => { setSpectra((s) => ({ ...s, [key]: r.spectrum })); setTfs((t) => ({ ...t, [key]: r.tf })); },
       () => {},
     ).finally(() => inflight.delete(key));
   }, [pool, store]);
@@ -153,6 +174,27 @@ export default function SimGrid() {
     if (srcs.some((x) => !x)) return null;
     return sceneDeficit(srcs as NonNullable<(typeof srcs)[number]>[], audiogram[side], G[side]);
   })), [visible, spectra, ref, audiogram, G]);
+
+  // listen: the selected scene through the simulated head, binaurally (lib/binaural.ts)
+  const selScene = visible.find((s) => s.id === selected) ?? null;
+  const gains = useMemo(() => conditionGains(cond, audiogram, G), [cond, audiogram, G]);
+  const condKey = `${cond}:${gains.left.map((g) => g.toFixed(1)).join()}:${gains.right.map((g) => g.toFixed(1)).join()}`;
+  useEffect(() => {
+    if (!listening || !selScene || !player.current) return;
+    player.current.update(selScene.sources, tfs, REF, gains, condKey).catch(() => {});
+    // gains are captured by condKey
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [listening, selScene, tfs, condKey]);
+  useEffect(() => { if (!listening) { player.current?.stop(); player.current = null; } }, [listening]);
+  useEffect(() => () => { player.current?.stop(); player.current = null; }, []);
+  useEffect(() => { if (selected && !visible.some((s) => s.id === selected)) setListening(false); }, [selected, visible]);
+  const toggleListen = (id: string) => {
+    if (listening && selected === id) { setListening(false); return; }
+    setSelected(id);
+    // the AudioContext must be created inside the click (browsers block audio that starts on its own)
+    if (!player.current) player.current = new ScenePlayer((name) => `/api/sim/clips/${name}.wav`);
+    setListening(true);
+  };
 
   const status = (s: Scene): CellStatus => {
     const keys = [...new Set(s.sources.map((x) => dirKey(x.az, x.el)))];
@@ -232,7 +274,7 @@ export default function SimGrid() {
 
   const sii = (i: number): EarSii => perEar((s) => {
     const r = results[s][i];
-    return r ? { healthy: r.siiHealthy, unaided: r.siiUnaided, aided: r.siiAided } : null;
+    return r ? { healthy: r.siiHealthy, unaided: r.siiUnaided, aided: r.siiAided, metric: r.metric } : null;
   });
 
   if (error) return <p className={styles.error}>{error}</p>;
@@ -292,6 +334,7 @@ export default function SimGrid() {
             {grid.head.meta.measured ? `patient's head from a front photo (${Number(grid.head.meta.breadth_mm).toFixed(0)} mm wide)` : "average head"} ·{" "}
             {isAverage(ids.left) && isAverage(ids.right) ? "average ear on both sides (not anyone's ears)" : "patient's left and right ear scans"} ·{" "}
             {grid.dx_mm} mm grid · talkers far away (plane waves) ·{" "}
+            {sceneSource ? `scenes: ${sceneSource} · ` : ""}
             {SIDES.map((s) => `${s}: ${agEdit[s] ? "edited" : pts?.[s] && !pts[s].audiogram_is_example ? "patient" : "example"} audiogram`).join(", ")}
             {offline && <> · backend offline ({offline}): designing is disabled</>}
           </span>
@@ -299,6 +342,8 @@ export default function SimGrid() {
         <div className={styles.cells} style={{ gridTemplateColumns: `repeat(${n}, minmax(0, 1fr))` }}>
           {visible.map((s, i) => (
             <SceneCell key={s.id} grid={grid} solid={solid} scene={s} status={status(s)} sii={sii(i)} store={store}
+              selected={selected === s.id} listening={listening && selected === s.id} cond={cond} canAided={SIDES.every((e) => !!G[e])}
+              onSelect={() => setSelected(s.id)} onToggleListen={() => toggleListen(s.id)} onCond={setCond}
               onMove={(sid, az, el) => update(s.id, (x) => ({ ...x, sources: x.sources.map((q) => (q.id === sid ? { ...q, az, el } : q)) }))}
               onCommit={commit}
               onChange={(ns) => update(s.id, () => ns)}

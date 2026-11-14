@@ -81,7 +81,65 @@ export async function locateEar(img: HTMLImageElement): Promise<EarLocation | nu
   return { side, box: [clamp(cx - bw / 2, W), clamp(cy - bh / 2, H), clamp(cx + bw / 2, W), clamp(cy + bh / 2, H)], score: best.categories[0]?.score ?? 0 };
 }
 
-export type FaceResult ={ landmarks: number[][]; image_w: number; image_h: number; yaw_deg: number | null };
+// ---------------------------------------------------------------- hair + face silhouette
+// MediaPipe's multiclass selfie segmenter labels each pixel: 0 background, 1 hair, 2 body skin,
+// 3 face skin, 4 clothes, 5 other. Hair + face skin, connected to the face, is the head's outline as
+// the camera sees it; the backend takes the hair's thickness off it (hornsim/head_shape.py).
+const SEGMENTER = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite";
+const HAIR = 1, FACE_SKIN = 3;
+let segmenter: Promise<import("@mediapipe/tasks-vision").ImageSegmenter> | null = null;
+
+function loadSegmenter() {
+  segmenter ??= quietly(async () => {
+    const { ImageSegmenter, FilesetResolver } = await import("@mediapipe/tasks-vision");
+    const files = await FilesetResolver.forVisionTasks(WASM);
+    return ImageSegmenter.createFromOptions(files, {
+      baseOptions: { modelAssetPath: SEGMENTER, delegate: "CPU" }, runningMode: "IMAGE",
+      outputCategoryMask: true, outputConfidenceMasks: false,
+    });
+  });
+  segmenter.catch(() => { segmenter = null; });
+  return segmenter;
+}
+
+/** Rows [y, x_left, x_right] (image px) of the hair + face-skin region connected to the face centre
+ * (normalised point `seed`, e.g. the nose), or null if segmentation fails or finds nothing there. */
+export async function headSilhouette(img: HTMLImageElement, seed: [number, number], step = 2): Promise<number[][] | null> {
+  const seg = await loadSegmenter();
+  const r = await quietly(() => seg.segment(img));
+  const mask = r.categoryMask;
+  if (!mask) return null;
+  const mw = mask.width, mh = mask.height, cls = mask.getAsUint8Array();
+  const head = new Uint8Array(mw * mh);
+  for (let i = 0; i < cls.length; i++) head[i] = cls[i] === HAIR || cls[i] === FACE_SKIN ? 1 : 0;
+  r.close();
+  // flood fill from the seed: only the region the face belongs to (not other people, not a hairy coat)
+  let sx = Math.round(seed[0] * (mw - 1)), sy = Math.round(seed[1] * (mh - 1));
+  if (!head[sy * mw + sx]) {        // nose tip on a boundary pixel: look around it
+    let found = false;
+    for (let d = 1; d < 8 && !found; d++) for (let dy = -d; dy <= d && !found; dy++) for (let dx = -d; dx <= d; dx++) {
+      const x = sx + dx, y = sy + dy;
+      if (x >= 0 && y >= 0 && x < mw && y < mh && head[y * mw + x]) { sx = x; sy = y; found = true; break; }
+    }
+    if (!found) return null;
+  }
+  const seen = new Uint8Array(mw * mh), stack = [sy * mw + sx];
+  seen[stack[0]] = 1;
+  while (stack.length) {
+    const q = stack.pop()!, x = q % mw, y = (q - x) / mw;
+    for (const n of [x > 0 ? q - 1 : -1, x < mw - 1 ? q + 1 : -1, y > 0 ? q - mw : -1, y < mh - 1 ? q + mw : -1])
+      if (n >= 0 && head[n] && !seen[n]) { seen[n] = 1; stack.push(n); }
+  }
+  const sxp = img.naturalWidth / mw, syp = img.naturalHeight / mh, rows: number[][] = [];
+  for (let y = 0; y < mh; y += step) {
+    let x0 = -1, x1 = -1;
+    for (let x = 0; x < mw; x++) if (seen[y * mw + x]) { if (x0 < 0) x0 = x; x1 = x; }
+    if (x0 >= 0) rows.push([Math.round((y + 0.5) * syp), Math.round(x0 * sxp), Math.round((x1 + 1) * sxp)]);
+  }
+  return rows.length >= 10 ? rows : null;
+}
+
+export type FaceResult = { landmarks: number[][]; image_w: number; image_h: number; yaw_deg: number | null };
 
 /** Landmarks of the one face in `img`, or an error a person can act on. */
 export async function detectFace(img: HTMLImageElement): Promise<FaceResult> {

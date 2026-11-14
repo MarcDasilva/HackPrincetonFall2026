@@ -64,7 +64,7 @@ export default function Aggregate({ ear, rows, target, need, nal, complete, tota
         <span className={styles.num}>{complete}/{total} runs</span>
       </div>
       <p className={styles.caption}>
-        T(f) = scene-weighted mean audibility gap, floored at 0 and capped at NAL-R (hornsim/target.py).
+        T(f) = scene-weighted mean audibility gap of the sounds you listen for (speech, music, alarms…), floored at 0 and capped at NAL-R (hornsim/target.py).
         {target.some((t) => t > 0) && <> Largest need: <b>{target[peak].toFixed(1)} dB at {fmtHz(SII_FREQS[peak])} Hz</b>.</>}
       </p>
       <div className={styles.legend}>
@@ -184,7 +184,7 @@ export default function Aggregate({ ear, rows, target, need, nal, complete, tota
       </div>
 
       <table className={styles.table}>
-        <thead><tr><th>Scene</th><th>weight</th><th>SII healthy</th><th>this ear</th>{G && <th>aided</th>}</tr></thead>
+        <thead><tr><th>Scene</th><th>weight</th><th title="SII for speech, AI (audibility index) for other sounds">healthy</th><th>this ear</th>{G && <th>aided</th>}</tr></thead>
         <tbody>
           {rows.map((r) => (
             <tr key={r.id}>

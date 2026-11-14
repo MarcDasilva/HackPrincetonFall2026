@@ -40,13 +40,23 @@ export const fetchHead = (ids: Record<Side, string>, shape: string | null) =>
 export type HeadShapeMeta = {
   measured: boolean; breadth_mm: number; bizygomatic_mm: number; length_mm: number; chin_mm: number; crown_mm: number;
   eye_line_mm: number; ipd_mm: number; mm_per_px: number; roll_deg: number; yaw_deg: number | null;
+  vault_exponent?: number; segmented?: boolean; sources?: { breadth: string; crown: string; vault: string };
 };
 export type HeadShapeFit = {
   id: string; meta: HeadShapeMeta; warnings: string[];
-  overlay: { silhouette_px: number[][]; face_oval_px: number[][]; canal_line_px: number[][]; measured_to_px: number };
+  overlay: { silhouette_px: number[][]; face_oval_px: number[][]; canal_line_px: number[][]; measured_to_px: number; hair_outline_px?: number[][] | null };
 };
+/** Fit the head from a front photo's face landmarks and, if available, its hair + face silhouette rows
+ * (both found in the browser; the photo itself is never sent). */
+export async function measureHead(img: HTMLImageElement) {
+  const { detectFace, headSilhouette } = await import("./faceShape");
+  const face = await detectFace(img);
+  const nose = face.landmarks[1];
+  const head_rows = await headSilhouette(img, [nose[0], nose[1]]).catch(() => null);
+  return createHeadShape({ ...face, head_rows });
+}
 /** Fit the head from a front photo's face landmarks (the photo itself stays in the browser). */
-export const createHeadShape = (face: { landmarks: number[][]; image_w: number; image_h: number; yaw_deg: number | null }) =>
+export const createHeadShape = (face: { landmarks: number[][]; image_w: number; image_h: number; yaw_deg: number | null; head_rows?: number[][] | null }) =>
   fetch("/api/sim/head_shapes", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(face) })
     .then((r) => json<HeadShapeFit>(r));
 export const startDesign = (pid: string, audiogram_db_hl: Record<string, number>, scenes: DesignScene[]) =>
@@ -64,3 +74,6 @@ export const startWaveCheck = (pid: string, azimuths = [0, 90], dx_mm = 1.0) =>
   fetch(`/api/sim/patients/${pid}/design/wave_check`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ azimuths, dx_mm }) })
     .then((r) => json<{ status_url: string }>(r));
 export const waveStatus = (pid: string) => fetch(`/api/sim/patients/${pid}/design/wave_check`).then((r) => json<WaveStatus>(r));
+
+/** A scene set from the research step (backend hornsim/scene_spec.py). */
+export const fetchSceneSet = (sid: string) => fetch(`/api/sim/scene_sets/${sid}`).then((r) => json<import("./scenes").SceneSet>(r));
