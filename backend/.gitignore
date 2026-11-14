@@ -2,3 +2,4 @@
 weights/
 data/
 __pycache__/
+!tests/data/
