@@ -279,6 +279,7 @@ def results_document(
         "research": progress.research.model_dump(mode="json") if progress.research else None,
         "orchestrator": {
             "agent": ORCHESTRATOR_NAME,
+            "evidence_scorecard": progress.scorecard,
             "notes": dict(progress.notes),
             "notes_label": "Working notes written by the orchestrator model. They are not results.",
             "phases_completed_by_workflow": list(progress.phases_completed_by_workflow),

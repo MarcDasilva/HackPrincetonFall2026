@@ -135,7 +135,7 @@ class Budget(Contract):
     max_parallel_evaluations: int = Field(default=2, ge=1, le=32)
     max_research_tool_calls_per_agent: int = Field(default=6, ge=1, le=40)
     max_research_follow_ups: int = Field(
-        default=1,
+        default=2,
         ge=0,
         le=6,
         description="How many times in total the orchestrator may send an investigator back for more.",
@@ -482,6 +482,20 @@ class BranchResult(Contract):
     error: str | None = None
 
 
+class FindingReview(Contract):
+    """The orchestrator's decision on whether one finding may support the plan.
+
+    A model gives the decision and the reason. Code records it only when the finding exists,
+    a reason was given, and, for an acceptance, the finding's source was opened first.
+    """
+
+    finding_id: str
+    decision: Literal["accept", "reject"]
+    reason: str
+    source_id: str
+    source_opened: bool
+
+
 class ResearchRecord(Contract):
     """Everything the research phase produced (research.json)."""
 
@@ -489,6 +503,7 @@ class ResearchRecord(Contract):
     branches: tuple[BranchResult, ...]
     findings: tuple[ResearchFinding, ...]
     sources: tuple[SourceRecord, ...]
+    reviews: tuple[FindingReview, ...] = ()
 
 
 # --------------------------------------------------------------------------

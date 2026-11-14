@@ -7,14 +7,19 @@ from typing import Any
 
 from helpers import (
     INVESTIGATOR_NAMES,
+    PAPER_TEXT,
     PASSAGES,
+    FakeReader,
     Harness,
     call,
     coordinator_responder,
     delegate,
     investigator_of,
     make_request,
+    narrative,
+    open_sources,
     research_responder,
+    review,
     tool_results,
     valid_draft,
 )
@@ -22,10 +27,12 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from horn_study.contracts import StudyState
 from horn_study.orchestrator import ORCHESTRATOR_NAME, ORCHESTRATOR_PROMPT
+from horn_study.sources import FetchedSource
 from horn_study.workflow import run_study
 
 ORCHESTRATOR_TOOLS = {
     "task",
+    "review_findings",
     "submit_plan",
     "run_experiments",
     "write_report",
@@ -37,6 +44,23 @@ ORCHESTRATOR_TOOLS = {
     "edit_file",
 }
 DONE = AIMessage(content="The study is complete.")
+ALL_FINDINGS = ("hearing-F1", "context-F1", "design-F1")
+OPEN_ALL = open_sources("S1", "S2", "S3")
+ACCEPT_ALL = review(dict.fromkeys(ALL_FINDINGS, "accept"))
+
+
+class LongReader(FakeReader):
+    """Returns a text long enough to count as a paper's full text."""
+
+    async def fetch(self, url: str) -> FetchedSource:
+        fetched = await super().fetch(url)
+        return FetchedSource(
+            url=fetched.url,
+            final_url=fetched.final_url,
+            title=fetched.title,
+            content_type=fetched.content_type,
+            text=PAPER_TEXT * 8,
+        )
 
 
 def load(outcome, name: str) -> Any:
@@ -125,6 +149,8 @@ async def test_research_is_closed_once_a_plan_has_been_submitted(tmp_path):
     over_budget["seeds"] = [1, 2, 3]
     lead = scripted(
         delegate(*INVESTIGATOR_NAMES),
+        OPEN_ALL,
+        ACCEPT_ALL,
         call("submit_plan", over_budget, "first"),
         delegate("hearing_research", direction="Look again."),
     )
@@ -155,7 +181,9 @@ async def test_one_follow_up_assignment_is_allowed_and_its_direction_reaches_the
         delegate("hearing_research", direction="One more."),
     )
     harness = Harness(tmp_path, research=research, coordinator=lead)
-    outcome = await run_study(make_request(), harness.deps)
+    request = make_request()
+    request["budget"]["max_research_follow_ups"] = 1
+    outcome = await run_study(request, harness.deps)
 
     assert outcome.state is StudyState.COMPLETED
     assert len(directions) == 2
@@ -212,7 +240,9 @@ async def test_two_assignments_of_one_investigator_in_one_turn_are_a_first_pass_
         ],
     )
     lead = scripted(twice, delegate("use_context_research", "acoustic_design_research"))
-    outcome = await run_study(make_request(), Harness(tmp_path, coordinator=lead).deps)
+    request = make_request()
+    request["budget"]["max_research_follow_ups"] = 1
+    outcome = await run_study(request, Harness(tmp_path, coordinator=lead).deps)
 
     assert outcome.state is StudyState.COMPLETED
     assigned = [e for e in outcome.events.history if e.type == "orchestrator.assigned"]
@@ -308,7 +338,7 @@ async def test_the_orchestrator_can_open_the_reports_and_the_papers_its_investig
     assert sources
     assert all(f"/sources/{source['source_id']}.txt" in listing for source in sources)
     opened = [e for e in outcome.events.history if e.type == "orchestrator.evidence_opened"]
-    assert [(e.data["tool"], e.data["path"]) for e in opened] == [
+    assert [(e.data["tool"], e.data["path"]) for e in opened][:2] == [
         ("grep", "/sources"),
         ("read_file", "/research/hearing_research.json"),
     ]
@@ -425,6 +455,8 @@ async def test_nothing_can_be_researched_planned_or_rerun_once_the_plan_is_froze
     ]
     lead = scripted(
         delegate(*INVESTIGATOR_NAMES),
+        OPEN_ALL,
+        ACCEPT_ALL,
         call("submit_plan", valid_draft(), "p1"),
         after_freeze(*again),
         call("run_experiments", {}, "r1"),
@@ -464,6 +496,8 @@ async def test_nothing_can_be_researched_planned_or_rerun_once_the_plan_is_froze
 async def test_the_workflow_finishes_the_phases_an_orchestrator_leaves_undone(tmp_path):
     lead = scripted(
         delegate(*INVESTIGATOR_NAMES),
+        OPEN_ALL,
+        ACCEPT_ALL,
         call("submit_plan", valid_draft(), "p1"),
         then=lambda messages, bound: AIMessage(content="I am stopping here."),
     )
@@ -499,3 +533,251 @@ async def test_an_orchestrator_that_assigns_nobody_fails_the_study_without_evalu
     assert outcome.failure["kind"] == "planning_failed"
     assert harness.research_model.log.calls == 0
     assert harness.evaluator.calls == []
+
+
+# --------------------------------------------------------------------------
+# Reviewing the evidence
+# --------------------------------------------------------------------------
+
+
+def reviewed(outcome) -> dict[str, dict[str, Any]]:
+    return {r["finding_id"]: r for r in load(outcome, "research.json")["reviews"]}
+
+
+async def test_a_plan_is_refused_until_every_finding_has_been_reviewed(tmp_path):
+    lead = scripted(
+        delegate(*INVESTIGATOR_NAMES),
+        call("submit_plan", valid_draft(), "unreviewed"),
+        delegate("acoustic_design_research", direction="Still open, so this is allowed."),
+    )
+    harness = Harness(tmp_path, coordinator=lead)
+    outcome = await run_study(make_request(), harness.deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    early = answers(lead, "submit_plan")[0]
+    assert early.startswith("Not accepted")
+    assert "review_findings" in early
+    for finding_id in ALL_FINDINGS:
+        assert finding_id in early
+    assert count(outcome, "plan.revision_requested") == 0
+    # The refusal did not close research: the follow-up assignment went through.
+    assert count(outcome, "research.agent_started") == 4
+    assert set(reviewed(outcome)) == {*ALL_FINDINGS, "design-F2"}
+
+
+async def test_a_finding_can_be_accepted_only_after_its_source_was_opened(tmp_path):
+    lead = scripted(
+        delegate(*INVESTIGATOR_NAMES),
+        review(dict.fromkeys(ALL_FINDINGS, "accept")),
+    )
+    harness = Harness(tmp_path, coordinator=lead)
+    outcome = await run_study(make_request(), harness.deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    unopened = answers(lead, "review_findings")[0]
+    assert unopened.startswith("Not reviewed")
+    for finding_id in ALL_FINDINGS:
+        assert finding_id in unopened
+    assert "/sources/" in unopened
+    assert "open" in unopened
+    assert {r["decision"] for r in reviewed(outcome).values()} == {"accept"}
+    assert all(r["source_opened"] for r in reviewed(outcome).values())
+
+
+async def test_a_review_needs_a_real_finding_and_a_reason(tmp_path):
+    lead = scripted(
+        delegate(*INVESTIGATOR_NAMES),
+        OPEN_ALL,
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "review_findings",
+                    "args": {
+                        "reviews": [
+                            {
+                                "finding_id": "hearing-F9",
+                                "decision": "accept",
+                                "reason": "It looks right to me.",
+                            },
+                            {"finding_id": "hearing-F1", "decision": "accept", "reason": "ok"},
+                            {
+                                "finding_id": "context-F1",
+                                "decision": "reject",
+                                "reason": "The passage is about talkers in general, not this device.",
+                            },
+                        ]
+                    },
+                    "id": "mixed",
+                }
+            ],
+        ),
+    )
+    outcome = await run_study(make_request(), Harness(tmp_path, coordinator=lead).deps)
+
+    mixed = answers(lead, "review_findings")[0]
+    assert mixed.startswith("Reviewed 1 finding")
+    assert "hearing-F9" in mixed
+    assert "does not exist" in mixed
+    assert "hearing-F1" in mixed
+    assert "reason" in mixed
+    # The scripted lead then accepts what is still unreviewed and plans. context-F1 stays rejected.
+    assert outcome.state is StudyState.COMPLETED
+    assert reviewed(outcome)["context-F1"]["decision"] == "reject"
+    assert reviewed(outcome)["hearing-F1"]["decision"] == "accept"
+
+
+async def test_a_hypothesis_cannot_cite_a_rejected_finding(tmp_path):
+    seen: dict[str, str] = {}
+
+    def interpreter(messages, bound):
+        seen["brief"] = str(messages[1].content)
+        return call("ReportNarrative", narrative(), "report-1")
+
+    without_design = valid_draft()
+    without_design["hypotheses"][0]["supporting_finding_ids"] = ["hearing-F1"]
+    lead = scripted(
+        delegate(*INVESTIGATOR_NAMES),
+        OPEN_ALL,
+        review({"hearing-F1": "accept", "context-F1": "accept"}),
+        review(
+            {"design-F1": "reject"}, reason="The source is about loudspeakers, not horns worn at the ear."
+        ),
+        call("submit_plan", valid_draft(), "cites-rejected"),
+        call("submit_plan", without_design, "corrected"),
+    )
+    harness = Harness(tmp_path, coordinator=lead, interpreter=interpreter)
+    outcome = await run_study(make_request(), harness.deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    refused, accepted = answers(lead, "submit_plan")
+    assert refused.startswith("Not accepted")
+    assert "design-F1" in refused
+    assert "rejected" in refused
+    assert accepted.startswith("Plan frozen")
+    assert count(outcome, "plan.revision_requested") == 0
+    assert load(outcome, "plan.json")["hypotheses"][0]["supporting_finding_ids"] == ["hearing-F1"]
+
+    record = reviewed(outcome)["design-F1"]
+    assert record["decision"] == "reject"
+    assert record["reason"] == "The source is about loudspeakers, not horns worn at the ear."
+    events = [e for e in outcome.events.history if e.type == "orchestrator.finding_reviewed"]
+    assert {e.finding_ids[0]: e.data["decision"] for e in events} == {
+        "hearing-F1": "accept",
+        "context-F1": "accept",
+        "design-F1": "reject",
+    }
+    rejected = next(e for e in events if e.finding_ids == ("design-F1",))
+    assert rejected.data["reason"] == record["reason"]
+    assert rejected.data["source"]["source_id"] == record["source_id"]
+    assert rejected.data["source"]["url"]
+
+    # The interpreter explains results from the evidence the plan was allowed to use.
+    told = json.loads(seen["brief"].split("Study results:\n\n")[1])
+    assert {f["finding_id"] for f in told["findings"]} == {"hearing-F1", "context-F1"}
+    assert any(
+        "rejected 1 of 3 research findings" in text and "design-F1" in text
+        for text in outcome.report.limitations
+    )
+    assert len(load(outcome, "research.json")["findings"]) == 3
+
+
+async def test_reviews_cannot_change_once_the_plan_is_frozen(tmp_path):
+    lead = scripted(
+        delegate(*INVESTIGATOR_NAMES),
+        OPEN_ALL,
+        ACCEPT_ALL,
+        call("submit_plan", valid_draft(), "p1"),
+        review({"design-F1": "reject"}, reason="Changing my mind after the plan was frozen."),
+    )
+    outcome = await run_study(make_request(), Harness(tmp_path, coordinator=lead).deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    late = answers(lead, "review_findings")[-1]
+    assert late.startswith("Not reviewed")
+    assert "frozen" in late
+    assert reviewed(outcome)["design-F1"]["decision"] == "accept"
+
+
+# --------------------------------------------------------------------------
+# The evidence scorecard
+# --------------------------------------------------------------------------
+
+
+async def test_each_report_comes_with_counts_of_how_strong_its_evidence_is(tmp_path):
+    lead = scripted(delegate(*INVESTIGATOR_NAMES))
+    outcome = await run_study(make_request(), Harness(tmp_path, coordinator=lead).deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    for text in answers(lead, "task")[:3]:
+        report = json.loads(text)
+        assert report["evidence"] == {
+            "findings": 1,
+            "from_full_text": 0,
+            "from_abstract_or_short_text": 1,
+            "from_scholarly_sources": 1,
+        }
+        (finding,) = report["findings"]
+        assert finding["source_text"] == "abstract_or_short_text"
+        assert finding["source_chars"] == len(PAPER_TEXT)
+
+    long_lead = scripted(delegate(*INVESTIGATOR_NAMES))
+    await run_study(
+        make_request("long_papers"), Harness(tmp_path, coordinator=long_lead, reader=LongReader()).deps
+    )
+    for text in answers(long_lead, "task")[:3]:
+        report = json.loads(text)
+        assert report["evidence"]["from_full_text"] == 1
+        assert report["evidence"]["from_abstract_or_short_text"] == 0
+        assert report["findings"][0]["source_text"] == "full_text"
+
+
+async def test_a_review_returns_the_scorecard_and_says_where_the_evidence_is_missing(tmp_path):
+    without_design = valid_draft()
+    without_design["hypotheses"][0]["supporting_finding_ids"] = ["hearing-F1"]
+    lead = scripted(
+        delegate(*INVESTIGATOR_NAMES),
+        OPEN_ALL,
+        review({"hearing-F1": "accept", "context-F1": "accept"}),
+        review(
+            {"design-F1": "reject"}, reason="The source is about loudspeakers, not horns worn at the ear."
+        ),
+        then=coordinator_responder(without_design),
+    )
+    outcome = await run_study(make_request(), Harness(tmp_path, coordinator=lead).deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    first, second = answers(lead, "review_findings")
+    assert first.startswith("Reviewed 2 findings")
+    assert "design-F1" in first  # still unreviewed
+    card = json.loads(second.split("Evidence scorecard:\n", 1)[1].split("\n\n", 1)[0])
+    by_name = {row["investigator"]: row for row in card["investigators"]}
+    assert by_name["acoustic_design_research"] == {
+        "investigator": "acoustic_design_research",
+        "assignments": 1,
+        "findings": 1,
+        "from_full_text": 0,
+        "from_abstract_or_short_text": 1,
+        "accepted": 0,
+        "rejected": 1,
+        "unreviewed": 0,
+    }
+    assert by_name["hearing_research"]["accepted"] == 1
+    assert card["follow_ups_left"] == 2
+    assert "acoustic_design_research has no accepted finding" in second
+    assert "follow-up" in second
+    assert load(outcome, "results.json")["orchestrator"]["evidence_scorecard"] == card
+
+
+async def test_two_follow_up_assignments_are_allowed_by_default(tmp_path):
+    lead = scripted(
+        delegate(*INVESTIGATOR_NAMES),
+        delegate("acoustic_design_research", direction="More on flare."),
+        delegate("hearing_research", direction="More on the 2 to 4 kHz region."),
+        delegate("use_context_research", direction="One too many."),
+    )
+    outcome = await run_study(make_request(), Harness(tmp_path, coordinator=lead).deps)
+
+    assert outcome.state is StudyState.COMPLETED
+    assert count(outcome, "research.agent_started") == 5
+    assert answers(lead, "task")[-1].startswith("Not assigned")

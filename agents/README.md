@@ -2,7 +2,7 @@
 
 This package is the agent workstream for the passive acoustic hearing device project.
 It takes a profile with existing hearing-test results and optional needs.
-One orchestrator, a LangChain Deep Agent, then runs the study: it assigns three investigators to research the question in parallel, checks their evidence, forms hypotheses, freezes one finite experiment plan, has the team's evaluator run it, has the results explained, and stops.
+One orchestrator, a LangChain Deep Agent, then runs the study: it assigns three investigators to research the question in parallel, reviews every finding against its source, sends an investigator back when its evidence does not hold up, forms hypotheses, freezes one finite experiment plan, has the team's evaluator run it, has the results explained, and stops.
 
 The product starts after hearing testing.
 Users supply their existing results.
@@ -45,6 +45,8 @@ flowchart TD
     H -- "report, findings, source texts" --> O
     U -- "report, findings, source texts" --> O
     A -- "report, findings, source texts" --> O
+    O -- "review_findings" --> W["record accept or reject (code checks the source was opened)"]
+    W -- "scorecard: who has no accepted finding" --> O
     O -- "submit_plan" --> V["validate and freeze (code)"]
     V -- "validation errors, before freezing" --> O
     O -- "run_experiments" --> E["evaluate the frozen cases (code)"]
@@ -69,6 +71,7 @@ It uses the framework's subagents, file system, and permissions:
 | `task` | Assigns research to an investigator, with a direction of its own. The three investigators are its subagents. It assigns all three in one turn so they run at the same time. |
 | File system, read | `/research/<investigator>.json` holds each report with its findings, and `/sources/<source_id>.txt` holds the full text of every source an investigator read. The orchestrator can open a source to check what a quoted passage supports before it builds a hypothesis on it. |
 | File system, write | Only under `/work/`, for its own notes. They are saved in `results.json` and labelled as model notes. |
+| `review_findings` | Records its decision on each finding: accept or reject as support for the plan, with a reason. |
 | `submit_plan` | Hands the plan to code for validation and freezing. |
 | `run_experiments` | Has code run the frozen cases. |
 | `write_report` | Has code compute the comparison and the selection, and the interpreter explain them. |
@@ -76,11 +79,28 @@ It uses the framework's subagents, file system, and permissions:
 Every one of these is a gate that code controls:
 
 - `task` reaches investigators only. The framework's general-purpose helper, shell, and file deletion are not offered and are refused if called.
-- An investigator can be assigned again only as a follow-up, and `budget.max_research_follow_ups` (default 1) caps follow-ups for the whole study.
-- `submit_plan` is refused until every investigator has reported. The first submission closes research.
+- An investigator can be assigned again only as a follow-up, and `budget.max_research_follow_ups` (default 2) caps follow-ups for the whole study.
+- `review_findings` records an acceptance only when the finding exists, a reason was given, and the orchestrator opened that finding's source first. A rejection needs a reason only.
+- `submit_plan` is refused until every investigator has reported and every finding has been reviewed, and a hypothesis may cite accepted findings only. The first plan that passes those checks closes research.
 - `run_experiments` works once, only on a frozen plan, and runs exactly its cases.
 - `write_report` works once, only after the experiments.
 - A tool used out of turn is refused and says what the next step is.
+
+### Reviewing the evidence
+
+Research produces findings, and the orchestrator decides which of them the plan may rest on.
+
+- Each report the orchestrator receives carries counts of how strong its evidence is: the number of findings, and how many rest on a paper's full text against an abstract or a short page.
+  A source counts as full text when it is not an abstract and has at least 5,000 characters.
+- The orchestrator reviews every finding.
+  Its decisions and reasons are saved as `reviews[]` in `research.json`, each with `finding_id`, `decision`, `reason`, `source_id`, and `source_opened`.
+- Every review returns the evidence scorecard: per investigator, the findings, the split by full text, and how many were accepted, rejected, or are still unreviewed, plus the follow-up assignments left.
+  It names any investigator left with no accepted finding, which is the cue to send that investigator back.
+  The latest scorecard is saved as `orchestrator.evidence_scorecard` in `results.json`.
+- Rejected findings stay in `research.json`, but the interpreter is not given them, and the report's limitations say how many were rejected.
+
+The counts and the checks are code.
+Whether a passage supports a claim is the orchestrator's judgment, and it is recorded with its reason so it can be read and questioned.
 
 The investigators, the interpreter, and the earpiece designer are unchanged.
 The orchestrator never holds the evaluator or another role's model: they sit behind the gates.
@@ -91,7 +111,7 @@ Without a frozen plan the study fails with `planning_failed`, and nothing is eva
 
 | Phase | Who | Can do | Cannot do |
 | --- | --- | --- | --- |
-| Whole study | The orchestrator, a Deep Agent | Assign investigators, read reports and source texts, keep notes, submit a plan, ask for the experiments and the report | Skip an investigator, change a frozen plan, run a case that is not in it, run anything twice, write outside `/work/`, change a number |
+| Whole study | The orchestrator, a Deep Agent | Assign investigators, read reports and source texts, accept or reject findings, send an investigator back, keep notes, submit a plan, ask for the experiments and the report | Skip an investigator, accept a finding whose source it did not open, plan on a finding it rejected or did not review, change a frozen plan, run a case that is not in it, run anything twice, write outside `/work/`, change a number |
 | Research | Three investigators, Deep Agents run as the orchestrator's subagents | Search literature, read sources, record findings, read saved source text | Run the evaluator, write files, run shell commands, spawn subagents |
 | Planning | The orchestrator proposes, code validates | Propose hypotheses, candidates, scenarios, and a selection rule | Freeze its own plan, skip the coverage the evaluator requires, or relax the per-scenario rule. Code validates the plan against capabilities and budget. |
 | Evaluation | Bounded runner (code), started by `run_experiments` | Evaluate each frozen spec, retry the identical spec after a transient failure | Change a spec, add a case, turn a failure into a number |
@@ -194,20 +214,21 @@ Each study appends to `events.jsonl`, one JSON object per line, in strict `seque
 }
 ```
 
-Event types: `study.started`, `study.state_changed`, `orchestrator.assigned`, `orchestrator.evidence_opened`, `orchestrator.note_written`, `research.agent_started`, `research.source_read`, `research.finding_added`, `research.agent_completed`, `research.agent_failed`, `hypothesis.created`, `plan.revision_requested`, `plan.frozen`, `experiment.started`, `experiment.retried`, `experiment.completed`, `experiment.failed`, `report.completed`, `study.completed`, `study.failed`, `study.cancelled`.
+Event types: `study.started`, `study.state_changed`, `orchestrator.assigned`, `orchestrator.evidence_opened`, `orchestrator.finding_reviewed`, `orchestrator.note_written`, `research.agent_started`, `research.source_read`, `research.finding_added`, `research.agent_completed`, `research.agent_failed`, `hypothesis.created`, `plan.revision_requested`, `plan.frozen`, `experiment.started`, `experiment.retried`, `experiment.completed`, `experiment.failed`, `report.completed`, `study.completed`, `study.failed`, `study.cancelled`.
 
-What the orchestrator did is in three of them, all with `component` set to `study_orchestrator`:
+What the orchestrator did is in four of them, all with `component` set to `study_orchestrator`:
 
 | Event | When | `data` |
 | --- | --- | --- |
 | `orchestrator.assigned` | It assigned an investigator. Comes just before that investigator's `research.agent_started`. | `investigator`, `follow_up`, `direction` (the orchestrator's own words) |
 | `orchestrator.evidence_opened` | It read or searched a report or a source text. | `tool`, `path`, `pattern`, and `sources[]` with `source_id`, `title`, `url` for each source it touched |
+| `orchestrator.finding_reviewed` | It accepted or rejected a finding. `finding_ids` holds the finding. | `decision`, `reason` (the orchestrator's own words), `source_opened`, and `source` with `source_id`, `title`, `url` |
 | `orchestrator.note_written` | It wrote a note under `/work/`. | `path`, `tool` |
 
 `hypothesis.created` events now carry the component `study_orchestrator`, where earlier versions said `study_coordinator`.
 
 Events carry summaries and IDs, not binary assets.
-The `direction` of an assignment is the one place an event carries a model's own words.
+The `direction` of an assignment and the `reason` of a review are the places an event carries a model's own words.
 
 ### Artifacts
 
@@ -228,6 +249,8 @@ In `results.json`:
 
 - `selected_candidate_id` is a candidate ID, or `null` when no selection is justified. It is never an array index.
 - `orchestrator.notes` maps each note file the orchestrator wrote to its text. They are a model's working notes, not results.
+- `orchestrator.evidence_scorecard` has the evidence counts per investigator and the follow-up assignments left.
+- `research.reviews[]` has the orchestrator's decision and reason for each finding.
 - `orchestrator.phases_completed_by_workflow` lists `run_experiments` or `write_report` when the workflow had to run them because the orchestrator stopped early. It is normally empty.
 - `selected_candidate` is that candidate's record, with its geometry family and parameters.
 - `experiments[]` lists every evaluation case with its `experiment_id`, `candidate_id`, scenario, outcome, metrics, and asset references.
@@ -517,6 +540,7 @@ Each study is one root trace named `study <study_id>`, with these children:
 - `orchestrate_study`, which holds the `study_orchestrator` run. Everything the study did is nested under it:
   - one `task` call per assignment, holding `hearing_research`, `use_context_research`, or `acoustic_design_research` with that agent's model calls and tool calls;
   - `read_file`, `grep`, and `write_file` calls where the orchestrator checked evidence or kept notes;
+  - `review_findings` calls with its decisions;
   - `submit_plan`, with a `check_buildable` run per design when the evaluator offers one;
   - `run_experiments`, with one `evaluate_experiment` run per attempt, tagged with `experiment_id`, `candidate_id`, `spec_hash`, `plan_hash`, `attempt`, and `evaluator_version`;
   - `write_report`, holding the `results_interpreter` run.
@@ -568,7 +592,9 @@ Tests drive the real workflow with a scripted stand-in model and offline sources
 | Three research branches overlap | `test_three_research_branches_overlap_and_return_identifiable_evidence` |
 | The orchestrator holds only its study tools, assigns only investigators, and writes only its own notes | `test_orchestrator.py` |
 | A plan is refused until every investigator has reported, and research closes once a plan is submitted | `test_a_plan_is_refused_until_every_investigator_has_reported`, `test_research_is_closed_once_a_plan_has_been_submitted` |
-| Follow-up assignments are bounded by the budget | `test_one_follow_up_assignment_is_allowed_and_its_direction_reaches_the_investigator`, `test_a_request_can_forbid_follow_up_assignments` |
+| Follow-up assignments are bounded by the budget | `test_two_follow_up_assignments_are_allowed_by_default`, `test_a_request_can_forbid_follow_up_assignments` |
+| A finding is accepted only after its source was opened, and a plan rests only on reviewed, accepted findings | `test_a_finding_can_be_accepted_only_after_its_source_was_opened`, `test_a_plan_is_refused_until_every_finding_has_been_reviewed`, `test_a_hypothesis_cannot_cite_a_rejected_finding` |
+| The evidence counts come from code | `test_each_report_comes_with_counts_of_how_strong_its_evidence_is`, `test_a_review_returns_the_scorecard_and_says_where_the_evidence_is_missing` |
 | Findings need a read source and a verbatim passage | `test_research.py` |
 | Investigators and the interpreter cannot reach the evaluator | `test_investigators_hold_evidence_tools_only`, `test_the_interpreter_cannot_change_the_selection_or_run_anything` |
 | Plans respect capabilities, controls, and budget | `test_planner.py` |

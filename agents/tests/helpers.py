@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -316,11 +318,75 @@ def delegate(*names: str, direction: str = "Research your question for this stud
     )
 
 
+def reported_findings(messages: list[BaseMessage]) -> dict[str, str]:
+    """finding ID -> source ID, for every finding an investigator has reported to the orchestrator."""
+    found: dict[str, str] = {}
+    for name, text in tool_results(messages):
+        if name != "task" or not text.startswith("{"):
+            continue
+        for finding in json.loads(text).get("findings", []):
+            found[finding["finding_id"]] = finding["source_id"]
+    return found
+
+
+def tool_calls_made(messages: list[BaseMessage], name: str) -> list[dict[str, Any]]:
+    return [
+        tool_call["args"]
+        for message in messages
+        if isinstance(message, AIMessage)
+        for tool_call in message.tool_calls
+        if tool_call["name"] == name
+    ]
+
+
+def open_sources(*source_ids: str) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "read_file",
+                "args": {"file_path": f"/sources/{source_id}.txt"},
+                "id": f"open-{source_id}",
+            }
+            for source_id in source_ids
+        ],
+    )
+
+
+def review(decisions: dict[str, str], reason: str = "The passage supports the claim as stated.") -> AIMessage:
+    """One review_findings call. `decisions` maps finding ID to 'accept' or 'reject'."""
+    return call(
+        "review_findings",
+        {
+            "reviews": [
+                {"finding_id": finding_id, "decision": decision, "reason": reason}
+                for finding_id, decision in decisions.items()
+            ]
+        },
+        "review-" + "-".join(decisions),
+    )
+
+
+def recorded_reviews(messages: list[BaseMessage]) -> set[str]:
+    """Finding IDs whose review was recorded, read from what review_findings answered."""
+    recorded: set[str] = set()
+    for name, text in tool_results(messages):
+        if name != "review_findings" or not text.startswith("Reviewed"):
+            continue
+        first_line = text.split("\n", 1)[0]
+        for listed in re.findall(r"(?:accepted|rejected) ([^;.]*)", first_line):
+            recorded |= {
+                item.strip() for item in listed.split(",") if item.strip() and item.strip() != "none"
+            }
+    return recorded
+
+
 def coordinator_responder(*drafts: dict[str, Any]) -> Responder:
     """Script the orchestrator through a whole study.
 
-    It assigns all three investigators in one turn, submits each draft in turn until one is
-    frozen, runs the experiments, asks for the report, and stops.
+    It assigns all three investigators in one turn, opens every source a finding rests on,
+    accepts every finding, submits each draft in turn until one is frozen, runs the experiments,
+    asks for the report, and stops.
     """
 
     def respond(messages: list[BaseMessage], bound: list[str]) -> AIMessage:
@@ -330,7 +396,17 @@ def coordinator_responder(*drafts: dict[str, Any]) -> Responder:
             return delegate(*INVESTIGATOR_NAMES)
         submitted = [text for name, text in results if name == "submit_plan"]
         if not any(text.startswith("Plan frozen") for text in submitted):
-            draft = drafts[min(len(submitted), len(drafts) - 1)]
+            findings = reported_findings(messages)
+            opened = {args.get("file_path", "") for args in tool_calls_made(messages, "read_file")}
+            unopened = sorted({s for s in findings.values() if f"/sources/{s}.txt" not in opened})
+            if unopened:
+                return open_sources(*unopened)
+            reviewed = recorded_reviews(messages)
+            unreviewed = [finding_id for finding_id in findings if finding_id not in reviewed]
+            if unreviewed:
+                return review(dict.fromkeys(unreviewed, "accept"))
+            counted = [text for text in submitted if not text.startswith("Not accepted")]
+            draft = drafts[min(len(counted), len(drafts) - 1)]
             return call("submit_plan", copy.deepcopy(draft), f"plan-{len(submitted)}")
         if "run_experiments" not in done:
             return call("run_experiments", {}, "run-1")

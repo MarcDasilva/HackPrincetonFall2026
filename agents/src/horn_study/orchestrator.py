@@ -5,7 +5,9 @@ they read from its own file system, designs the plan, and asks for each later ph
 tool. It manages the study, but it does not decide what code decides: every tool is a gate.
 
     task             only investigators, only while research is open, follow-ups bounded
-    submit_plan      refused until every investigator has reported, then validated and frozen
+    review_findings  a finding is accepted only after its source was opened, with a reason
+    submit_plan      refused until every investigator has reported and every finding is reviewed,
+                     and a hypothesis may cite accepted findings only; then validated and frozen
     run_experiments  only a frozen plan, exactly once, exactly its cases
     write_report     only after the experiments, exactly once
 
@@ -21,7 +23,7 @@ import json
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from deepagents import CompiledSubAgent, FilesystemPermission, create_deep_agent
 from deepagents.backends.utils import create_file_data
@@ -31,13 +33,16 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.graph.state import CompiledStateGraph
+from pydantic import BaseModel, Field
 
 from horn_study.contracts import (
     BranchResult,
     EvaluatorCapabilities,
     ExperimentRecord,
     ExperimentSpec,
+    FindingReview,
     ResearchRecord,
+    SourceRecord,
     StartingPackage,
     StudyPlan,
     StudyReport,
@@ -69,7 +74,11 @@ ORCHESTRATOR_NAME = "study_orchestrator"
 NOTES_DIR = "/work/"
 _READ_TOOLS = ("ls", "read_file", "glob", "grep")
 _NOTE_TOOLS = ("write_file", "edit_file")
-_STUDY_TOOLS = ("submit_plan", "run_experiments", "write_report")
+_STUDY_TOOLS = ("review_findings", "submit_plan", "run_experiments", "write_report")
+# A source counts as full text when it is not an abstract and is at least this long. Shorter
+# pages are usually a landing page or a summary, and support a claim no better than an abstract.
+FULL_TEXT_MIN_CHARS = 5000
+MIN_REVIEW_REASON_CHARS = 20
 # Turns the orchestrator may take in one study. Reading, planning, and each phase need a few
 # each, so this is generous. The workflow finishes a frozen plan if the limit is reached.
 MAX_ORCHESTRATOR_TURNS = 60
@@ -91,29 +100,36 @@ How you run the study
 so they work at the same time. Give each a direction: what you most need from it for this \
 profile and these needs. Each returns its report and its findings, and each finding quotes a \
 passage from a source the investigator read.
-2. Read the evidence critically. The reports are saved under /research/ and the full text of \
-every source that was read is under /sources/. Check the findings your plan will rest on: \
-for each one a hypothesis is going to cite, open its source with grep or read_file and \
-confirm the passage supports the claim the way you intend to use it. A finding taken from an \
-abstract, or about a different device or population, supports less than its claim suggests. \
-Note thin or conflicting evidence. You may send an investigator back with a sharper \
-direction. Follow-up assignments are limited, so spend one where it matters most: usually on \
-the investigator whose evidence is weakest for the plan (few findings, abstracts only, or \
-sources that miss the question), and name what it should look for. Skip it when the evidence \
-already supports the comparisons you intend.
-3. Keep notes. Write your reasoning and decisions to files under /work/, for example \
+2. Read the evidence critically. Each report comes with counts of how strong its evidence \
+is: how many findings, and how many rest on a paper's full text against an abstract or a short \
+page. The reports are saved under /research/ and the text of every source that was read is \
+under /sources/.
+3. Review every finding with review_findings. Open its source with grep or read_file and \
+decide whether the passage supports the claim the way this study would use it. Accept it or \
+reject it, with a reason that says what the passage does or does not show. Code records an \
+acceptance only after you opened the source. A finding taken from an abstract, or about a \
+different device or population, supports less than its claim suggests: reject what you \
+cannot stand behind. Each review returns the scorecard and names any investigator left with \
+no accepted finding.
+4. Send an investigator back when its evidence does not hold up. That is the expected move, \
+not a last resort: assign it again with a direction that names what was missing and what to \
+look for. The study allows a few follow-up assignments, and the scorecard says how many are \
+left. Review what comes back.
+5. Keep notes. Write your reasoning and decisions to files under /work/, for example \
 /work/decisions.md. They are kept with the study record and marked as your notes.
-4. Design the plan and call submit_plan. Code checks the plan against the evaluator's \
-capabilities and the budget, and may test-build each design. If it comes back with problems, \
-correct exactly those and submit the complete plan again. Submitting a plan closes research: \
-no investigator can be assigned after that.
-5. When the plan is frozen, call run_experiments. Exactly the frozen cases run, once.
-6. Then call write_report. Code computes every comparison and applies the selection rule, \
+6. Design the plan and call submit_plan. A hypothesis may cite accepted findings only. Code \
+checks the plan against the evaluator's capabilities and the budget, and may test-build each \
+design. If it comes back with problems, correct exactly those and submit the complete plan \
+again. The first plan that passes the review check closes research: no investigator can be \
+assigned after that.
+7. When the plan is frozen, call run_experiments. Exactly the frozen cases run, once.
+8. Then call write_report. Code computes every comparison and applies the selection rule, \
 and the interpreter explains the result.
-7. Finish with two or three sentences saying what the study did. Do not restate numbers.
+9. Finish with two or three sentences saying what the study did. Do not restate numbers.
 
 What code decides, not you
 - Whether a plan is executable, which design is selected, and every number in the report.
+- Whether a review is recorded, and that a plan rests only on findings you accepted.
 - The order of the phases. A tool used out of turn is refused and tells you what to do next.
 - After the plan is frozen nothing can be researched or planned again. A new study needs a \
 new request from the user.
@@ -134,6 +150,18 @@ _TASK_DESCRIPTION = (
 )
 
 
+class ReviewItem(BaseModel):
+    finding_id: str
+    decision: Literal["accept", "reject"]
+    reason: str = Field(
+        description="What the quoted passage does or does not support for this study, in a sentence or two."
+    )
+
+
+class ReviewInput(BaseModel):
+    reviews: list[ReviewItem]
+
+
 class StudyFailed(Exception):
     def __init__(self, kind: str, message: str, details: list[str] | None = None) -> None:
         self.kind = kind
@@ -150,6 +178,7 @@ class Progress:
     records: list[ExperimentRecord] = field(default_factory=list)
     report: StudyReport | None = None
     notes: dict[str, str] = field(default_factory=dict)
+    scorecard: dict[str, Any] = field(default_factory=dict)
     phases_completed_by_workflow: list[str] = field(default_factory=list)
 
 
@@ -198,6 +227,8 @@ class StudyControl:
         # Assignments the gate accepted that have not started yet: tool call ID -> (investigator,
         # is a follow-up). One that never starts, because the framework rejected the call, is released.
         self._reserved: dict[str, tuple[str, bool]] = {}
+        self._opened: set[str] = set()
+        self._reviews: dict[str, FindingReview] = {}
         self._follow_ups_used = 0
         self._plan_revision = 0
         self._phase = asyncio.Lock()
@@ -272,15 +303,33 @@ class StudyControl:
             else None,
         )
         self._branches.append(branch)
-        findings = [f.model_dump(mode="json") for f in self._ledger.findings_by(spec.name)]
+        mine = self._ledger.findings_by(spec.name)
+        findings = []
+        for finding in mine:
+            source = self._source(finding.source_id)
+            findings.append(
+                {
+                    **finding.model_dump(mode="json"),
+                    "source_text": "full_text" if _is_full_text(source) else "abstract_or_short_text",
+                    "source_chars": source.char_count if source else 0,
+                }
+            )
+        full_text = sum(1 for item in findings if item["source_text"] == "full_text")
         report = {
             "investigator": spec.name,
             "assignment": "follow-up" if is_follow_up else "first",
             "status": branch.status,
             "error": branch.error,
             "research_calls_used": branch.research_tool_calls,
+            "evidence": {
+                "findings": len(findings),
+                "from_full_text": full_text,
+                "from_abstract_or_short_text": len(findings) - full_text,
+                "from_scholarly_sources": sum(1 for finding in mine if finding.source_tier == "scholarly"),
+            },
             "report": branch.output.model_dump(mode="json") if branch.output else None,
             "findings": findings,
+            "next": "Open the sources and review every finding with review_findings before you plan.",
             "saved_at": f"/research/{spec.name}.json",
             "sources": "/sources/<source_id>.txt holds the full text of each source that was read.",
         }
@@ -292,7 +341,12 @@ class StudyControl:
                 for record, body in self._source_texts()
             }
         )
+        self.progress.scorecard = self._scorecard()
         return text, files
+
+    def _source(self, source_id: str) -> SourceRecord | None:
+        known = self._ledger.lookup(source_id)
+        return known[0] if known is not None else None
 
     def _source_texts(self) -> list[tuple[Any, str]]:
         found = []
@@ -310,6 +364,7 @@ class StudyControl:
             branches=branches,
             findings=self._ledger.findings,
             sources=self._ledger.sources,
+            reviews=self._ordered_reviews(),
         )
         self.progress.research = research
         self._store.write_json("research.json", research)
@@ -326,6 +381,163 @@ class StudyControl:
             )
         self._transition(StudyState.PLANNING)
 
+    # -- review ------------------------------------------------------------
+
+    async def review(self, items: list[ReviewItem]) -> str:
+        """Record the orchestrator's decisions on findings, where code's checks allow it."""
+        async with self._phase:
+            if self._state() not in (StudyState.RESEARCHING, StudyState.PLANNING):
+                return (
+                    "Not reviewed: the plan is frozen, and its evidence cannot be re-judged. "
+                    + self._next_step()
+                )
+            findings = {finding.finding_id: finding for finding in self._ledger.findings}
+            recorded: list[FindingReview] = []
+            problems: list[str] = []
+            for item in items:
+                finding = findings.get(item.finding_id)
+                if finding is None:
+                    problems.append(f"{item.finding_id} does not exist. Review recorded findings only.")
+                    continue
+                reason = " ".join(item.reason.split())
+                if len(reason) < MIN_REVIEW_REASON_CHARS:
+                    problems.append(
+                        f"{item.finding_id}: give a reason that says what the passage does or does not support."
+                    )
+                    continue
+                opened = finding.source_id in self._opened
+                if item.decision == "accept" and not opened:
+                    problems.append(
+                        f"{item.finding_id}: open /sources/{finding.source_id}.txt with read_file or grep "
+                        "first. A finding can be accepted only after its source was opened."
+                    )
+                    continue
+                review = FindingReview(
+                    finding_id=finding.finding_id,
+                    decision=item.decision,
+                    reason=reason,
+                    source_id=finding.source_id,
+                    source_opened=opened,
+                )
+                self._reviews[finding.finding_id] = review
+                recorded.append(review)
+                self._events.emit(
+                    "orchestrator.finding_reviewed",
+                    f"{'Accepted' if review.decision == 'accept' else 'Rejected'} {review.finding_id}: "
+                    + _whole_sentences(reason, 220),
+                    component=ORCHESTRATOR_NAME,
+                    finding_ids=[review.finding_id],
+                    data={
+                        "decision": review.decision,
+                        "reason": reason,
+                        "source_opened": opened,
+                        "source": {
+                            "source_id": finding.source_id,
+                            "title": finding.source_title,
+                            "url": finding.source_url,
+                        },
+                    },
+                )
+            if recorded and self.progress.research is not None:
+                self.progress.research = self.progress.research.model_copy(
+                    update={"reviews": self._ordered_reviews()}
+                )
+                self._store.write_json("research.json", self.progress.research)
+            card = self._scorecard()
+            self.progress.scorecard = card
+            return self._review_answer(recorded, problems, card)
+
+    def _review_answer(self, recorded: list[FindingReview], problems: list[str], card: dict[str, Any]) -> str:
+        lines: list[str] = []
+        if recorded:
+            accepted = [r.finding_id for r in recorded if r.decision == "accept"]
+            rejected = [r.finding_id for r in recorded if r.decision == "reject"]
+            lines.append(
+                f"Reviewed {len(recorded)} finding{'' if len(recorded) == 1 else 's'}: "
+                f"accepted {', '.join(accepted) or 'none'}; rejected {', '.join(rejected) or 'none'}."
+            )
+        else:
+            lines.append("Not reviewed: nothing was recorded.")
+        if problems:
+            lines.append("Not recorded:\n" + "\n".join(f"- {problem}" for problem in problems))
+        unreviewed = [f.finding_id for f in self._ledger.findings if f.finding_id not in self._reviews]
+        if unreviewed:
+            lines.append(f"Still unreviewed: {', '.join(unreviewed)}.")
+        lines.append("Evidence scorecard:\n" + json.dumps(card, indent=1))
+        left = card["follow_ups_left"]
+        gaps = [
+            row["investigator"]
+            for row in card["investigators"]
+            if row["assignments"] and not row["unreviewed"] and not row["accepted"]
+        ]
+        if gaps:
+            names = ", ".join(gaps)
+            advice = (
+                f"A follow-up assignment can send it back with a sharper direction ({left} left). "
+                "Its new findings will need review."
+                if left
+                else "No follow-up assignments are left, so plan from the accepted findings and note the gap."
+            )
+            lines.append(f"{names} {'has' if len(gaps) == 1 else 'have'} no accepted finding. {advice}")
+        elif not unreviewed:
+            lines.append("Every finding is reviewed. Plan from the accepted ones.")
+        return "\n\n".join(lines)
+
+    def _ordered_reviews(self) -> tuple[FindingReview, ...]:
+        return tuple(
+            self._reviews[f.finding_id] for f in self._ledger.findings if f.finding_id in self._reviews
+        )
+
+    def _scorecard(self) -> dict[str, Any]:
+        """Counts of how much evidence each investigator has, and how much of it was accepted."""
+        rows = []
+        for spec in INVESTIGATORS:
+            mine = self._ledger.findings_by(spec.name)
+            full_text = sum(1 for finding in mine if _is_full_text(self._source(finding.source_id)))
+            decisions = [self._reviews[f.finding_id].decision for f in mine if f.finding_id in self._reviews]
+            rows.append(
+                {
+                    "investigator": spec.name,
+                    "assignments": sum(1 for branch in self._branches if branch.investigator == spec.name),
+                    "findings": len(mine),
+                    "from_full_text": full_text,
+                    "from_abstract_or_short_text": len(mine) - full_text,
+                    "accepted": decisions.count("accept"),
+                    "rejected": decisions.count("reject"),
+                    "unreviewed": len(mine) - len(decisions),
+                }
+            )
+        left = max(0, self.package.budget.max_research_follow_ups - self._follow_ups_used)
+        return {"investigators": rows, "follow_ups_left": left}
+
+    def _review_refusal(self, draft: PlanDraft) -> str | None:
+        """A plan may rest only on findings the orchestrator reviewed and accepted."""
+        findings = [finding.finding_id for finding in self._ledger.findings]
+        unreviewed = [finding_id for finding_id in findings if finding_id not in self._reviews]
+        if unreviewed:
+            return (
+                "Not accepted: every finding must be reviewed with review_findings before a plan is "
+                f"submitted. Unreviewed: {', '.join(unreviewed)}. Open each source, then accept or reject "
+                "the finding with a reason."
+            )
+        problems = []
+        for hypothesis in draft.hypotheses:
+            rejected = [
+                finding_id
+                for finding_id in hypothesis.supporting_finding_ids
+                if finding_id in self._reviews and self._reviews[finding_id].decision == "reject"
+            ]
+            if rejected:
+                problems.append(
+                    f"hypothesis '{hypothesis.hypothesis_id}' cites {', '.join(rejected)}, which you rejected"
+                )
+        if problems:
+            return (
+                "Not accepted: " + "; ".join(problems) + ". A hypothesis may cite accepted findings only. "
+                "Cite others, or review the finding again if you now accept it."
+            )
+        return None
+
     # -- plan --------------------------------------------------------------
 
     async def submit_plan(self, draft: PlanDraft) -> str:
@@ -340,6 +552,11 @@ class StudyControl:
                         "reported yet. Every investigator must report before a plan can be submitted. "
                         "Assign them with the task tool, then submit the plan."
                     )
+            if self._state() in (StudyState.RESEARCHING, StudyState.PLANNING):
+                refusal = self._review_refusal(draft)
+                if refusal:
+                    return refusal
+            if self._state() is StudyState.RESEARCHING:
                 self._synthesize()
             if self._state() is not StudyState.PLANNING:
                 return "Not accepted: the plan is frozen and cannot be changed. " + self._next_step()
@@ -447,6 +664,10 @@ class StudyControl:
             plan, research, records = self.progress.plan, self.progress.research, self.progress.records
             assert plan is not None
             assert research is not None
+            rejected = [r.finding_id for r in research.reviews if r.decision == "reject"]
+            accepted_evidence = research.model_copy(
+                update={"findings": tuple(f for f in research.findings if f.finding_id not in rejected)}
+            )
             summaries, selection = summarize_candidates(plan, records, self.capabilities)
             data = hypothesis_data(plan, records)
             needs = need_outcomes(plan, records, self.capabilities, selection)
@@ -455,7 +676,7 @@ class StudyControl:
                 narrative = await write_narrative(
                     self._interpreter_model,
                     interpretation_brief(
-                        self.package, plan, research, summaries, selection, data, needs, records
+                        self.package, plan, accepted_evidence, summaries, selection, data, needs, records
                     ),
                     study_id=self.package.study_id,
                     plan_hash=plan.plan_hash,
@@ -475,6 +696,12 @@ class StudyControl:
                 narrative,
                 narrative_error,
             )
+            if rejected:
+                note = (
+                    f"The orchestrator rejected {len(rejected)} of {len(research.findings)} research findings "
+                    f"as support for the plan: {', '.join(rejected)}. Its reasons are in research.json."
+                )
+                report = report.model_copy(update={"limitations": (*report.limitations, note)})
             self.progress.report = report
             self._events.emit(
                 "report.completed",
@@ -553,9 +780,9 @@ class StudyControl:
             ids = list(dict.fromkeys(_SOURCE_FILE.findall(path) or _SOURCE_FILE.findall(text)))
             sources = []
             for source_id in ids:
-                known = self._ledger.lookup(source_id)
-                if known is not None:
-                    record = known[0]
+                record = self._source(source_id)
+                if record is not None:
+                    self._opened.add(record.source_id)
                     sources.append({"source_id": record.source_id, "title": record.title, "url": record.url})
             what = ", ".join(s["source_id"] for s in sources) or path
             self._events.emit(
@@ -578,7 +805,7 @@ class StudyControl:
     def _next_step(self) -> str:
         state = self._state()
         if state is StudyState.RESEARCHING:
-            return "No plan is frozen yet. Assign the investigators, then call submit_plan."
+            return "No plan is frozen yet. Assign the investigators, review their findings, then call submit_plan."
         if state is StudyState.PLANNING:
             return "No plan is frozen yet. Call submit_plan with a corrected, complete plan."
         if state is StudyState.PLAN_FROZEN:
@@ -589,6 +816,14 @@ class StudyControl:
 
 
 _SOURCE_FILE = re.compile(r"/sources/(S\d+)\.txt")
+
+
+def _is_full_text(source: SourceRecord | None) -> bool:
+    return (
+        source is not None
+        and source.content_type != "abstract_only"
+        and source.char_count >= FULL_TEXT_MIN_CHARS
+    )
 
 
 def _direction(direction: str, is_follow_up: bool, earlier: list[BranchResult]) -> str:
@@ -704,6 +939,12 @@ def _study_tools(control: StudyControl) -> list[BaseTool]:
     async def submit_plan(**fields: Any) -> str:
         return await control.submit_plan(PlanDraft(**fields))
 
+    async def review_findings(reviews: list[Any]) -> str:
+        items = [
+            item if isinstance(item, ReviewItem) else ReviewItem.model_validate(item) for item in reviews
+        ]
+        return await control.review(items)
+
     async def run_experiments() -> str:
         return await control.run_experiments()
 
@@ -712,13 +953,25 @@ def _study_tools(control: StudyControl) -> list[BaseTool]:
 
     return [
         StructuredTool.from_function(
+            coroutine=review_findings,
+            name="review_findings",
+            description=(
+                "Record your decision on findings: accept or reject each one as support for the plan, with "
+                "a reason. Code records an acceptance only if you opened the finding's source first. Returns "
+                "the evidence scorecard. Every finding must be reviewed before a plan is submitted, and a "
+                "later review of the same finding replaces the earlier one until the plan is frozen."
+            ),
+            args_schema=ReviewInput,
+        ),
+        StructuredTool.from_function(
             coroutine=submit_plan,
             name="submit_plan",
             description=(
                 "Submit the complete study plan. Code validates it against the evaluator's capabilities "
                 "and the budget. A valid plan is frozen and cannot be changed. An invalid one comes back "
                 "with every problem listed, to correct and submit again in full. Every investigator must "
-                "have reported first, and submitting closes research."
+                "have reported and every finding must be reviewed first, and a hypothesis may cite accepted "
+                "findings only. The first plan that passes those checks closes research."
             ),
             args_schema=PlanDraft,
         ),
