@@ -373,6 +373,18 @@ No key is required.
 OpenAlex without a key shares a small daily allowance per network, so set `OPENALEX_API_KEY` at an event.
 Investigators are told to keep user data out of queries.
 
+Every source is classified, and the tier is saved on each source and finding in `research.json`:
+
+| Tier | Examples | How it is treated |
+| --- | --- | --- |
+| `scholarly` | Anything a literature index returned, DOI links, PubMed Central, publisher and preprint sites | Accepted as evidence |
+| `technical_documentation` | GitHub, PyPI, Read the Docs | At most one finding per investigator. It can establish what the software does, not acoustics or hearing. |
+| `other` | General web pages | Counts toward the same one-finding limit |
+| `tertiary` | Wikipedia and other encyclopedias, forums, blogs | Refused before a call is spent |
+
+The report's `findings_by_source_tier` gives the counts.
+Its limitations say so when findings rest on non-scholarly sources or on abstracts alone.
+
 ## Development
 
 ```bash

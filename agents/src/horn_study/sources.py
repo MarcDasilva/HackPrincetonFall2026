@@ -21,6 +21,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from horn_study.contracts import SourceTier
+
 USER_AGENT = "horn-study-research/0.1 (literature research agent)"
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MIN_USEFUL_CHARS = 400
@@ -52,6 +54,92 @@ class FetchedSource:
 
 class SourceUnavailable(Exception):
     pass
+
+
+# --------------------------------------------------------------------------
+# Source tiers
+# --------------------------------------------------------------------------
+
+# Encyclopedias and user-generated pages. They summarize other work and anyone can edit them,
+# so they are leads to a primary source and are never accepted as evidence.
+_TERTIARY_HOSTS = (
+    "wikipedia.org",
+    "wikiversity.org",
+    "wikibooks.org",
+    "britannica.com",
+    "fandom.com",
+    "quora.com",
+    "reddit.com",
+    "medium.com",
+    "stackexchange.com",
+    "stackoverflow.com",
+)
+# Code repositories and package documentation: authoritative about the software they describe,
+# not about acoustics or hearing.
+_DOCUMENTATION_HOSTS = (
+    "github.com",
+    "githubusercontent.com",
+    "gitlab.com",
+    "pypi.org",
+    "readthedocs.io",
+    "readthedocs.org",
+)
+# Publishers, indexes, and preprint servers for scholarly work.
+_SCHOLARLY_HOSTS = (
+    "doi.org",
+    "ncbi.nlm.nih.gov",
+    "europepmc.org",
+    "arxiv.org",
+    "biorxiv.org",
+    "medrxiv.org",
+    "nature.com",
+    "sciencedirect.com",
+    "springer.com",
+    "wiley.com",
+    "aip.org",
+    "scitation.org",
+    "frontiersin.org",
+    "mdpi.com",
+    "plos.org",
+    "jneurosci.org",
+    "ieee.org",
+    "acm.org",
+    "tandfonline.com",
+    "sagepub.com",
+    "oup.com",
+    "cambridge.org",
+    "aes.org",
+    "asha.org",
+    "lww.com",
+    "karger.com",
+    "thieme-connect.com",
+    "hindawi.com",
+    "openalex.org",
+    "semanticscholar.org",
+    "hal.science",
+    "zenodo.org",
+    "osf.io",
+)
+
+
+def _host_matches(host: str, suffixes: tuple[str, ...]) -> bool:
+    return any(host == suffix or host.endswith("." + suffix) for suffix in suffixes)
+
+
+def classify_source(url: str, *, from_literature_search: bool = False) -> SourceTier:
+    """Say what kind of source a URL is.
+
+    A page that a literature index returned is scholarly by construction. Otherwise the host
+    decides, and an unknown host is "other" rather than being given the benefit of the doubt.
+    """
+    host = (urlparse(url).hostname or "").lower()
+    if _host_matches(host, _TERTIARY_HOSTS):
+        return "tertiary"
+    if from_literature_search or _host_matches(host, _SCHOLARLY_HOSTS):
+        return "scholarly"
+    if _host_matches(host, _DOCUMENTATION_HOSTS):
+        return "technical_documentation"
+    return "other"
 
 
 class SearchBackend(Protocol):

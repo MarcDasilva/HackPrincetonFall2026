@@ -404,6 +404,7 @@ class InputIssue(Contract):
 # --------------------------------------------------------------------------
 
 InvestigatorName = Literal["hearing_research", "use_context_research", "acoustic_design_research"]
+SourceTier = Literal["scholarly", "technical_documentation", "tertiary", "other"]
 
 
 class SourceRecord(Contract):
@@ -416,6 +417,10 @@ class SourceRecord(Contract):
     content_sha256: str
     char_count: int
     first_read_by: InvestigatorName
+    tier: SourceTier = Field(
+        default="other",
+        description="scholarly, technical_documentation, tertiary, or other. See sources.classify_source.",
+    )
 
 
 class ResearchFinding(Contract):
@@ -425,6 +430,7 @@ class ResearchFinding(Contract):
     source_id: str
     source_url: str
     source_title: str
+    source_tier: SourceTier = "other"
     claim: str
     evidence_passage: str = Field(description="Verbatim excerpt, verified against the read text.")
     applicability: str
@@ -835,6 +841,10 @@ class StudyReport(Contract):
     inconclusive_findings: tuple[str, ...]
     follow_up_proposals: tuple[FollowUpProposal, ...]
     narrative_source: Literal["model", "unavailable"]
+    findings_by_source_tier: dict[str, int] = Field(
+        default_factory=dict,
+        description="How many accepted findings rest on each kind of source, for example scholarly.",
+    )
 
 
 # --------------------------------------------------------------------------
