@@ -1,8 +1,8 @@
 """The hornsim evaluator: the real pipeline behind the contract, with the bridge process stubbed.
 
-These tests need no backend environment. `FakeBridge` answers the four bridge
-commands the way `bridges/hornsim_bridge.py` does. The one test that runs the
-real pipeline is skipped unless the backend variables are set.
+These tests need no backend environment. `FakeBridge` answers the five bridge
+commands the way `bridges/hornsim_bridge.py` does. The two tests that run the
+real pipeline are skipped unless the backend variables are set.
 """
 
 from __future__ import annotations
@@ -41,7 +41,10 @@ from horn_study.hornsim_evaluator import (
     BACKEND_DIR_ENV,
     BASELINE_ID,
     CALIBRATION_REF,
+    COLLECTOR_MOUTH,
+    COLLECTOR_REACH,
     EAR_MESH_ENV,
+    EARPIECE_FAMILY_ID,
     FAMILY_ID,
     FIDELITY,
     WORK_DIR_ENV,
@@ -66,6 +69,37 @@ DEFAULT_DESIGN = {
 }
 # A design the first version could not build: a wide throat, a large mouth, and no vent.
 WIDE_DESIGN = {**DEFAULT_DESIGN, "throat_mm2": 20.0, "mouth_mm2": 150.0, "vent_diameter_mm": 0.0}
+# The in-concha earpiece at the builder's defaults, with no collector.
+EARPIECE_DEFAULT = {
+    "throat_mm2": 27.0,
+    "mouth_mm2": 150.0,
+    "canal_stem_mm": 5.0,
+    COLLECTOR_REACH: 0.0,
+    COLLECTOR_MOUTH: 0.0,
+}
+# What the acoustic sweep pointed at: a wide throat, no stem, and a collector beyond the faceplate.
+EARPIECE_COLLECTOR = {
+    "throat_mm2": 60.0,
+    "mouth_mm2": 300.0,
+    "canal_stem_mm": 0.0,
+    COLLECTOR_REACH: 10.0,
+    COLLECTOR_MOUTH: 450.0,
+}
+# hornsim.earpiece's own words for a mouth the faceplate cannot hold and a throat too wide for the stem.
+MOUTH_FIT = {
+    "check": "mouth_fit",
+    "message": "the mouth is larger than this concha's opening allows",
+    "max_ok_mm2": 304.8,
+    "alternatives": ["rim_conformity +"],
+    "move": {"dial": "mouth_mm2", "direction": "-"},
+}
+STEM_THROAT = {
+    "check": "stem_throat",
+    "message": "the throat does not fit inside the canal stem",
+    "max_ok_mm2": 27.3,
+    "alternatives": ["canal_stem_mm 0 (no stem: the piece then relies on its fit alone)"],
+    "move": {"dial": "throat_mm2", "direction": "-"},
+}
 BRIDGE = Path(__file__).resolve().parents[1] / "bridges" / "hornsim_bridge.py"
 
 # What `hornsim_bridge.py describe` printed for the backend this adapter was written against.
@@ -113,6 +147,51 @@ DESCRIBED: dict[str, Any] = {
         "sha256": "f" * 64,
         "provenance": {"source": "AudioEar average ear. A template, not a person's ear."},
     },
+    # hornsim.earpiece.PARAMS (a few of its shaping dials are left out here), and what
+    # hornsim.target.earpiece_boxes found on the template ear.
+    "earpiece": {
+        "available": True,
+        "family": "concha_horn_earpiece",
+        "params": {
+            "throat_mm2": {
+                "minimum": 7.0,
+                "maximum": 60.0,
+                "default": 27.0,
+                "meaning": "bore area at the canal",
+            },
+            "mouth_mm2": {"minimum": 20.0, "maximum": 1500.0, "default": 150.0, "meaning": "mouth area"},
+            "hood_mm": {"minimum": 0.0, "maximum": 5.0, "default": 0.0, "meaning": "hood height"},
+            "flare_mid1": {"minimum": 0.0, "maximum": 1.0, "default": 0.15, "meaning": "flare"},
+            "flare_mid2": {"minimum": 0.0, "maximum": 1.0, "default": 0.45, "meaning": "flare"},
+            "wall_mm": {"minimum": 0.8, "maximum": 3.0, "default": 1.2, "meaning": "minimum shell wall"},
+            "canal_stem_mm": {"minimum": 0.0, "maximum": 8.0, "default": 5.0, "meaning": "soft stem"},
+            "tab_mm": {"minimum": 0.0, "maximum": 6.0, "default": 4.0, "meaning": "removal tab length"},
+        },
+        "collector": {"max_reach_mm": 35.0, "section_radius_mm": [1.0, 30.0], "clearance_mm": 1.0},
+        "stem_wall_mm": 0.8,
+        "boxes": [
+            {
+                "throat_mm2": [7.0, 27.339710067865177],
+                "mouth_mm2": [20.0, 304.76],
+                "length_mm": [12.4, 12.4],
+                "canal_stem_mm": [0.0, 8.0],
+            },
+            {
+                "throat_mm2": [7.0, 60.0],
+                "mouth_mm2": [20.0, 304.76],
+                "length_mm": [8.9, 8.9],
+                "canal_stem_mm": [0.0, 0.0],
+            },
+        ],
+        "ear": {
+            "opening_area_mm2": 419.0,
+            "concha_depth_mm": 12.0,
+            "bowl_volume_cc": 3.37,
+            "canal_diameter_mm": 7.5,
+        },
+        "whole_canal_is_sample_plus_mm": 9.0,
+        "probe_seconds": 5.4,
+    },
 }
 
 
@@ -126,6 +205,12 @@ class FakeBridge:
         self.crashes: set[float] = set()  # mouth areas whose build raises inside a library
         self.vent_wall_to_bore_mm = 0.74
         self.version = VERSION
+        # Faceplate mouth areas hornsim.earpiece rejects, with the reasons it gives.
+        self.earpiece_rejections: dict[float, list[dict[str, Any]]] = {}
+        # What `describe` says about the earpiece. None stands for a bridge that says nothing.
+        self.earpiece: dict[str, Any] | None = copy.deepcopy(DESCRIBED["earpiece"])
+        # HASPI gained over unaided, by built folder. A collector scores best, the coiled aid next.
+        self.gain_over_unaided: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def count(self, command: str) -> int:
@@ -140,7 +225,10 @@ class FakeBridge:
         return getattr(self, f"_{command}")(payload)
 
     def _describe(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return {**copy.deepcopy(DESCRIBED), "version": self.version}
+        described = {**copy.deepcopy(DESCRIBED), "version": self.version, "earpiece": self.earpiece}
+        if self.earpiece is None:
+            del described["earpiece"]
+        return described
 
     def _context(self, payload: dict[str, Any]) -> dict[str, Any]:
         key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
@@ -198,6 +286,7 @@ class FakeBridge:
                 "peak_ig_db": 7.3,
                 "peak_ig_hz": 285,
             },
+            "protrusion_mm": 2.3,
             "assets": {
                 "design_json": f"{folder}/aid/design.json",
                 "aid_glb": f"{folder}/aid/aid.glb",
@@ -206,11 +295,83 @@ class FakeBridge:
             },
         }
 
+    def _build_earpiece(self, payload: dict[str, Any]) -> dict[str, Any]:
+        time.sleep(self.build_delay)
+        parameters = payload["parameters"]
+        mouth = parameters["mouth_mm2"]
+        key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+        folder = f"{payload['work_dir']}/candidates/{key}"
+        answer: dict[str, Any] = {
+            "ok": True,
+            "version": self.version,
+            "candidate_key": key,
+            "candidate_dir": folder,
+            "family": "concha_horn_earpiece",
+            "reused": False,
+            "seconds": 3.0,
+            "build_seconds": 3.0,
+        }
+        if mouth in self.crashes:
+            return {"ok": False, "error": {"code": "bridge_crashed", "message": "ValueError: boom"}}
+        if mouth in self.earpiece_rejections:
+            return {**answer, "fits": False, "reasons": copy.deepcopy(self.earpiece_rejections[mouth])}
+        collector = parameters.get("collector")
+        reach = collector["spine"][-1][0] if collector else 0.0
+        opening = math.pi * collector["sections"][-1][0] ** 2 if collector else mouth
+        with self._lock:
+            self.gain_over_unaided[folder] = 0.25 if collector else 0.0625
+        out = f"{folder}/aid/earpiece"
+        return {
+            **answer,
+            "fits": True,
+            # hornsim.earpiece's report, without the mouth outline.
+            "design": {
+                "design_id": "earpiece",
+                "family": "concha_horn_earpiece",
+                "params": {"flare_mid1": 0.15, "flare_mid2": 0.45, "tab_mm": 4.0, **parameters},
+                "ok": True,
+                "warnings": [],
+                "checks": {"bore_wall_mm": 1.41, "watertight": True},
+                "seat_floor_mm": 5.5,
+                "geometry": {
+                    "mouth_mm2": mouth,
+                    "mouth_mm2_max": 320.8,
+                    "throat_mm2": parameters["throat_mm2"],
+                    "bore_length_mm": 8.9,
+                    "canal_stem_mm": parameters["canal_stem_mm"],
+                    "proud_of_concha_mm": 5.9 + reach,
+                    "collector": bool(collector),
+                    "collector_mouth_mm2": round(opening, 1),
+                },
+                "area_profile_mm2": [[0.0, parameters["throat_mm2"]], [8.9, mouth]],
+            },
+            "acoustics_summary": {
+                "mean_ig_500_1k_db": 0.2,
+                "mean_ig_1k_2k_db": 0.8,
+                "mean_ig_2k_4k_db": 0.4,
+                "mean_ig_4k_8k_db": -0.3,
+                "peak_ig_db": 3.4,
+                "peak_ig_hz": 8000,
+            },
+            "acoustic_door": "profile",
+            "bore_length_mm": 8.9,
+            "protrusion_mm": 5.9 + reach,
+            "assets": {
+                "design_json": f"{out}/design.json",
+                "earpiece_glb": f"{out}/earpiece.glb",
+                "earpiece_in_ear_glb": f"{out}/earpiece_in_ear.glb",
+                "earpiece_print_stl": f"{out}/earpiece_print.stl",
+                "earpiece_preview_png": f"{out}/preview.png",
+                "acoustics_json": f"{out}/acoustics.json",
+            },
+        }
+
     def _score(self, payload: dict[str, Any]) -> dict[str, Any]:
         # The bridge scores every clip of the type and reports their mean.
         clips = [clip["name"] for clip in DESCRIBED["clips"] if clip["type"] == payload["clip_type"]]
         unaided = 0.5 if payload["clip_type"] == "clean" else 0.25
-        aided = unaided if payload["candidate_dir"] is None else unaided + 0.125
+        gain = self.gain_over_unaided.get(payload["candidate_dir"], 0.125)
+        aided = unaided if payload["candidate_dir"] is None else unaided + gain
         return {
             "ok": True,
             "version": self.version,
@@ -259,13 +420,14 @@ def make_spec(
     parameters: dict[str, float] | None = None,
     baseline: bool = False,
     thresholds: dict[int, float] | None = None,
+    family: str = FAMILY_ID,
 ) -> ExperimentSpec:
     return ExperimentSpec(
         study_id="study_test_001",
         experiment_id=f"{candidate_id}--{scenario_id}",
         candidate_id=candidate_id,
         candidate_kind="baseline" if baseline else "design",
-        family_id=None if baseline else FAMILY_ID,
+        family_id=None if baseline else family,
         baseline_id=BASELINE_ID if baseline else None,
         parameters={} if baseline else dict(parameters or DEFAULT_DESIGN),
         hearing_input=hearing(thresholds),
@@ -273,6 +435,17 @@ def make_spec(
         canal_config_id="sampled_canals",
         fidelity=FIDELITY,
         calibration_ref=CALIBRATION_REF,
+    )
+
+
+def earpiece_spec(
+    candidate_id: str = "earpiece_default",
+    scenario_id: str = "clean_speech_65_db_spl",
+    *,
+    parameters: dict[str, float] | None = None,
+) -> ExperimentSpec:
+    return make_spec(
+        candidate_id, scenario_id, parameters=parameters or EARPIECE_DEFAULT, family=EARPIECE_FAMILY_ID
     )
 
 
@@ -292,9 +465,12 @@ def test_capabilities_validate_against_the_contract_and_come_from_the_backend(tm
 
     assert capabilities.kind == "real"
     assert capabilities.evaluator_version == VERSION
-    assert bridge.payloads("describe") == [{"ear_mesh": str(tmp_path / "ear.ply")}]
+    # The work directory and ear height let the bridge probe what this ear holds.
+    assert bridge.payloads("describe") == [
+        {"ear_mesh": str(tmp_path / "ear.ply"), "work_dir": str(tmp_path / "work"), "ear_height_mm": None}
+    ]
 
-    (family,) = capabilities.geometry_families
+    family, _ = capabilities.geometry_families
     assert family.family_id == FAMILY_ID
     assert {p.name: (p.minimum, p.maximum, p.unit) for p in family.parameters} == {
         "throat_mm2": (0.3, 31, "mm^2"),
@@ -331,6 +507,8 @@ def test_capabilities_validate_against_the_contract_and_come_from_the_backend(tm
     assert len(names) == len(set(names))
     assert names[:3] == ["haspi_v2_mean", "haspi_v2_worst_canal", "haspi_v2_improvement_over_unaided"]
     assert all(m.unit and m.direction for m in capabilities.metrics)
+    informational = [m.name for m in capabilities.metrics if m.direction == "informational"]
+    assert informational == ["bore_length_mm", "protrusion_mm"]
 
     assert not capabilities.supports_seeds
     assert capabilities.calibration.calibration_ref == CALIBRATION_REF
@@ -392,6 +570,7 @@ def test_design_and_control_results_pass_the_runner_checks(tmp_path):
     assert values["haspi_v2_improvement_over_unaided"] == 0.125
     assert values["insertion_gain_2000_4000_hz_db"] == -25.2
     assert values["bore_length_mm"] == 72.2
+    assert values["protrusion_mm"] == 2.3
     kinds = {a.kind: a.ref for a in design.assets}
     assert kinds["design_json"].endswith("/aid/design.json")
     assert kinds["aid_print_stl"].endswith("/aid/aid_print.stl")
@@ -405,7 +584,7 @@ def test_design_and_control_results_pass_the_runner_checks(tmp_path):
     assert values["haspi_v2_mean"] == values["haspi_v2_worst_canal"] == 0.5
     assert values["haspi_v2_improvement_over_unaided"] == 0
     assert values["insertion_gain_2000_4000_hz_db"] == 0
-    assert values["bore_length_mm"] == 0
+    assert values["bore_length_mm"] == values["protrusion_mm"] == 0
     assert bridge.payloads("score")[-1]["candidate_dir"] is None
 
 
