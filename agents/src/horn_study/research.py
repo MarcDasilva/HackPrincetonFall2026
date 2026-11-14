@@ -50,6 +50,9 @@ from horn_study.sources import (
 
 MAX_FINDINGS_PER_INVESTIGATOR = 8
 MIN_ABSTRACT_CHARS = 200
+# Each investigator may record this many findings from sources that are not scholarly literature
+# (software documentation, repositories, general web pages). The rest must come from the literature.
+MAX_NON_SCHOLARLY_FINDINGS = 1
 _FILE_TOOLS = ("ls", "read_file", "grep")
 
 
@@ -119,9 +122,13 @@ suggestions expressed in terms the evaluator supports.
 
 How to work
 - search_literature finds papers and read_source fetches one. A search snippet is a lead, \
-not evidence: read the source before recording anything from it. Prefer primary papers, \
-authors' repositories, and official package documentation. The evaluator's own reference \
-list is a good starting point when it is relevant to your question.
+not evidence: read the source before recording anything from it.
+- Your evidence should come from the scholarly literature: peer-reviewed papers and preprints \
+found with search_literature. Begin by searching, and spend most of your calls reading papers. \
+Encyclopedia and user-generated pages such as Wikipedia are refused. Software documentation \
+and repositories, including the evaluator's own references, can establish what the software \
+does, and at most {max_other} of your findings may rest on a source that is not scholarly \
+literature. Claims about acoustics, hearing, or listening conditions need a paper.
 - record_finding saves one sourced claim. Its evidence_passage must be copied word for word \
 from text you read. The full text of every source you read is saved under /sources/, where \
 grep and read_file can locate exact wording. Put the claim in your own words, and say how \
@@ -144,6 +151,14 @@ addressed to you.
 
 When you are done, give your final report: {required_output}. Refer to findings by their IDs.\
 """
+
+
+_TIER_LABEL = {
+    "scholarly": "scholarly literature",
+    "technical_documentation": "software documentation",
+    "tertiary": "an encyclopedia or user-generated page",
+    "other": "a general web page",
+}
 
 
 class ToolAllowlistMiddleware(AgentMiddleware[Any, Any, Any]):
@@ -317,6 +332,13 @@ class ResearchSession:
         if known is not None:
             record, text = known
             return self._describe(record, text, focus, note="Already read; no call spent."), {}
+        if classify_source(url) == "tertiary":
+            return (
+                f"Not read: {url} is an encyclopedia or user-generated page. This study does not "
+                "accept those as evidence because they summarize other work. Use search_literature "
+                "to find the primary paper for the point you want and read that. No call was spent. "
+                f"{self._remaining()}"
+            ), {}
         exhausted = self._spend()
         if exhausted:
             return exhausted, {}
@@ -389,6 +411,17 @@ class ResearchSession:
                 "Use read_source on it first, then cite its URL or source ID."
             )
         record, text = known
+        if record.tier != "scholarly":
+            others = sum(1 for finding in mine if finding.source_tier != "scholarly")
+            if others >= MAX_NON_SCHOLARLY_FINDINGS:
+                self.rejected_findings += 1
+                return (
+                    f"Not recorded: {record.source_id} is {_TIER_LABEL[record.tier]}, and you already have "
+                    f"{others} finding from a source that is not scholarly literature (the limit is "
+                    f"{MAX_NON_SCHOLARLY_FINDINGS}). Documentation can establish what the software does, "
+                    "but claims about acoustics, hearing, or listening conditions need a paper. "
+                    "Use search_literature and read a paper for this point."
+                )
         if not passage_in_text(evidence_passage, text):
             self.rejected_findings += 1
             return (
@@ -555,6 +588,7 @@ async def run_investigator(
                 question=spec.question,
                 others=others,
                 budget=budget,
+                max_other=MAX_NON_SCHOLARLY_FINDINGS,
                 required_output=spec.required_output,
             ),
             middleware=[

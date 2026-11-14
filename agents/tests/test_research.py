@@ -235,3 +235,42 @@ async def test_a_read_source_and_its_findings_carry_the_tier():
     (finding,) = s._ledger.findings
     assert source.tier == finding.source_tier == "scholarly"
     assert [e.data["tier"] for e in events.history if e.type == "research.source_read"] == ["scholarly"]
+
+
+async def test_encyclopedia_pages_are_refused_without_spending_a_call():
+    reader = FakeReader()
+    s, events = session(reader=reader)
+    message, files = await s.read_source("https://en.wikipedia.org/wiki/Horn_(acoustic)", "cutoff")
+    assert message.startswith("Not read: https://en.wikipedia.org/wiki/Horn_(acoustic) is an encyclopedia")
+    assert "No call was spent" in message
+    assert files == {}
+    assert reader.fetched == []
+    assert s.calls_used == 0
+    assert s._ledger.sources == ()
+    assert events.history == []
+
+
+async def test_only_one_finding_per_investigator_may_rest_on_a_non_scholarly_source():
+    docs = "https://github.com/example/tool"
+    web = "https://some-blog.example.com/post"
+    s, _ = session()
+    await s.read_source(docs, "tool")
+    await s.read_source(web, "tool")
+    await s.search_literature("a")
+    await s.read_source(URL, "horn")
+
+    first = s.record_finding(source=docs, evidence_passage=PASSAGES["hearing_research"], **FINDING)
+    second = s.record_finding(source=web, evidence_passage=PASSAGES["use_context_research"], **FINDING)
+    assert first == "Recorded as hearing-F1."
+    assert second.startswith("Not recorded: S2 is a general web page")
+    assert "need a paper" in second
+    assert s.rejected_findings == 1
+
+    paper_one = s.record_finding(source=URL, evidence_passage=PASSAGES["use_context_research"], **FINDING)
+    paper_two = s.record_finding(source=URL, evidence_passage=PASSAGES["acoustic_design_research"], **FINDING)
+    assert (paper_one, paper_two) == ("Recorded as hearing-F2.", "Recorded as hearing-F3.")
+    assert [f.source_tier for f in s._ledger.findings] == [
+        "technical_documentation",
+        "scholarly",
+        "scholarly",
+    ]
