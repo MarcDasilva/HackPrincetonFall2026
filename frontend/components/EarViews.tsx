@@ -28,7 +28,7 @@ const DOCK_CLEAR = 116;
  * Reveals the views one at a time, stacked on top of each other over the orb, then fans them into a row as wide as the chat box. Each view waits for ITS file to exist (`files`) AND for STEP_MS after the previous one.
  * GSAP owns every card's transform — NEVER put transform in a card's style prop, or a re-render snaps it back. `anchor` returns the orb's rect: the stack centers on it at the first reveal.
  */
-export default function EarViews({ files, anchor }: { files?: Record<string, string>; anchor: () => DOMRect | null }) {
+export default function EarViews({ files, anchor, onGone }: { files?: Record<string, string>; anchor: () => DOMRect | null; onGone?: () => void }) {
   const [shown, setShown] = useState(0);
   const [top, setTop] = useState<number | null>(null);
   const lastAt = useRef(0);
@@ -81,7 +81,7 @@ export default function EarViews({ files, anchor }: { files?: Record<string, str
     const t = setTimeout(() => {
       collapsing.current = true;
       const r = anchor(), dy = r && top !== null ? r.top + r.height / 2 - top : 0;
-      gsap.to(cards.current, { x: (i: number) => W / 2 - S / 2 - left(i), y: dy, scale: 0, opacity: 0, duration: 0.7, ease: "power3.in", stagger: 0.06, onComplete: () => setGone(true) });
+      gsap.to(cards.current, { x: (i: number) => W / 2 - S / 2 - left(i), y: dy, scale: 0, opacity: 0, duration: 0.7, ease: "power3.in", stagger: 0.06, onComplete: () => { setGone(true); onGone?.(); } });
     }, IDLE_MS);
     return () => clearTimeout(t);
   }, [row, open, gone]); // eslint-disable-line react-hooks/exhaustive-deps

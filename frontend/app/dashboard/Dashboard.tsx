@@ -9,6 +9,7 @@ import { hearingPdf } from "@/lib/hearingPdf";
 import { fakeHearing } from "@/lib/fakeHearing";
 import type { Result } from "@/lib/audiometry";
 import { pollRun, runNote, startRun, type Run } from "@/lib/run";
+import { talkToLead } from "@/lib/lead";
 import EarViews from "@/components/EarViews";
 import gsap from "gsap";
 import { CustomEase } from "gsap/CustomEase";
@@ -152,6 +153,8 @@ export default function Dashboard() {
   const [starting, setStarting] = useState(false);
   const [run, setRun] = useState<Run | null>(null);
   const [runErr, setRunErr] = useState<string | null>(null);
+  // The lead agent takes over once the ear cards vanish (EarViews onGone). From then on the composer talks to it, and its latest reply replaces "Processing…" under the orb. null = not started.
+  const [lead, setLead] = useState<{ line: string; waiting: boolean } | null>(null);
   const upload = useRef<HTMLInputElement>(null);
   // Composer "+" and drag-drop share one router (addFiles below); dragging lights the card while a file hovers over it.
   const pick = useRef<HTMLInputElement>(null);
@@ -193,11 +196,24 @@ export default function Dashboard() {
   }, [camOn, hearOn]);
   // Dev shortcut, two keys (handler assigned each render below; the listener lives in a hook above the early return): turning Caps Lock ON attaches the practice ear and fake hearing test, then Enter sends them like any submit. Only the ON transition counts — macOS fires keydown for ON and keyup for OFF, other platforms keydown for both, so getModifierState keeps turning it OFF from re-attaching. Enter is swallowed ONLY when focus is on the page itself, so the textarea and buttons keep their own Enter. Dev builds only.
   const keyFn = useRef<(e: KeyboardEvent) => void>(() => {});
+  const held = useRef(new Set<string>());
   useEffect(() => {
     if (process.env.NODE_ENV === "production") return;
-    const onKey = (e: KeyboardEvent) => keyFn.current(e);
+    // Held keys, for chords: "1 + 2" needs to know 1 is still down when 2 arrives. A key released while the window is blurred never sends keyup, so blur clears the set or a stuck "1" would fire the chord on the next "2".
+    const onKey = (e: KeyboardEvent) => {
+      held.current.add(e.key);
+      keyFn.current(e);
+    };
+    const onUp = (e: KeyboardEvent) => held.current.delete(e.key);
+    const clear = () => held.current.clear();
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keyup", onUp);
+    window.addEventListener("blur", clear);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keyup", onUp);
+      window.removeEventListener("blur", clear);
+    };
   }, []);
   // Poll the backend job. Deps are id+status only — new files and steps arrive through setRun without restarting the timer.
   useEffect(() => {
@@ -315,8 +331,32 @@ export default function Dashboard() {
   const busy = starting || run?.status === "queued" || run?.status === "running";
   const orbState: OrbState = !sent || panelOn ? "idle" : arrived && busy ? "loading" : "active";
   const canRun = !!photo && !!hearing && !busy;
+  const canSend = lead ? !lead.waiting : canRun;
+  const talk = async (message: string, id = run?.id) => {
+    if (!id) return;
+    setLead((l) => ({ line: l?.line ?? "", waiting: true }));
+    try {
+      setLead({ line: (await talkToLead(id, message)).reply, waiting: false });
+    } catch {
+      setLead({ line: "The assistant is unreachable. Is the agents server running on :8010?", waiting: false });
+    }
+  };
   const note = runErr ?? (run ? runNote(run) : "");
+  // Dev shortcut: skip upload, run and ear views and land in the lead conversation, as if a run had just finished. The lead reads a FINISHED patient from the backend's data folder (job.json), so this needs one: d60d88e7550d is the validation patient (done, left ear); override with NEXT_PUBLIC_DEV_RUN_ID. The lead agents server (:8010) must be up.
+  const skipToLead = () => {
+    if (lead) return;
+    const id = process.env.NEXT_PUBLIC_DEV_RUN_ID ?? "d60d88e7550d";
+    if (panelOn) closePanel();
+    clearPhoto();
+    clearHearing();
+    setRun({ id, status: "done" });
+    setSent(true);
+    void talk("", id);
+  };
   keyFn.current = (e) => {
+    // Chord: both held, either order. Not while typing — "12" in the chat box is a message, and repeat must not refire it.
+    const typing = e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement;
+    if (!e.repeat && !typing && held.current.has("1") && held.current.has("2")) return skipToLead();
     if (e.key === "CapsLock" && e.getModifierState("CapsLock")) void practice();
     else if (e.key === "Enter" && canRun && e.target === document.body) {
       e.preventDefault();
@@ -342,14 +382,14 @@ export default function Dashboard() {
     <>
     {/* The up arrow is live only once an ear photo AND a hearing test are attached; plus is inert. Width 600 approximates the dock's resting width — retune if the dock changes. */}
     {/* The ear stage's three views, revealed as the backend writes them; the orb's rect is where the stack lands. */}
-    {run && <EarViews key={run.id} files={run.files} anchor={() => orb.current?.getBoundingClientRect() ?? null} />}
+    {run && <EarViews key={run.id} files={run.files} anchor={() => orb.current?.getBoundingClientRect() ?? null} onGone={() => void talk("")} />}
     <div ref={chat} style={{ position: "fixed", top: "50%", left: "50%", transform: "translate(-50%, -50%)", width: 600, maxWidth: "calc(100vw - 32px)", zIndex: 10 }}>
     {/* Orb draws at full resolution (components/Orb.tsx), so size is plain pixels. zIndex -1 sits behind the card and bar inside this wrapper's stacking context. The inner div carries the post-send y/scale tween, so GSAP NEVER rewrites the centering translate on the outer one. */}
     <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)", zIndex: -1, pointerEvents: "none" }}>
       <div ref={orb} data-testid="orb" data-state={orbState} style={{ position: "relative" }}>
         <Orb px={ORB_PX} speed={orbState === "idle" ? 1 : 2} spin={spin.current} />
         {/* Sits under the visible sphere (canvas is ORB_FILL sphere + padding) and scales with the orb. Colour and font match the Capture Ear pill label (pill() default colour), one size up; dividing by --orb-s undoes the orb's scale so it stays 18px on short screens. */}
-        {orbState === "loading" && <div role="status" className="orb-sub" style={{ position: "absolute", top: (ORB_PX * (1 + ORB_FILL)) / 2 + 28, left: 0, right: 0, textAlign: "center", fontSize: "calc(18px / var(--orb-s, 1))", lineHeight: "calc(22px / var(--orb-s, 1))", color: "#757575" }}>Processing…</div>}
+        {(lead ? orbState !== "idle" : orbState === "loading") && <div role="status" className="orb-sub" style={{ position: "absolute", top: `calc(${(ORB_PX * (1 + ORB_FILL)) / 2 + 28}px + 22px / var(--orb-s, 1))`, transform: "translateY(-100%)", left: 0, right: 0, textAlign: "center", fontSize: "calc(18px / var(--orb-s, 1))", lineHeight: "calc(22px / var(--orb-s, 1))", color: "#757575" }}>{/* Anchored by its BOTTOM edge at the one-line spot: ORB_SUB reserves room for ONE line, so a longer lead reply grows UP over the orb, never down onto the Capture pills. */}{lead ? (lead.waiting ? "…" : lead.line) : "Processing…"}</div>}
       </div>
     </div>
     {/* Bar floats above the card (bottom: 100%) so the card stays centered, and hugs its content. While a panel (camera or hearing) is open the bar joins the flow instead, so the wrapper (centered by its translate) re-centers feed + card together and the card is pushed down. Inert until capture is wired. Grey matches the textarea placeholder. */}
@@ -419,6 +459,15 @@ export default function Dashboard() {
       ref={form}
       onSubmit={async (e) => {
         e.preventDefault();
+        if (lead) {
+          // Once the lead is on, the composer is ITS input — it never starts another run.
+          const ta = e.currentTarget.elements.namedItem("msg") as HTMLTextAreaElement;
+          const msg = ta.value.trim();
+          if (!msg || lead.waiting) return;
+          ta.value = "";
+          void talk(msg);
+          return;
+        }
         // A run needs BOTH inputs. Enter in the textarea submits too, so the guard lives here, not only on the arrow.
         if (!photo || !hearing || busy) return;
         const ta = e.currentTarget.elements.namedItem("msg") as HTMLTextAreaElement;
@@ -483,7 +532,7 @@ export default function Dashboard() {
         <button type="button" aria-label="Add" onClick={() => pick.current?.click()} style={{ ...iconBtn, border: "1px solid rgba(255,255,255,0.18)", background: "transparent", color: "#c9ccd1" }}>
           <svg viewBox="0 0 24 24" {...icon}><path d="M12 5v14M5 12h14" /></svg>
         </button>
-        <button type="submit" aria-label="Send" disabled={!canRun} title={canRun ? undefined : "Add an ear photo and a hearing test to start"} style={{ ...iconBtn, border: 0, background: "#3b82f6", color: "#fff", opacity: canRun ? 1 : 0.35, cursor: canRun ? "pointer" : "not-allowed" }}>
+        <button type="submit" aria-label="Send" disabled={!canSend} title={canSend ? undefined : lead ? "Waiting for a reply" : "Add an ear photo and a hearing test to start"} style={{ ...iconBtn, border: 0, background: "#3b82f6", color: "#fff", opacity: canSend ? 1 : 0.35, cursor: canSend ? "pointer" : "not-allowed" }}>
           <svg viewBox="0 0 24 24" {...icon}><path d="M12 19V5M5 12l7-7 7 7" /></svg>
         </button>
       </div>

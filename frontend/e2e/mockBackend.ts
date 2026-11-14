@@ -16,6 +16,11 @@ export async function mockBackend(page: Page, opts: { onPost?: (body: string) =>
   });
   await page.route(`**/api/patients/${PID}`, (route) =>
     route.fulfill({ contentType: "application/json", headers: CORS, body: JSON.stringify({ status: "running", step: "context", files }) }));
+  // The lead opens when the ear cards vanish; WITHOUT this stub every spec that sends would call the real agents server (and the model) on :8010. lead.spec.ts registers its own handler after this one, which wins.
+  await page.route(`**/lead/${PID}`, (route) =>
+    route.request().method() === "OPTIONS"
+      ? route.fulfill({ headers: { ...CORS, "access-control-allow-headers": "*" } })
+      : route.fulfill({ contentType: "application/json", headers: CORS, body: JSON.stringify({ reply: "stub", awaiting_launch: false, launch_requested: false }) }));
   await page.route(`**/api/patients/${PID}/files/*`, (route) =>
     route.request().url().endsWith(".glb") ? route.fulfill({ status: 404, headers: CORS }) : route.fulfill({ contentType: "image/png", headers: CORS, body: PNG }));
 }
