@@ -31,6 +31,8 @@ type Props = {
   onChange: (s: Scene) => void;
   onRemoveSource: (sourceId: string) => void;
   onAddSource: (role: Source["role"]) => void;
+  /** Just the 3D view, NO editing: speakers stay put and the scene controls are not drawn (SimRuns' detail view). */
+  bare?: boolean;
 };
 
 function local(grid: EarGrid, p: number[]) {
@@ -179,6 +181,7 @@ export default function SceneCell(props: Props) {
     };
     const sphere = new THREE.Sphere(new THREE.Vector3(), grid.radius_mm);
     const down = (e: PointerEvent) => {
+      if (cb.current.bare) return;
       toNdc(e);
       const hit = ray.intersectObjects([...markers.values()])[0];
       if (!hit) return;
@@ -235,6 +238,7 @@ export default function SceneCell(props: Props) {
 
   useEffect(() => { api.current?.setSources(scene.sources); }, [scene.sources]);
 
+  if (props.bare) return <div ref={mount} className={styles.view} style={{ aspectRatio: "1", borderRadius: 12, overflow: "hidden", background: "#0b0b0d" }} />;
   const pct = status.total ? Math.round((status.done / status.total) * 100) : 0;
   return (
     <div className={styles.cell}>

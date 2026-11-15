@@ -6,7 +6,8 @@ import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import styles from "./sim.module.css";
 
-export default function EarpieceView({ url }: { url: string }) {
+/** `className` replaces the /sim panel's fixed 210px box — the dashboard's option viewer fills its own. */
+export default function EarpieceView({ url, className = styles.earpiece }: { url: string; className?: string }) {
   const mount = useRef<HTMLDivElement>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -34,7 +35,9 @@ export default function EarpieceView({ url }: { url: string }) {
       });
       scene.add(g.scene);
       controls.target.copy(c);
-      camera.position.copy(c).add(new THREE.Vector3(r * 1.9, r * 0.6, r * 0.9));
+      // Back far enough that the bounding sphere fits the 30° view, from the same angle as before.
+      const dist = (r / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2))) * 1.1;
+      camera.position.copy(c).add(new THREE.Vector3(1.9, 0.6, 0.9).normalize().multiplyScalar(dist));
     }, undefined, (e) => setErr(String((e as Error).message ?? e)));
 
     const resize = () => {
@@ -54,7 +57,7 @@ export default function EarpieceView({ url }: { url: string }) {
   }, [url]);
 
   return (
-    <div className={styles.earpiece} ref={mount}>
+    <div className={className} ref={mount}>
       {err && <p className={styles.caption}>Could not load the earpiece mesh: {err}</p>}
     </div>
   );

@@ -168,7 +168,7 @@ def study_request(run_id: str, study_id: str, job: dict[str, Any], notes: list[s
     # Two ears: the study targets the one with the worse average threshold — it needs the aid most.
     target = max(ags, key=lambda e: sum(ags[e].values()) / len(ags[e]))
     example = job.get("request", {}).get("audiogram_is_example", False)
-    # ponytail: the development fixture unless a real evaluator is configured; per-patient hornsim config is the next step.
+    # ponytail: the development fixture unless a real evaluator is configured; _evaluator gives hornsim the patient's ear.
     real = bool(os.environ.get("HORN_STUDY_REAL_EVALUATOR"))
     return {
         "study_id": study_id,
@@ -190,16 +190,37 @@ def study_request(run_id: str, study_id: str, job: dict[str, Any], notes: list[s
     }
 
 
+def _evaluator(raw: dict[str, Any]) -> Any:
+    """The study's evaluator. hornsim gets THIS patient's ear mesh — .env's HORNSIM_EAR_MESH is only the fallback."""
+    from horn_study.evaluator_adapter import CallableEvaluator, evaluator_for
+
+    if (
+        raw["evaluation_mode"] != "real"
+        or os.environ.get("HORN_STUDY_REAL_EVALUATOR") != "horn_study.hornsim_evaluator"
+    ):
+        return evaluator_for(raw["evaluation_mode"])
+    from horn_study.hornsim_evaluator import HornsimConfig, HornsimEvaluator
+
+    profile = raw["hearing_profile"]
+    run_dir = patients_dir() / profile["profile_id"].removeprefix("patient_")
+    # Per-ear layout (<run>/<side>/ear) first, then the older one-ear layout (<run>/ear).
+    meshes = [run_dir / profile["target_ear"] / "ear" / "ear.ply", run_dir / "ear" / "ear.ply"]
+    env = dict(os.environ)
+    if mesh := next((m for m in meshes if m.is_file()), None):
+        env["HORNSIM_EAR_MESH"] = str(mesh)
+    hornsim = HornsimEvaluator(HornsimConfig.from_env(env))
+    return CallableEvaluator(hornsim.get_evaluator_capabilities, hornsim.evaluate_experiment)
+
+
 async def run(raw: dict[str, Any]) -> None:
     """The study, as cli.py's run command builds it. Events land in <studies>/<study_id>/events.jsonl."""
-    from horn_study.evaluator_adapter import evaluator_for
     from horn_study.llm import load_model
     from horn_study.sources import HttpReader, default_search, make_http_client
     from horn_study.workflow import StudyDependencies, run_study
 
     async with make_http_client() as client:
         deps = StudyDependencies(
-            evaluator=evaluator_for(raw["evaluation_mode"]),
+            evaluator=_evaluator(raw),
             research_model=load_model("research"),
             coordinator_model=load_model("coordinator"),
             interpreter_model=load_model("interpreter"),

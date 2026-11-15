@@ -1,9 +1,11 @@
 import { test, expect, type Page } from "@playwright/test";
 import fs from "node:fs";
-import { mockStudy } from "./mockBackend";
+import { localHead, mockStudy } from "./mockBackend";
 
 const CORS = { "access-control-allow-origin": "*", "access-control-allow-headers": "*" };
 const RUN = "d60d88e7550d"; // the dev chord's run (Dashboard DEV_RUN_ID)
+// A real earpiece (preview.png, earpiece*.glb) when this checkout has one (backend/data is local); otherwise a 1x1 PNG.
+const PREVIEW_DIR = process.env.AID_FIXTURE_DIR ?? "../backend/data/patients/8e0c9758fead/aid/cone";
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
 // Two directions (front, aided side) shared by three scenes: the real FDTD runs in the workers, kept short.
 const SCENES = [
@@ -50,7 +52,12 @@ async function mockSim(page: Page, asked: string[]) {
     const url = route.request().url();
     asked.push(`${route.request().method()} ${url.replace(/^.*\/patients\//, "")}`);
     // /files/ first: "files/grid1/preview.png" also contains "/grid".
-    if (url.includes("/files/")) return route.fulfill({ contentType: url.includes(".png") ? "image/png" : "model/stl", body: PNG });
+    if (url.includes("/files/")) {
+      // Real renders and meshes when this checkout has them; a .glb that fails to load only shows the viewer's error line.
+      const name = url.split("/").pop()!.split("?")[0], real = `${PREVIEW_DIR}/${name}`;
+      const body = fs.existsSync(real) ? fs.readFileSync(real) : PNG;
+      return route.fulfill({ contentType: name.endsWith(".png") ? "image/png" : name.endsWith(".glb") ? "model/gltf-binary" : "model/stl", body });
+    }
     if (url.includes("/grid")) return route.fulfill({ contentType: "application/json", body: JSON.stringify(grid) });
     if (route.request().method() === "POST") return route.fulfill({ status: 202, contentType: "application/json", body: "{}" });
     return route.fulfill({ contentType: "application/json", body: JSON.stringify({ status: "done", result: { design: OPTIONS[0], options: OPTIONS } }) });
@@ -70,6 +77,9 @@ test("after research the lead runs the simulations, offers four aids, validates 
   await mockStudy(page);
   await mockLead(page, said);
   await mockSim(page, asked);
+  // A real reconstructed head when this checkout has one (backend/data is local); otherwise the tiles draw the average head.
+  const headGlb = localHead();
+  if (headGlb) await page.route("**/files/head/head_ears.glb", (route) => route.fulfill({ contentType: "model/gltf-binary", body: fs.readFileSync(headGlb) }));
   await page.route(/\/api\/patients\/[a-f0-9]{12}$/, (route) => route.fulfill({ status: 404, headers: CORS, contentType: "application/json", body: "{}" }));
   await page.goto("/zz-preview");
   await page.waitForFunction(() => {
@@ -102,18 +112,44 @@ test("after research the lead runs the simulations, offers four aids, validates 
   await expect(sims.locator("[data-testid=sim-tile][data-done]")).toHaveCount(3, { timeout: 150_000 });
   await page.waitForTimeout(500);
   await page.screenshot({ path: test.info().outputPath("runs.png") });
+  // A tile opens its run: the 3D wave field on the head, the ear's 2D wave slices, the live pixel field, and the run's numbers. Catches the detail view losing a figure or its way back.
+  await sims.getByTestId("sim-tile").first().click();
+  const detail = page.getByTestId("sim-detail");
+  await expect(detail.getByTestId("sim-3d")).toHaveAttribute("src", /\/head\/viewer\.html\?embed=1&run=az000_el%2B00&rig=1&ear=left$/);
+  await expect(detail.getByTestId("sim-2d-lab")).toHaveAttribute("src", /\/waves\/left\/index\.html\?embed=1&run=az000_el%2B00&disp=slices$/);
+  await expect(detail.getByTestId("sim-slice")).toBeVisible();
+  await expect(detail.getByTestId("sim-info")).toContainText("family talking");
+  await expect(detail.getByTestId("sim-deficit")).toBeVisible();
+  await page.waitForTimeout(1500);
+  await page.screenshot({ path: test.info().outputPath("detail.png") });
+  await detail.getByRole("button", { name: "All simulations" }).click();
+  await expect(sims.getByTestId("sim-tile")).toHaveCount(3);
   await page.getByRole("button", { name: "Exit simulation" }).click();
   await expect(line).toHaveText("Great, I have enough data to develop a hearing aid. Ready to see it?");
+  await page.waitForTimeout(2500); // zoom out, then the chrome fades back in
+  await page.screenshot({ path: test.info().outputPath("ready.png") });
 
   await send(page, "yes");
   const options = page.getByTestId("aid-option");
   await expect(options).toHaveCount(4, { timeout: 15_000 });
-  await expect(options.nth(1)).toContainText("Reason for option 2.");
+  await page.waitForTimeout(800); // metal rings draw
   await page.screenshot({ path: test.info().outputPath("options.png") });
+  // Hover lifts the card; the expanded view holds BOTH models and the reason. Catches a card that never lifts, or an expanded view missing a model.
+  const before = (await options.nth(1).boundingBox())!.y;
+  await options.nth(1).hover();
+  await page.waitForTimeout(400);
+  expect((await options.nth(1).boundingBox())!.y).toBeLessThan(before - 4);
+  await page.screenshot({ path: test.info().outputPath("options-hover.png") });
   // The design request carried every scene's deficit, for the study's (left) ear.
   expect(asked).toContain("POST d60d88e7550d/design?ear=left");
 
-  await options.nth(1).getByRole("button", { name: "Pick option 2" }).click();
+  await options.nth(1).click({ position: { x: 40, y: 40 } });
+  const expanded = page.getByTestId("aid-expanded");
+  await expect(expanded.getByTestId("aid-model")).toHaveCount(2);
+  await expect(expanded).toContainText("Reason for option 2.");
+  await page.waitForTimeout(1500); // meshes load
+  await page.screenshot({ path: test.info().outputPath("options-expanded.png") });
+  await expanded.getByRole("button", { name: "Select option 2" }).click();
   // Picking reopens the orb on the same runs, now scored with the aid. Visible, not just opaque: the hidden layer keeps its old opacity.
   await expect(sims).toBeVisible({ timeout: 10_000 });
   await expect(sims).toHaveCSS("opacity", "1");

@@ -197,7 +197,12 @@ def test_the_simulation_half_runs_in_order(
         if out["stage"] != "sim_prep":
             break
         time.sleep(0.01)
-    assert (out["stage"], out["reply"], len(out["scenes"]), picked) == ("sim_running", lead.SIM_RUNNING, 40, [40])
+    assert (out["stage"], out["reply"], len(out["scenes"]), picked) == (
+        "sim_running",
+        lead.SIM_RUNNING,
+        40,
+        [40],
+    )
     assert c.post("/lead/run1", json={"event": "picked"}).status_code == 409
     steps = [
         ("sims_done", {"summary": "s"}, "design_ready"),
@@ -211,3 +216,25 @@ def test_the_simulation_half_runs_in_order(
         assert c.post("/lead/run1", json={"event": event, "data": data}).json()["stage"] == stage
     out = c.post("/lead/run1", json={"message": "report please"}).json()
     assert (out["stage"], out["report"], out["picked"]) == ("done", "the report", "grid1")
+
+
+def test_hornsim_study_uses_the_target_ears_own_mesh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A study scored on the OTHER ear, or on .env's fallback mesh, designs an aid for an ear the patient doesn't have.
+    from horn_study import hornsim_evaluator
+
+    monkeypatch.setenv("HORN_STUDY_PATIENTS_DIR", str(tmp_path))
+    monkeypatch.setenv("HORN_STUDY_REAL_EVALUATOR", "horn_study.hornsim_evaluator")
+    monkeypatch.setenv("HORNSIM_EAR_MESH", "/fallback/ear.ply")
+    for side in ("left", "right"):
+        (tmp_path / "run1" / side / "ear").mkdir(parents=True)
+        (tmp_path / "run1" / side / "ear" / "ear.ply").write_text("")
+    seen: list[str] = []
+    monkeypatch.setattr(
+        hornsim_evaluator.HornsimConfig,
+        "from_env",
+        classmethod(lambda cls, env: seen.append(env["HORNSIM_EAR_MESH"])),
+    )
+    monkeypatch.setattr(hornsim_evaluator, "HornsimEvaluator", lambda config: hornsim_evaluator)
+    raw = server.study_request("run1", "s1", TWO_EARS, [])
+    server._evaluator(raw)
+    assert seen == [str(tmp_path / "run1" / "right" / "ear" / "ear.ply")]

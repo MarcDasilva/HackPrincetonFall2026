@@ -679,6 +679,10 @@ function view(v) {
 document.querySelector('.views').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) view(b.dataset.view); });
 
 await choose(state.run, '4000');
+// ?disp=slices opens on the 2D slices (the dashboard's sim detail shows them under the 3D head); 3D wavefronts otherwise.
+if (Q.get('disp') === 'slices') document.querySelector('#disp [data-disp="slices"]').click();
+// The sim detail labels its own figures: drop the overlay caption there.
+if (Q.get('disp') === 'slices') document.querySelector('.hud')?.setAttribute('hidden', '');
 view('3d');
 
 const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;

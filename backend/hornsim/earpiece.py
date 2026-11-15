@@ -191,7 +191,8 @@ def printable(solid, tol_mm=0.01):
 
 
 def render_preview(ear, solid, c, n, up, left, png):
-    """Two views for the designer to judge the look: face-on in the ear, and three-quarter."""
+    """Two views for the designer to judge the look: face-on in the ear (left), and three-quarter (right).
+    Transparent and untitled: the dashboard's option cards (frontend AidOptions) draw it on black."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -211,10 +212,22 @@ def render_preview(ear, solid, c, n, up, left, png):
         r = 30
         ax.set_xlim(-r, r); ax.set_ylim(-r, r); ax.set_zlim(-r, r)
         ax.view_init(elev=el, azim=az); ax.set_axis_off()
-        ax.set_title(["face-on, in the ear", "three-quarter"][k], fontsize=9)
     plt.tight_layout()
-    plt.savefig(png, dpi=80)
+    plt.savefig(png, dpi=80, transparent=True)
     plt.close(fig)
+    # The 3D axes leave wide empty margins and a gap between the views: crop each view to its own pixels, then butt them together.
+    from PIL import Image
+    im = Image.open(png)
+    w, h = im.size
+    halves = [im.crop((0, 0, w // 2, h)), im.crop((w // 2, 0, w, h))]
+    halves = [x.crop(x.getchannel("A").getbbox() or (0, 0, *x.size)) for x in halves]
+    pad = 8
+    out = Image.new("RGBA", (sum(x.width for x in halves) + 3 * pad, max(x.height for x in halves) + 2 * pad))
+    left = pad
+    for x in halves:
+        out.paste(x, (left, (out.height - x.height) // 2))
+        left += x.width + pad
+    out.save(png)
 
 
 def _periodic(psi, r, at):

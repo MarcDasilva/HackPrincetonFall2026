@@ -12,6 +12,7 @@ import { pollRun, runNote, startRun, type EarPhoto, type Run } from "@/lib/run";
 import type { Ear } from "@/lib/audiometry";
 import { createSession, getLead, leadEvent, listSessions, MOVING, talkToLead, type LeadReply } from "@/lib/lead";
 import SimRuns, { type Outcome } from "@/app/sim/SimRuns";
+import AidOptions from "@/components/AidOptions";
 import { designFile, designStatus, startDesign } from "@/app/sim/lib/api";
 import ResearchBoxes, { RESEARCH_LINE } from "@/components/ResearchBoxes";
 import EarViews, { type View } from "@/components/EarViews";
@@ -221,6 +222,8 @@ export default function Dashboard() {
   const [zoomed, setZoomed] = useState(false);
   // Escape and the X close the orb the SAME way (exitSim): a close can move the lead on.
   const exitRef = useRef(() => setZoomed(false));
+  // Dev chord 3+4: the orb stays clickable whatever stage the lead reports — otherwise its reply, landing after the chord, switches it back off.
+  const devSim = useRef(false);
   const bar = useRef<HTMLDivElement>(null);
   const simWrap = useRef<HTMLDivElement>(null);
   // True once the zoom-in has LANDED. The sims mount on this, never on zoomed: building their 3D scenes and workers blocks the main thread for seconds, and doing it mid-zoom freezes the zoom and the chrome fade.
@@ -541,7 +544,7 @@ export default function Dashboard() {
       flyDelay.current = sent && !panelOn ? 0 : 0.9;
       setResearch(true);
     }
-    setSimReady(r.stage === "sim_running" || r.stage === "validating");
+    setSimReady(devSim.current || r.stage === "sim_running" || r.stage === "validating");
   };
   const talk = async (message: string, id = run?.id) => {
     if (!id) return;
@@ -585,6 +588,11 @@ export default function Dashboard() {
     void step("validated", { aided, summary: `With option ${n} you hear ${pct(mean(aided))} of speech on average, up from ${pct(unaided)}. It helps in ${better} of ${aided.length} scenes.` });
   };
   exitRef.current = exitSim;
+  /** The orb's centre on screen (its rect already includes the rise's scale). */
+  const orbSphere = () => {
+    const r = orb.current?.getBoundingClientRect();
+    return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+  };
   applyRef.current = apply;
   stepRef.current = step;
   const note = runErr ?? (run ? runNote(run) : "");
@@ -607,6 +615,7 @@ export default function Dashboard() {
     setSimReady(false);
     setView(null);
     setOutcome(null);
+    devSim.current = false;
     setRunErr(null);
     if (id === "new") {
       history.replaceState(null, "", location.pathname);
@@ -634,6 +643,7 @@ export default function Dashboard() {
     // 3 + 4: the same skip, then straight to a clickable orb, as if the patient had already agreed to launch research.
     if (!e.repeat && !typing && held.current.has("3") && held.current.has("4")) {
       skipToLead();
+      devSim.current = true;
       return setSimReady(true);
     }
     // 5: the research view, as if research had just launched. Pressing 5 again closes it.
@@ -872,9 +882,16 @@ export default function Dashboard() {
         <button type="button" aria-label="Add" onClick={() => pick.current?.click()} style={{ ...iconBtn, border: "1px solid rgba(255,255,255,0.18)", background: "transparent", color: "#c9ccd1" }}>
           <svg viewBox="0 0 24 24" {...icon}><path d="M12 5v14M5 12h14" /></svg>
         </button>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        {/* ponytail: display only — nothing reads the choice; the agents server picks its models from agents/.env. */}
+        <select aria-label="Model" data-testid="model-picker" defaultValue="Opus 5.5"
+          style={{ padding: "4px 10px", borderRadius: 999, border: 0, outline: 0, background: "transparent", color: "#9aa0a8", font: "inherit", fontSize: 13, cursor: "pointer" }}>
+          {["Fable 5.2", "Opus 5.5", "Haiku 5.5"].map((m) => <option key={m} style={{ background: "#000" }}>{m}</option>)}
+        </select>
         <button type="submit" aria-label="Send" disabled={!canSend} title={lead ? (canSend ? undefined : "Waiting for a reply") : canSend ? (photos.selfie ? undefined : `Send, or ${faceHint}`) : `Add both ear photos and a hearing test to start; ${faceHint}`} style={{ ...iconBtn, border: 0, background: "#3b82f6", color: "#fff", opacity: canSend ? 1 : 0.35, cursor: canSend ? "pointer" : "not-allowed" }}>
           <svg viewBox="0 0 24 24" {...icon}><path d="M12 19V5M5 12l7-7 7 7" /></svg>
         </button>
+        </div>
       </div>
     </form>
     </MetalFx>
@@ -899,7 +916,7 @@ export default function Dashboard() {
     {/* Inside the orb: one bento box per speaker direction, left and right ear side by side (components/WaveBento), gain panel on the right. Mounted ONLY once the zoom lands (see inside) — ten wave viewers loading at once stall the main thread, and mid-zoom that freezes the zoom. The top padding keeps the header clear of the X. */}
     {/* The lead's simulations mount as soon as they exist and STAY mounted (hidden) outside the orb: the workers run in the background, and closing the orb must not restart them. */}
     {run && view?.scenes?.length ? (
-      <div ref={simWrap} data-testid="sims" style={{ position: "fixed", inset: 0, zIndex: 25, overflow: "auto", paddingTop: 56, opacity: 0, display: inside ? "block" : "none", background: "#000" }}>
+      <div ref={simWrap} data-testid="sims" style={{ position: "fixed", inset: 0, zIndex: 25, overflow: "auto", paddingTop: 56, opacity: 0, display: inside ? "block" : "none", background: "#fff" }}>
         <SimRuns pid={run.id} ear={view.ear} scenes={view.scenes} gain={view.stage === "validating" || view.stage === "final" || view.stage === "done" ? pickedGain : undefined} onDone={setOutcome} />
       </div>
     ) : inside && run && (
@@ -908,19 +925,7 @@ export default function Dashboard() {
       </div>
     )}
     {run && view?.stage === "options" && view.options && (
-      <div data-testid="aid-options" style={{ position: "fixed", top: 150, left: 16, right: 16, zIndex: 15, display: "flex", justifyContent: "center" }}>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 260px))", gap: 14, justifyContent: "center", width: "100%", maxWidth: 1120 }}>
-          {view.options.map((o, i) => (
-            <div key={o.id} data-testid="aid-option" style={{ display: "flex", flexDirection: "column", gap: 8, padding: 12, borderRadius: 16, background: "#121212", border: "1px solid rgba(255,255,255,0.14)", color: "#c9ccd1", fontSize: 13 }}>
-              {o.files["preview.png"] && <img src={designFile(run.id, o.id, "preview.png", view.ear ?? undefined)} alt={`Option ${i + 1} preview`} style={{ width: "100%", aspectRatio: "4 / 3", objectFit: "contain", borderRadius: 10, background: "#fbfaf8" }} />}
-              <strong style={{ color: "#e6e8eb", fontSize: 15, fontWeight: 500 }}>Option {i + 1}</strong>
-              <span style={{ lineHeight: 1.4 }}>{o.reason}</span>
-              <button type="button" onClick={async () => { await step("picked", { design_id: o.id }); setZoomed(true); }}
-                style={{ marginTop: "auto", height: 36, borderRadius: 999, border: 0, background: "#3b82f6", color: "#fff", font: "inherit", cursor: "pointer" }}>Pick option {i + 1}</button>
-            </div>
-          ))}
-        </div>
-      </div>
+      <AidOptions runId={run.id} ear={view.ear} options={view.options} around={orbSphere} onPick={async (id) => { await step("picked", { design_id: id }); setZoomed(true); }} />
     )}
     {run && view?.stage === "done" && view.report && (
       <div data-testid="final-report" style={{ position: "fixed", top: 150, left: "50%", transform: "translateX(-50%)", width: 640, maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 470px)", minHeight: 160, overflow: "auto", zIndex: 15, padding: 18, borderRadius: 16, background: "#121212", border: "1px solid rgba(255,255,255,0.14)", color: "#c9ccd1", fontSize: 14, lineHeight: 1.5 }}>

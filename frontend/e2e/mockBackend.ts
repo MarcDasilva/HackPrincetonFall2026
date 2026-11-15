@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import type { Page } from "@playwright/test";
 
 const CORS = { "access-control-allow-origin": "*" };
@@ -47,4 +48,11 @@ export async function mockStudy(page: Page) {
     ...(k === "ear_fit_research" ? [ev(k, "research.agent_completed", "The ear-fit investigator finished with 1 finding(s).", { summary: "A concha lock holds while running." })] : []),
   ]);
   await page.route("**/lead/*/events", (route) => route.fulfill({ contentType: "application/json", headers: CORS, body: JSON.stringify({ status: "running", events }) }));
+}
+
+/** Any reconstructed head in this checkout's backend/data (local, never committed); null without one. */
+export function localHead() {
+  const dir = "../backend/data/patients";
+  const pid = fs.existsSync(dir) ? fs.readdirSync(dir).find((p) => fs.existsSync(`${dir}/${p}/head/head_ears.glb`)) : undefined;
+  return pid ? `${dir}/${pid}/head/head_ears.glb` : null;
 }
