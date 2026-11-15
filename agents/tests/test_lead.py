@@ -47,3 +47,41 @@ def test_simulation_count_is_a_number_from_1_to_100() -> None:
     from horn_study.lead import count
 
     assert [count(t) for t in ("40", "let's do 100", "0", "500", "lots")] == [40, 100, None, None, None]
+
+
+def test_deep_agent_lead_sends_exactly_the_plain_call() -> None:
+    """Catches Deep Agents' base prompt, file tools or subagents leaking into the orb reply's model call."""
+    import asyncio
+
+    from deepagents._models import get_model_provider
+    from deepagents.profiles import HarnessProfile, register_harness_profile
+    from helpers import ScriptedChatModel
+    from langchain_core.messages import AIMessage, BaseMessage
+
+    from horn_study.lead import _messages, answer
+
+    seen: list[list[BaseMessage]] = []
+
+    def respond(messages: list[BaseMessage], bound: list[str]) -> AIMessage:
+        seen.append(messages)
+        return AIMessage("  The research is halfway done.  ")
+
+    class ProfiledModel(ScriptedChatModel):
+        pass
+
+    model = ProfiledModel(responder=respond)
+    # Built-in profiles (Claude 4.x) append a suffix to the system prompt; a subclass keeps this one off other tests.
+    register_harness_profile(
+        str(get_model_provider(model)), HarnessProfile(system_prompt_suffix="DEEP AGENT SUFFIX")
+    )
+    history = [{"role": "lead", "text": "Ask me anything."}, {"role": "patient", "text": "How far along?"}]
+    context: dict = dict(patient="right ear, mild", notes=["tinnitus"], status="running", events=[])
+
+    reply = asyncio.run(answer(model, history, **context))
+
+    assert reply == "The research is halfway done."
+    assert [(type(m), m.content) for m in seen[0]] == [
+        (type(m), m.content) for m in _messages(history, **context)
+    ]
+    assert model.log.calls == 1
+    assert all(tools == [] for tools in model.log.bound_tool_sets)

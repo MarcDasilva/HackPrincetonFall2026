@@ -27,11 +27,13 @@ that wait on the dashboard or on background work):
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from typing import Any, Literal
 
+from deepagents import create_deep_agent
+from langchain.agents.middleware import AgentMiddleware, ModelRequest
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 OPENING = "Anything I should know before I launch research based on your audiogram?"
@@ -247,8 +249,42 @@ Study progress, oldest first:
 {progress}"""
 
 
-async def answer(
-    model: BaseChatModel,
+class _Verbatim(AgentMiddleware[Any, Any, Any]):
+    """Sends the model EXACTLY the messages answer() built, with NO tools.
+
+    create_deep_agent adds its base prompt, file system and subagent instructions, and their tools;
+    without this the lead's replies drift from the 40-word orb copy. Loosen it here to give the lead tools.
+    """
+
+    def __init__(self, messages: list[AnyMessage]) -> None:
+        self._messages = messages
+
+    def _exact(self, request: ModelRequest[Any]) -> ModelRequest[Any]:
+        system, *rest = self._messages
+        assert isinstance(system, SystemMessage)
+        return request.override(system_message=system, messages=rest, tools=[])
+
+    def wrap_model_call(self, request: ModelRequest[Any], handler: Callable[..., Any]) -> Any:
+        return handler(self._exact(request))
+
+    async def awrap_model_call(
+        self, request: ModelRequest[Any], handler: Callable[..., Awaitable[Any]]
+    ) -> Any:
+        return await handler(self._exact(request))
+
+
+class _KeepRefusals(AgentMiddleware[Any, Any, Any]):
+    """Takes ModelRefusalMiddleware's place by name, so a refusal comes back as reply text, as before.
+
+    Deep Agents raises on a refusal instead, and server.py would answer "I can't answer right now".
+    """
+
+    @property
+    def name(self) -> str:
+        return "ModelRefusalMiddleware"
+
+
+def _messages(
     history: Iterable[dict[str, str]],
     *,
     patient: str,
@@ -257,8 +293,8 @@ async def answer(
     events: list[dict[str, Any]],
     board: Sequence[dict[str, Any]] = (),
     session: str = "research only",
-) -> str:
-    """One reply after launch. history is the session's messages, the patient's question last."""
+) -> list[AnyMessage]:
+    """The system prompt with the study's live progress, then the session's messages."""
     # ponytail: the last 60 event summaries, not the artifacts; read research.json if answers need the findings in full.
     progress = (
         "\n".join(f"- [{e.get('component')}] {e.get('summary')}" for e in events[-60:]) or "- nothing yet"
@@ -272,8 +308,20 @@ async def answer(
         progress=progress,
         session=session,
     )
-    messages = [SystemMessage(system)] + [
+    turns: list[AnyMessage] = [
         HumanMessage(m["text"]) if m["role"] == "patient" else AIMessage(m["text"]) for m in history
     ]
-    out = await model.ainvoke(messages)
-    return str(out.text).strip()
+    return [SystemMessage(system), *turns]
+
+
+async def answer(model: BaseChatModel, history: Iterable[dict[str, str]], **context: Any) -> str:
+    """One reply after launch, from the lead Deep Agent. history is the session's messages, the question last."""
+    messages = _messages(history, **context)
+    agent = create_deep_agent(
+        model=model,
+        system_prompt=str(messages[0].content),
+        middleware=[_Verbatim(messages), _KeepRefusals()],
+        name="lead",
+    )
+    result = await agent.ainvoke({"messages": messages[1:]})  # pyright: ignore[reportArgumentType]
+    return str(result["messages"][-1].text).strip()
