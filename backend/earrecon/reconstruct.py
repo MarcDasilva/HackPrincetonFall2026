@@ -293,6 +293,7 @@ def reconstruct(photo, out, box, left=False, height_mm=62.0, pad=0.15, mask_path
     px = np.stack([IMG / 2 - IMG / 2 * posed[:, 2], IMG / 2 - IMG / 2 * posed[:, 1]], 1)
     pxi = np.clip(px.round().astype(int), 0, IMG - 1)
     colors = crop[pxi[:, 1], pxi[:, 0]]
+    inside = cmask[pxi[:, 1], pxi[:, 0]] > 0
     if inside.any():
         colors[~inside] = colors[inside].mean(0)
     ov = (crop * 255).astype(np.uint8).copy()
