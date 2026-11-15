@@ -134,6 +134,9 @@ class Budget(Contract):
     max_evaluation_cases: int = Field(default=12, ge=1, le=500)
     max_parallel_evaluations: int = Field(default=2, ge=1, le=32)
     max_research_tool_calls_per_agent: int = Field(default=20, ge=1, le=40)
+    # Wall clock per investigator. Past it, search and read are refused so the agent reports — the
+    # slowest investigator gates synthesis, and the call budget alone let one run past five minutes.
+    max_research_seconds: float = Field(default=150, gt=0, le=3600)
     max_attempts_per_experiment: int = Field(default=2, ge=1, le=5)
     max_plan_revisions: int = Field(default=2, ge=0, le=5)
     max_run_seconds: float = Field(default=1800, gt=0, le=6 * 3600)
