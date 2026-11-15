@@ -7,7 +7,8 @@ field (Kirchhoff). Two checks with exact answers:
   rigid sphere a receiver on the surface of a rigid sphere, sound from far away: the classic series
                solution (Rayleigh; Duda & Martens 1998, JASA 104:3048). Compared as band levels relative
                to frontal incidence, the way the scene grid uses the table.
-Both run on the CPU on a coarse 3 mm grid so they stay deterministic and quick.
+Both run on the CPU on a coarse 3 mm grid so they stay deterministic and quick, with the PML
+hrtf_table adds around the grid; one test runs the sphere without it to show what it removes.
 """
 import math
 
@@ -68,12 +69,11 @@ def _sphere_surface_pressure(ka, cos_gamma, m_max=60):
     return np.abs(terms.sum(0)) / ka ** 2
 
 
-def test_rigid_sphere_matches_the_series_solution():
-    # 90 mm of air around the sphere. The box faces absorb exactly only at normal incidence, so less
-    # air lets oblique reflections back in: with 33 mm the worst band error is 2.9 dB (mean 0.32 dB),
-    # with 90 mm 1.25 dB (mean 0.11 dB). head_grid leaves ~20-23 mm (EAR_PAD_MM, BOX_PAD_MM).
+def _sphere_band_errors(air_mm, pml=None):
+    """dB error per (direction, band <= 4 kHz) against the series solution, relative to frontal
+    incidence, for a 60 mm rigid sphere with `air_mm` of air to the grid edge."""
     a = 60.0                                                # sphere radius, mm
-    shape, origin, (cx, cy, cz) = _box(a + 90.0)
+    shape, origin, (cx, cy, cz) = _box(a + air_mm)
     X, Y, Z = np.meshgrid(cx, cy, cz, indexing="ij")
     solid = X ** 2 + Y ** 2 + Z ** 2 <= a ** 2
     src = _cell(origin, [a + DX, 0.0, 0.0])                 # first air cell outside the sphere, on +x
@@ -81,7 +81,7 @@ def test_rigid_sphere_matches_the_series_solution():
     r_rec = np.linalg.norm(origin + np.array(src) * DX)
 
     az = np.array([0, 45, 90, 135, 180, 225, 270])          # 90 faces the receiver, 270 is the far side
-    F = ht.run_ear(solid, np.zeros(shape, bool), src, origin, DX, CPU, log=lambda m: None, dirs=_dirs(az))
+    F = ht.run_ear(solid, np.zeros(shape, bool), src, origin, DX, CPU, log=lambda m: None, dirs=_dirs(az), pml=pml)
     _, f = ht.bins()
     sim = np.array([ht.band_power(F[i], f) for i in range(len(az))])
 
@@ -91,15 +91,29 @@ def test_rigid_sphere_matches_the_series_solution():
     gamma = np.radians(90.0 - az)                           # angle between +x (receiver) and the source
     ref = np.array([(_sphere_surface_pressure(2 * np.pi * ff / ht.C * r_rec * 1e-3, np.cos(g)) ** 2)
                     .reshape(len(SII_FREQS), 5).mean(1) for g in gamma])
-
-    front = list(az).index(0)
-    sim_db = 10 * np.log10(sim / sim[front])
-    ref_db = 10 * np.log10(ref / ref[front])
     keep = SII_FREQS <= 4000                                # 3 mm cells: ~29 per wavelength at 4 kHz
-    err = np.abs(sim_db - ref_db)[:, keep]
-    assert err.max() < 1.5, f"worst band error {err.max():.2f} dB"       # far side, 4 kHz: staircased sphere
-    assert err.mean() < 0.2, f"mean band error {err.mean():.2f} dB"
+    sim_db = 10 * np.log10(sim / sim[0])[:, keep]
+    ref_db = 10 * np.log10(ref / ref[0])[:, keep]
+    return sim_db - ref_db, sim_db, list(az), SII_FREQS[keep]
+
+
+def test_rigid_sphere_matches_the_series_solution():
+    # 33 mm of air, about what head_grid leaves around the head (EAR_PAD_MM, BOX_PAD_MM), and the PML.
+    err, sim_db, az, bands = _sphere_band_errors(33.0)
+    err = np.abs(err)
+    assert err.max() < 1.2, f"worst band error {err.max():.2f} dB"       # far side, 4 kHz: staircased sphere
+    assert err.mean() < 0.1, f"mean band error {err.mean():.2f} dB"
+    assert err[:, bands <= 800].max() < 0.15, "low bands: nothing but the box edges can spoil these"
     # the physics the scene grid relies on: the near side is louder than the far side at 2-4 kHz
-    hi = (SII_FREQS >= 2000) & keep
     # (the series solution gives 3.5-4 dB there; the staircased far-side bright spot narrows it to ~2.5)
-    assert (sim_db[list(az).index(90), hi] - sim_db[list(az).index(270), hi]).min() > 2
+    hi = bands >= 2000
+    assert (sim_db[az.index(90), hi] - sim_db[az.index(270), hi]).min() > 2
+
+
+def test_pml_removes_the_box_edge_reflections():
+    """Same sphere and box without the PML: the plain absorbing faces reflect obliquely arriving sound
+    (R = (cos θ - 1)/(cos θ + 1)), worst 2.9 dB and mean 0.32 dB; with the PML worst 1.0 and mean 0.06."""
+    plain = np.abs(_sphere_band_errors(33.0, pml=0)[0])
+    pml = np.abs(_sphere_band_errors(33.0)[0])
+    assert plain.mean() > 3 * pml.mean()
+    assert plain.max() > 2.0 > 1.2 > pml.max()
