@@ -1,7 +1,7 @@
 <h1 align="center">Auris</h1>
 
 <p align="center">
-  <img width="760" alt="Auris" src="https://github.com/user-attachments/assets/a831f355-8572-4460-9bc5-e83f83396ca7" />
+  <img width="360" alt="Auris" src="https://github.com/user-attachments/assets/a831f355-8572-4460-9bc5-e83f83396ca7" />
 </p>
 
 We envision a world where hearing aids are cheap and reproducible, without giving up a custom fit.
