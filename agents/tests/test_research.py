@@ -87,6 +87,24 @@ async def test_search_and_read_calls_stop_at_the_budget():
     assert s.calls_used == 2
 
 
+async def test_search_stops_when_research_time_is_up():
+    # Without the deadline the slowest investigator held synthesis for over five minutes.
+    search = FakeSearch()
+    s = ResearchSession(
+        INVESTIGATORS[0],
+        max_tool_calls=6,
+        search=search,
+        reader=FakeReader(),
+        ledger=ResearchLedger(),
+        events=EventBus("s"),
+        post_every=None,
+        max_seconds=0,
+    )
+    assert "Research time is up" in await s.search_literature("one")
+    assert search.queries == []
+    assert s.calls_used == 0
+
+
 async def test_rereading_is_free_and_findings_remain_possible_after_the_budget():
     s, _ = session(max_calls=1)
     await s.read_source(URL, "horn")
@@ -387,3 +405,23 @@ async def test_the_ledger_writes_a_sorted_evidence_tree(tmp_path):
     ]
     assert PASSAGES["acoustic_design_research"] in (tmp_path / "sources/S1.md").read_text()
     assert "source: S1" in (tmp_path / "board/hearing_research/hearing-B1.md").read_text()
+
+
+async def test_a_stopped_study_refuses_search():
+    # The patient said move on: investigators must stop spending calls and report.
+    from horn_study.research import stop_research
+
+    search = FakeSearch()
+    s = ResearchSession(
+        INVESTIGATORS[0],
+        max_tool_calls=6,
+        search=search,
+        reader=FakeReader(),
+        ledger=ResearchLedger(),
+        events=EventBus("s"),
+        post_every=None,
+        study_id="stopped-study",
+    )
+    stop_research("stopped-study")
+    assert "Research time is up" in await s.search_literature("one")
+    assert search.queries == []

@@ -238,3 +238,17 @@ def test_hornsim_study_uses_the_target_ears_own_mesh(tmp_path: Path, monkeypatch
     raw = server.study_request("run1", "s1", TWO_EARS, [])
     server._evaluator(raw)
     assert seen == [str(tmp_path / "run1" / "right" / "ear" / "ear.ply")]
+
+
+def test_move_on_cuts_research_short(api: tuple[TestClient, list[dict[str, Any]]]) -> None:
+    """Catches "move on" going to the model as a question while the patient waits on research to finish."""
+    from horn_study import research
+
+    s = server.fresh("run1") | {"stage": "launched", "study_id": "run1-1"}
+    server.save(s)
+    out = api[0].post("/lead/run1", json={"message": "let's move on"}).json()
+    assert out["reply"] == lead.MOVE_ON
+    assert server.load("run1")["stage"] == "sim_ready"
+    assert "run1-1" in research._STOPPED
+    assert not lead.moving_on("what's next?")
+    assert not lead.moving_on("should I continue wearing my old aid at the gym")

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -64,6 +65,15 @@ MIN_ABSTRACT_CHARS = 200
 # (software documentation, repositories, general web pages). The rest must come from the literature.
 MAX_NON_SCHOLARLY_FINDINGS = 1
 _FILE_TOOLS = ("ls", "read_file", "grep")
+
+# ponytail: in-process only — server.py runs the study in its own event loop. A file flag if the study
+# ever moves to another process.
+_STOPPED: set[str] = set()
+
+
+def stop_research(study_id: str) -> None:
+    """The patient said move on: every investigator of this study is refused further search and read."""
+    _STOPPED.add(study_id)
 
 
 @dataclass(frozen=True)
@@ -350,8 +360,12 @@ class ResearchSession:
         ledger: ResearchLedger,
         events: EventBus,
         post_every: int | None = POST_EVERY,
+        max_seconds: float | None = None,
+        study_id: str | None = None,
     ) -> None:
         self.spec = spec
+        self.study_id = study_id
+        self._deadline = None if max_seconds is None else time.monotonic() + max_seconds
         self.post_every = post_every
         self.unposted = 0
         self.max_tool_calls = max_tool_calls
@@ -367,6 +381,11 @@ class ResearchSession:
     # -- budget ------------------------------------------------------------
 
     def _spend(self) -> str | None:
+        if self.study_id in _STOPPED or (self._deadline is not None and time.monotonic() >= self._deadline):
+            return (
+                "Research time is up. Record any remaining findings from sources you have already "
+                "read, then give your final report."
+            )
         if self.calls_used >= self.max_tool_calls:
             return (
                 f"Research budget used up ({self.calls_used}/{self.max_tool_calls} search and "
@@ -711,7 +730,14 @@ async def run_investigator(
     started = datetime.now(UTC)
     budget = package.budget.max_research_tool_calls_per_agent
     session = ResearchSession(
-        spec, max_tool_calls=budget, search=search, reader=reader, ledger=ledger, events=events
+        spec,
+        max_tool_calls=budget,
+        search=search,
+        reader=reader,
+        ledger=ledger,
+        events=events,
+        max_seconds=package.budget.max_research_seconds,
+        study_id=package.study_id,
     )
     tools = session.tools()
     allowed = frozenset({t.name for t in tools} | set(_FILE_TOOLS) | {InvestigatorOutput.__name__})

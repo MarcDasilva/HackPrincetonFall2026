@@ -476,6 +476,12 @@ async def post_lead(run_id: str, body: Message) -> dict[str, Any]:
             launch(s)
             if s.get("error"):
                 reply = f"Research could not start: {s['error']}"
+    elif s["stage"] == "launched" and s.get("study_id") and lead.moving_on(text):
+        # The investigators wrap up in the background; the scene picker reads whatever they posted by then.
+        from horn_study.research import stop_research
+
+        stop_research(s["study_id"])
+        s["stage"], reply = "sim_ready", lead.MOVE_ON
     else:
         fixed, s["stage"], ask = lead.flow(s["stage"], text)
         if s["stage"] == "sim_prep":

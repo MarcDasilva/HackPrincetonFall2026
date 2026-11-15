@@ -45,6 +45,7 @@ WAIT = "Okay, I'll wait. Tell me anything else, or say yes when you're ready."
 LAUNCH = "Four agents are researching your aid. Ask me anything."
 
 SIM_READY = "Great, all done. Ready to run the simulation?"
+MOVE_ON = "Okay, moving on with what the research has found so far. Ready to run the simulation?"
 ASK_SIM = "Ready to run the simulation?"
 SIM_COUNT = "How many simulations should I run? Pick a number from 1 to 100."
 COUNT_AGAIN = "I need a number from 1 to 100. How many simulations should I run?"
@@ -113,6 +114,14 @@ def step(stage: Stage, text: str) -> tuple[str, Stage, str | None]:
     if stage == "begin" and answer == "no":
         return WAIT, "begin", None
     return f"{NOTED} {BEGIN}", "begin", text
+
+
+def moving_on(text: str) -> bool:
+    """A short "continue" / "move on" / "skip" during research: the patient wants the next step NOW."""
+    words = re.findall(r"[a-z']+", text.lower())
+    # "next" is left out: "what's next?" is a question, not a request to cut research short.
+    said = re.search(r"\b(continue|move on|moving on|skip|go on)\b", " ".join(words))
+    return 0 < len(words) <= 4 and said is not None
 
 
 def count(text: str) -> int | None:
