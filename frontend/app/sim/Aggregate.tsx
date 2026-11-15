@@ -25,12 +25,14 @@ type Props = {
   pid: string; design: DesignStatus; designStale: boolean; canDesign: boolean;
   /** a design is running for either ear (the button designs both) */
   designing: boolean; onDesign: () => void;
+  /** 3D optimisation of both earpieces for the scenes: progress text while running, null when idle */
+  optimizing: string | null; onOptimize: () => void;
   wave: WaveStatus; onWaveCheck: () => void;
 };
 // 3D-measured gain, one line per talker direction (categorical slots 3 and 4, fixed order)
 const WAVE_COLORS = ["var(--series-3)", "var(--series-4)"];
 
-export default function Aggregate({ ear, rows, target, need, nal, complete, total, pid, design, designStale, canDesign, designing, onDesign, wave, onWaveCheck }: Props) {
+export default function Aggregate({ ear, rows, target, need, nal, complete, total, pid, design, designStale, canDesign, designing, onDesign, optimizing, onOptimize, wave, onWaveCheck }: Props) {
   const [hover, setHover] = useState<{ band: number; row?: number; x: number; y: number } | null>(null);
   const res = design.status === "done" ? design.result ?? null : null;
   const G = res?.design.gain_mean_db, Gw = res?.design.gain_worst_db, reach = res?.reach_db;
@@ -136,6 +138,11 @@ export default function Aggregate({ ear, rows, target, need, nal, complete, tota
         <button className={styles.primary} disabled={!canDesign || designing} onClick={onDesign}>
           {designing ? "Designing both…" : res ? "Redesign both earpieces" : "Design both earpieces"}
         </button>
+        <button className={styles.primary} disabled={designing || !!optimizing} onClick={onOptimize}
+          title="Search earpiece shapes with the 3D head simulation for these scenes (a few minutes per ear)">
+          {optimizing ? "Optimising in 3D…" : "Optimise in 3D"}
+        </button>
+        {optimizing && <span className={styles.caption}>{optimizing}</span>}
         {res && !busy && (
           <button className={styles.btn} disabled={waveBusy} onClick={onWaveCheck}>
             {waveBusy ? "3D wave sim running…" : wv ? `Re-check ${ear.toLowerCase()} in 3D` : `Check ${ear.toLowerCase()} with 3D wave sim`}
@@ -146,6 +153,10 @@ export default function Aggregate({ ear, rows, target, need, nal, complete, tota
         {!busy && res && designStale && <span className={styles.caption}>scenes changed</span>}
       </div>
       {design.status === "error" && <p className={styles.errorBox}>{ear} earpiece design failed: {design.error}</p>}
+      {res && (res as unknown as { optimizer?: { benefit: number; dx_mm: number } }).optimizer && (() => {
+        const o = (res as unknown as { optimizer: { benefit: number; dx_mm: number } }).optimizer;
+        return <p className={styles.caption}>Optimised in 3D ({o.dx_mm} mm): {o.benefit >= 0 ? "+" : ""}{(o.benefit * 100).toFixed(1)} points of hearing index on average across the scenes, versus no earpiece.</p>;
+      })()}
       {wave.status === "error" && <p className={styles.errorBox}>3D wave check failed: {wave.error}</p>}
       {res?.design.files["earpiece_in_ear.glb"] && (
         <>

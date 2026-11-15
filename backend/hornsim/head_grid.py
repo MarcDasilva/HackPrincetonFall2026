@@ -128,9 +128,12 @@ def to_index(p, origin, dx, shape):
     return tuple(int(v) for v in i)
 
 
-def export(out, ears, dx=3.0, faces=7000, head=None):
+def export(out, ears, dx=3.0, faces=7000, head=None, pieces=None):
     """ears: {"left": ear.ply, "right": ear.ply} (earrecon output: the left one already mirrored).
-    head: a hornsim.head_shape.HeadShape (the patient's, from a front photo); default the average head."""
+    head: a hornsim.head_shape.HeadShape (the patient's, from a front photo); default the average head.
+    pieces: optional {"left": earpiece_print.stl, "right": ...} in each ear's own frame (hornsim.earpiece
+    output for that patient): voxelized into the head, so the grid is the AIDED head.
+    out: JSON path, or None to only return the data (hornsim.hrtf_table builds finer grids this way)."""
     head = head or head_shape.average()
     cfg = load_defaults()
     cfg["ear_world"]["landmarks_xlsx"] = os.environ.get(
@@ -168,6 +171,19 @@ def export(out, ears, dx=3.0, faces=7000, head=None):
         solid &= ~((t > -3) & (t < ws.CANAL_LEN_MM) & (r < rc))
         drum = (t >= ws.CANAL_LEN_MM - dx) & (t < ws.CANAL_LEN_MM) & (r < rc)
         ear_out[side] = {"drum": drum, "axis": axis, "mesh": mesh, "world": world, "mount": m}
+
+    for side, path in (pieces or {}).items():          # the earpieces, placed like their ears
+        import trimesh
+        piece = trimesh.load(path, force="mesh")
+        m = ear_out[side]["mount"]
+        v = m.to_head(piece.vertices)
+        piece = trimesh.Trimesh(v, piece.faces, process=False)
+        a = np.clip(np.floor((piece.bounds[0] - lo) / dx).astype(int), 0, None)
+        b = np.minimum(np.ceil((piece.bounds[1] - lo) / dx).astype(int) + 1, shape)
+        idx = np.stack(np.meshgrid(*[np.arange(i, j) for i, j in zip(a, b)], indexing="ij"), -1).reshape(-1, 3)
+        inside = piece.contains(lo + idx * dx)
+        solid[tuple(idx[inside].T)] = True
+        ear_out[side]["piece_cells"] = int(inside.sum())
 
     for side, e in ear_out.items():
         m, world, axis = e["mount"], e["world"], e["axis"]
@@ -213,8 +229,10 @@ def export(out, ears, dx=3.0, faces=7000, head=None):
         "canal_len_mm": ws.CANAL_LEN_MM, "eardrum_z": ws.EARDRUM_Z,
         "front": [0.0, 0.0, -1.0], "right": [1.0, 0.0, 0.0], "head": head.to_json(),
         "solid_b64": base64.b64encode(np.packbits(solid.ravel())).decode(),
-        "ears": {s: e["out"] for s, e in ear_out.items()},
+        "ears": {s: {**e["out"], "piece_cells": e.get("piece_cells", 0)} for s, e in ear_out.items()},
     }
+    if out is None:
+        return data
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     tmp = out + ".tmp"
     json.dump(data, open(tmp, "w"))

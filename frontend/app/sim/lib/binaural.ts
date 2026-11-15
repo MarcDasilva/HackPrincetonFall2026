@@ -173,16 +173,15 @@ export class ScenePlayer {
   }
 
   /** One update at a time (a drag fires many; overlapping ones would start a source twice). */
-  update(sources: Source[], tfs: Record<string, EarTF>, refKey: string, gainDb: Record<"left" | "right", number[]>, condKey: string) {
-    this.queue = this.queue.then(() => this.apply(sources, tfs, refKey, gainDb, condKey)).catch(() => {});
+  update(sources: Source[], tfs: Record<string, EarTF>, ref: EarTF, gainDb: Record<"left" | "right", number[]>, condKey: string) {
+    this.queue = this.queue.then(() => this.apply(sources, tfs, ref, gainDb, condKey)).catch(() => {});
     return this.queue;
   }
 
-  private async apply(sources: Source[], tfs: Record<string, EarTF>, refKey: string, gainDb: Record<"left" | "right", number[]>, condKey: string) {
+  /** ref: the OPEN ears' frontal response, the equalisation for every condition (aided included). */
+  private async apply(sources: Source[], tfs: Record<string, EarTF>, ref: EarTF, gainDb: Record<"left" | "right", number[]>, condKey: string) {
     if (this.closed) return;
     if (this.ctx.state === "suspended") await this.ctx.resume();
-    const ref = tfs[refKey];
-    if (!ref) return;
     const keep = new Set(sources.map((s) => s.id));
     const offset = playbackOffsetDb(sources);
     for (const [id, v] of this.voices) if (!keep.has(id)) { this.fadeOut(v); this.voices.delete(id); }

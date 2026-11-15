@@ -9,6 +9,10 @@ coarse wave grid (hornsim.head_grid), and per ear an earpiece designed from the 
     POST /api/sim/scene_sets                                {source, scenes} -> validated, stored -> id
     POST /api/sim/scene_sets/suggest                        a needs profile -> suggested scene set (stored)
     GET  /api/sim/scene_sets/{sid}                          a stored scene set (/sim?scenes=<sid>)
+    POST /api/sim/hrtf?left&right[&shape][&aided=1]         start each ear's direction table (hornsim.hrtf_table)
+    GET  /api/sim/hrtf?left&right[&shape][&aided=1]         status, and the table when done
+    POST /api/sim/optimize                                  optimise both earpieces in 3D for the scenes (hornsim.optimize_earpiece)
+    GET  /api/sim/optimize?left&right[&shape]               progress and result
     POST /api/sim/patients/{pid}/design                     {audiogram_db_hl, scenes} -> 202
     GET  /api/sim/patients/{pid}/design                     status, log, result
     GET  /api/sim/patients/{pid}/design/files/{did}/{name}  earpiece mesh / print / preview
@@ -27,6 +31,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -38,7 +43,7 @@ router = APIRouter(prefix="/api/sim")
 AVERAGE_IDS = {"right": "000000000000", "left": "000000000001"}
 AVERAGE_SIDE = {v: k for k, v in AVERAGE_IDS.items()}
 ID_RE = re.compile(r"^[a-f0-9]{12}$")
-DESIGN_RE = re.compile(r"^grid\d{1,2}$")
+DESIGN_RE = re.compile(r"^(grid\d{1,2}|opt\d{1,3})$")
 DESIGN_FILES = {"earpiece_in_ear.glb": "model/gltf-binary", "earpiece.glb": "model/gltf-binary",
                 "earpiece_print.stl": "model/stl", "preview.png": "image/png"}
 EXAMPLE_AUDIOGRAM = {"250": 15, "500": 20, "1000": 30, "2000": 45, "4000": 55, "6000": 55}
@@ -100,6 +105,196 @@ def _patient_info(pid, job):
     return {"id": pid, "average_ear": pid in AVERAGE_SIDE, "side": req.get("side", "right"),
             "audiogram_db_hl": req.get("audiogram_db_hl", EXAMPLE_AUDIOGRAM),
             "audiogram_is_example": bool(req.get("audiogram_is_example", True))}
+
+
+# ---------------------------------------------------------------- direction tables (hornsim.hrtf_table)
+# Each ear's response to every direction, by reciprocity: two GPU runs per head at HRTF_DX instead of
+# one browser run per talker direction. aided=1 voxelizes both designed earpieces into the head, so
+# "with earpieces" is simulated, not a gain added from the 1D model.
+HRTF_DX = float(os.environ.get("HRTF_DX", "1.5"))
+_hrtf_pool = ThreadPoolExecutor(max_workers=1)
+
+
+def _hrtf_key(left, right, shape, aided):
+    from hornsim import hrtf_table
+    pieces = None
+    if aided:
+        pieces = {}
+        for side, pid in (("left", left), ("right", right)):
+            d, _ = _patient(pid)
+            st = json.load(open(_status_path(d))) if os.path.exists(_status_path(d)) else {}
+            did = ((st.get("result") or {}).get("design") or {}).get("id")
+            stl = os.path.join(d, "aid", did or "-", "earpiece_print.stl")
+            if st.get("status") != "done" or not did or not os.path.exists(stl):
+                raise HTTPException(409, f"design the {side} earpiece first")
+            pieces[side] = stl
+    tag = "open" if not aided else f"aided_{os.path.basename(os.path.dirname(pieces['left']))}_{os.path.basename(os.path.dirname(pieces['right']))}"
+    base = os.path.join(settings.data_dir, "heads", f"{left}_{right}_{shape or 'average'}", f"hrtf_{tag}_dx{HRTF_DX:g}_r{hrtf_table.RUN_S * 1e3:g}ms")
+    return base, pieces
+
+
+def _run_hrtf(base, ears, head, pieces):
+    from hornsim import head_grid, hrtf_table
+    st = base + ".status.json"
+    try:
+        json.dump({"status": "running", "started_at": time.time()}, open(st, "w"))
+        t0 = time.time()
+        grid = head_grid.export(None, ears, dx=HRTF_DX, head=head, pieces=pieces)
+        table = hrtf_table.compute(grid, log=lambda m: None)
+        out = {**hrtf_table.to_json(table), "dx_mm": HRTF_DX, "aided": bool(pieces),
+               "piece_cells": {s: grid["ears"][s].get("piece_cells", 0) for s in ("left", "right")},
+               "elapsed_s": round(time.time() - t0, 1)}
+        json.dump(out, open(base + ".json.tmp", "w"))
+        os.replace(base + ".json.tmp", base + ".json")
+        json.dump({"status": "done", "elapsed_s": out["elapsed_s"]}, open(st, "w"))
+    except Exception as e:
+        json.dump({"status": "error", "error": str(e), "trace": traceback.format_exc(limit=3)}, open(st, "w"))
+
+
+def _hrtf_inputs(left, right, shape):
+    ears = {}
+    for side, pid in (("left", left), ("right", right)):
+        d, job = _patient(pid)
+        if _patient_info(pid, job)["side"] != side:
+            raise HTTPException(422, f"patient {pid} is not a {side} ear scan")
+        ears[side] = json.load(open(os.path.join(d, "context", "context.json")))["config"]["patient"]["ear_mesh"]
+    return ears, _load_shape(shape)
+
+
+@router.post("/hrtf", status_code=202)
+def start_hrtf(left: str, right: str, shape: str | None = None, aided: bool = False):
+    ears, head = _hrtf_inputs(left, right, shape)
+    base, pieces = _hrtf_key(left, right, shape, aided)
+    os.makedirs(os.path.dirname(base), exist_ok=True)
+    st = base + ".status.json"
+    if os.path.exists(base + ".json") or (os.path.exists(st) and json.load(open(st)).get("status") in ("queued", "running")):
+        return {"status": "exists"}
+    json.dump({"status": "queued"}, open(st, "w"))
+    _hrtf_pool.submit(_run_hrtf, base, ears, head, pieces)
+    return {"status": "queued"}
+
+
+@router.get("/hrtf")
+def get_hrtf(left: str, right: str, shape: str | None = None, aided: bool = False):
+    _hrtf_inputs(left, right, shape)
+    base, _ = _hrtf_key(left, right, shape, aided)
+    if os.path.exists(base + ".json"):
+        return {"status": "done", "table": json.load(open(base + ".json"))}
+    st = base + ".status.json"
+    return json.load(open(st)) if os.path.exists(st) else {"status": "none"}
+
+
+# ---------------------------------------------------------------- 3D earpiece optimisation (hornsim.optimize_earpiece)
+
+class OptSource(BaseModel):
+    role: str
+    az: float
+    el: float = 0.0
+    level_db: float = Field(ge=30, le=110)
+    target: bool | None = None
+
+
+class OptScene(BaseModel):
+    name: str = Field("", max_length=80)
+    weight: float = Field(1.0, ge=0, le=10)
+    sources: list[OptSource] = Field(min_length=1, max_length=8)
+
+
+class OptimizeRequest(BaseModel):
+    left: str
+    right: str
+    shape: str | None = None
+    audiogram: dict[str, dict[str, float]]           # {"left": {"250": 15, ...}, "right": {...}}
+    scenes: list[OptScene] = Field(min_length=1, max_length=16)
+    budget: int = Field(30, ge=6, le=120)
+
+
+def _opt_path(left, right, shape):
+    return os.path.join(settings.data_dir, "heads", f"{left}_{right}_{shape or 'average'}", "optimize.json")
+
+
+def _opt_result(pid, d, r, prev):
+    """The winner as this patient's scene_design result, in the shape the scene grid reads."""
+    b = r["best"]
+    gm, gw = np.array(b["insertion_front_db"]), np.array(b["insertion_worst_db"])
+    T = np.array(prev.get("target_db") or [0.0] * len(gm))
+    files = {k: f"aid/{b['design_id']}/{k}" for k in ("earpiece_in_ear.glb", "earpiece.glb", "earpiece_print.stl", "preview.png")
+             if os.path.exists(os.path.join(d, "aid", b["design_id"], k))}
+    pairs = [(n, round(u, 3), round(a, 3)) for n, u, a in zip(r["scene_names"], r["unaided"], b["aided"]) if u is not None]
+    return {**{k: prev[k] for k in ("freqs_hz", "target_db", "share", "key_bands_hz", "guard_bands_hz", "triage", "why") if k in prev},
+            "version": 2, "freqs_hz": r["freqs_hz"], "target_db": T.tolist(), "reach_db": gm.tolist(),
+            "share": prev.get("share") or [1 / len(gm)] * len(gm), "key_bands_hz": prev.get("key_bands_hz", []),
+            "guard_bands_hz": prev.get("guard_bands_hz", []), "triage": prev.get("triage", "passive-suitable"),
+            "why": prev.get("why", "optimised in 3D for the scenes"),
+            "design": {"id": b["design_id"], "params": b["params"], "objective": round(b["benefit"], 4),
+                       "gain_mean_db": gm.tolist(), "gain_worst_db": gw.tolist(),
+                       "key_met": "", "met": ((T < 1.0) | (gm >= T - 1.0)).tolist(),
+                       "geometry": b.get("geometry", {}), "files": files},
+            "attempts": [{"design_id": h["design_id"], "objective": round(h.get("benefit", float("nan")), 4) if h["ok"] else None,
+                          "ok": h["ok"], "reasons": h.get("reasons", [])} for h in r["history"]],
+            "swept": len(r["history"]), "elapsed_s": r["elapsed_s"],
+            "optimizer": {"method": "Bayesian optimisation on the 3D head simulation", "dx_mm": r["dx_mm"],
+                          "benefit": round(b["benefit"], 4), "scenes": [{"name": n, "without": u, "with": a} for n, u, a in pairs]},
+            "notes": [f"Optimised against the 3D head simulation ({r['dx_mm']} mm, reciprocity) for the scene grid's scenes: "
+                      "the objective is the scene-weighted gain in SII/audibility over wearing nothing.",
+                      "gain_mean_db is the simulated insertion gain for a talker in front; gain_worst_db the lowest over the scenes' directions."]}
+
+
+def _run_optimize(req, ears, head, path):
+    from hornsim import optimize_earpiece as oe
+    state = {"status": "running", "started_at": time.time(), "progress": {}, "log": []}
+
+    def save():
+        json.dump(state, open(path + ".tmp", "w"), default=float)
+        os.replace(path + ".tmp", path)
+
+    try:
+        save()
+        scenes = [{"name": s["name"], "weight": s["weight"], "sources": [{k: v for k, v in x.items() if v is not None} for x in s["sources"]]}
+                  for s in req["scenes"]]
+        for side in ("left", "right"):
+            pid = req[side]
+            d, _ = _patient(pid)
+            ag = {float(k): float(v) for k, v in req["audiogram"][side].items()}
+
+            def prog(pg, side=side):
+                state["progress"][side] = pg
+                save()
+            r = oe.optimize(d, side, ears, head, scenes, ag, budget=req["budget"],
+                            log=lambda m: state["log"].append(f"{time.strftime('%H:%M:%S')} {m}"), progress=prog)
+            if not r["best"]:
+                raise ValueError(f"no {side} earpiece passed the geometry checks")
+            prev = (json.load(open(_status_path(d))).get("result") or {}) if os.path.exists(_status_path(d)) else {}
+            _write_status(d, status="done", result=_opt_result(pid, d, r, prev), finished_at=time.time(), log=state["log"][-20:])
+            state.setdefault("results", {})[side] = {"design_id": r["best"]["design_id"], "benefit": r["best"]["benefit"]}
+        state["status"] = "done"
+        save()
+    except Exception as e:
+        state.update(status="error", error=str(e), trace=traceback.format_exc(limit=3))
+        save()
+
+
+@router.post("/optimize", status_code=202)
+def start_optimize(body: OptimizeRequest):
+    from hornsim import scene_spec
+    for s in body.scenes:
+        for x in s.sources:
+            if x.role not in scene_spec.SOUNDS:
+                raise HTTPException(422, f"unknown sound {x.role!r}")
+    ears, head = _hrtf_inputs(body.left, body.right, body.shape)
+    path = _opt_path(body.left, body.right, body.shape)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path) and json.load(open(path)).get("status") == "running":
+        raise HTTPException(409, "an optimisation is already running for these ears")
+    json.dump({"status": "queued"}, open(path, "w"))
+    _hrtf_pool.submit(_run_optimize, body.model_dump(), ears, head, path)
+    return {"status": "queued"}
+
+
+@router.get("/optimize")
+def optimize_status(left: str, right: str, shape: str | None = None):
+    path = _opt_path(left, right, shape)
+    return json.load(open(path)) if os.path.exists(path) else {"status": "none"}
 
 
 # ---------------------------------------------------------------- scene sets (hornsim.scene_spec)
