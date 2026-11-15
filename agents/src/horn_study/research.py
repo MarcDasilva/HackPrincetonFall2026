@@ -843,7 +843,11 @@ class _Dispatch(AgentMiddleware[Any, Any, Any]):
         if done:
             return AIMessage(f"All {_WORDS[len(done)]} investigators reported.")
         calls = [
-            {"name": "task", "args": {"description": self._brief, "subagent_type": spec.name}, "id": f"dispatch_{spec.name}"}
+            {
+                "name": "task",
+                "args": {"description": self._brief, "subagent_type": spec.name},
+                "id": f"dispatch_{spec.name}",
+            }
             for spec in INVESTIGATORS
         ]
         return AIMessage("", tool_calls=calls)
@@ -851,7 +855,9 @@ class _Dispatch(AgentMiddleware[Any, Any, Any]):
     def wrap_model_call(self, request: ModelRequest[Any], handler: Callable[..., Any]) -> Any:
         return self._turn(request)
 
-    async def awrap_model_call(self, request: ModelRequest[Any], handler: Callable[..., Awaitable[Any]]) -> Any:
+    async def awrap_model_call(
+        self, request: ModelRequest[Any], handler: Callable[..., Awaitable[Any]]
+    ) -> Any:
         return self._turn(request)
 
 
@@ -877,7 +883,11 @@ async def run_research_lead(
             summary = branch.output.summary if branch.output else branch.error or branch.status
             return {"messages": [AIMessage(f"{spec.title}: {branch.status}. {summary}")]}
 
-        return {"name": spec.name, "description": spec.question, "runnable": RunnableLambda(run, name=spec.name)}
+        return {
+            "name": spec.name,
+            "description": spec.question,
+            "runnable": RunnableLambda(run, name=spec.name),
+        }
 
     lead = create_deep_agent(
         model=model,
@@ -887,7 +897,11 @@ async def run_research_lead(
     )
     await lead.ainvoke(
         {"messages": [{"role": "user", "content": "Run the study's research."}]},
-        config={"run_name": "research_lead", "tags": ["research"], "metadata": {"study_id": package.study_id}},
+        config={
+            "run_name": "research_lead",
+            "tags": ["research"],
+            "metadata": {"study_id": package.study_id},
+        },
     )
     # A missing investigator here is a lead bug, never a research outcome — fail loudly, not with less evidence.
     return [results[spec.name] for spec in INVESTIGATORS]

@@ -1,7 +1,7 @@
 # horn-study: research and experiment-planning agents
 
 This package is the agent workstream for the passive acoustic hearing device project.
-It takes a profile with existing hearing-test results and optional needs, researches the question in three parallel branches, forms hypotheses, freezes one finite experiment plan, sends that plan to the team's evaluator, explains the returned results, and stops.
+It takes a profile with existing hearing-test results and optional needs, has a research lead run four investigators in parallel, forms hypotheses, freezes one finite experiment plan, sends that plan to the team's evaluator, explains the returned results, and stops.
 
 The product starts after hearing testing.
 Users supply their existing results.
@@ -35,12 +35,15 @@ Exit codes: `0` completed, `1` failed, `2` input rejected, `3` configuration pro
 ```mermaid
 flowchart TD
     I["Validate input, read capabilities, create study"]
-    I --> H["hearing_research"]
-    I --> U["use_context_research"]
-    I --> A["acoustic_design_research"]
+    I --> L["research_lead"]
+    L --> H["hearing_research"]
+    L --> U["use_context_research"]
+    L --> A["acoustic_design_research"]
+    L --> F["ear_fit_research"]
     H --> S["synthesize_evidence"]
     U --> S
     A --> S
+    F --> S
     S --> P["plan_experiments (coordinator)"]
     P --> V["validate_and_freeze_plan"]
     V -- "validation errors, before freezing" --> P
@@ -56,7 +59,7 @@ No edge leads from evaluation or interpretation back to planning.
 
 | Phase | Who | Can do | Cannot do |
 | --- | --- | --- | --- |
-| Research | Three Deep Agents, run concurrently by LangGraph | Search literature, read sources, record findings, read saved source text | Run the evaluator, write files, run shell commands, spawn subagents |
+| Research | A lead Deep Agent whose four investigator subagents run concurrently; code scripts the lead's dispatch so every investigator gets the same package | Search literature, read sources, record findings, read saved source text | Run the evaluator, write files, run shell commands, spawn subagents |
 | Planning | Coordinator model with no tools | Propose hypotheses, candidates, scenarios, and a selection rule | Freeze its own plan, skip the coverage the evaluator requires, or relax the per-scenario rule. Code validates the plan against capabilities and budget. |
 | Evaluation | Bounded runner (code) | Evaluate each frozen spec, retry the identical spec after a transient failure | Change a spec, add a case, turn a failure into a number |
 | Interpretation | Model with no tools | Explain the computed comparison, judge hypotheses, suggest follow-ups | Change scores or the selection, run anything |
@@ -535,7 +538,7 @@ Tests drive the real workflow with a scripted stand-in model and offline sources
 | `contracts.py` | Typed request, capability, finding, plan, result, report, and state models |
 | `intake.py` | Input validation and normalization against evaluator capabilities |
 | `sources.py` | Literature search, source reading, passage selection, quote verification |
-| `research.py` | The three investigators, their tools, budget, and evidence ledger |
+| `research.py` | The research lead, its four investigators, their tools, budget, and evidence ledger |
 | `planner.py` | Coordinator prompt, plan validation, deterministic expansion, freezing |
 | `evaluator_adapter.py` | Evaluator protocol, real-evaluator loader, labeled development fixture |
 | `hornsim_evaluator.py` | The real evaluator: capabilities and results from the backend's hornsim pipeline |
