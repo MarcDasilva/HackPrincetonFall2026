@@ -23,7 +23,7 @@ import uuid
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
@@ -265,6 +265,12 @@ def rerun_waves(pid: str):
     return {"id": pid, "status_url": f"/api/patients/{pid}"}
 
 
+WAVES_PENDING = """<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="20">
+<body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#fff;
+font:12px/1.5 Inter,system-ui,sans-serif;color:#6b7280;text-align:center;padding:16px;box-sizing:border-box">
+<p data-testid="waves-pending">This ear's wave simulation is still running.<br>The view appears here when it finishes.</p>"""
+
+
 def _wave_file(d, name):
     """Names are flat and pattern-checked, so a request can NEVER leave the waves folder."""
     if not WAVE_FILE_RE.match(name):
@@ -288,7 +294,12 @@ def _ear_dir(pid, ear):
 def get_ear_wave_file(pid: str, ear: str, name: str):
     """The wave viewer and its frames. The viewer fetches ear.json, runs.json and frames by RELATIVE
     URL, so they MUST stay under the same /waves/{ear}/ path as index.html."""
-    return _wave_file(_ear_dir(pid, ear), name)
+    d = _ear_dir(pid, ear)
+    if name == "index.html" and not os.path.isfile(os.path.join(d, "waves", name)):
+        # The viewer sits in an iframe while the ear's wave runs (~25 min) are still going: a 404's JSON body showed there
+        # as raw text. This page reloads itself until index.html exists — ONLY index.html, data files still 404.
+        return HTMLResponse(WAVES_PENDING)
+    return _wave_file(d, name)
 
 
 @app.get("/api/patients/{pid}/waves/{name}")

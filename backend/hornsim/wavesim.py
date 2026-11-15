@@ -45,6 +45,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 C = 343.0                 # speed of sound, m/s
 CANAL_LEN_MM = 25.0       # opening to eardrum; ASSUMPTION, typical adult
 MARGIN_MM = 15.0          # air between the farthest object and the box edge
+# The viewer runs (simulate) show this air as the wave field round the ear: a WIDE margin so the waves read in room, not a
+# tight crop. Measurements (aided_wave) keep MARGIN_MM — the box size does not change what reaches the eardrum, only the cost.
+VIEW_MARGIN_MM = 50.0
 # Eardrum loss as a resistance relative to air's characteristic impedance. A CALIBRATION KNOB, not a
 # measured value: a rigid, lossless eardrum makes the canal ring with a ~40 dB peak, far above the
 # published 10-20 dB open-ear gain. 3.0 puts the average ear's eardrum peak at 2.6 kHz, 18.3 dB
@@ -82,11 +85,10 @@ def speaker_position(world, front, az, el, dist):
     return world.canal_point + dist * d
 
 
-def grid_for(mesh, world, speakers, dx):
-    """Box covering ear, canal and every speaker, plus margin. Returns origin (mm), shape."""
+def grid_for(mesh, world, speakers, dx, pad=MARGIN_MM):
+    """Box covering ear, canal and every speaker, plus `pad` mm of air. Returns origin (mm), shape."""
     canal_end = world.canal_point + world.canal_axis * CANAL_LEN_MM
     pts = np.vstack([mesh.bounds, canal_end, *speakers])
-    pad = MARGIN_MM
     lo, hi = pts.min(0) - pad, pts.max(0) + pad
     shape = tuple(int(math.ceil(s / dx)) + 1 for s in hi - lo)
     return lo, shape
@@ -387,7 +389,7 @@ def simulate(out, ear_path, left=False, azimuths=(90,), elevations=(0,), dist=12
             t1 = time.time()
             tag = f"az{az:03.0f}_el{el:+03.0f}"
             spk = speaker_position(world, front, az, el, dist)
-            origin, shape = grid_for(mesh, world, [spk], dx)        # one box per position keeps each small
+            origin, shape = grid_for(mesh, world, [spk], dx, VIEW_MARGIN_MM)
             solid = solid_mask(mesh, world, x_head, origin, shape, dx)
             drum = eardrum_cells(world, origin, shape, dx) & ~solid
             rec = [to_index(world.canal_point + world.canal_axis * 1.5, origin, dx, shape),
@@ -441,6 +443,9 @@ def simulate(out, ear_path, left=False, azimuths=(90,), elevations=(0,), dist=12
                 shape[0] // 2, 2, shape[1] // 2, 2, shape[2] // 2, 2).mean((1, 3, 5)) > 0.5
             files["volume"] = {"dims": list(vmask.shape), "box_min": np.round(origin - dx / 2, 2).tolist(),
                                "box_size": [2 * dx * n for n in vmask.shape]}
+            # The viewers' voxel mask, on its OWN: it used to ride ONLY in the tone atlases' blue channel, so a click-only run
+            # (tones_hz=(), the patient pipeline — jobs._waves) had no solid ear in 3D. Both viewers read this first.
+            files["volume"]["mask"] = save_volume(np.zeros(vmask.shape, np.float32), 1.0, os.path.join(out, f"{tag}_mask_vol.png"), vmask)
 
             # 2 · steady tones: complex amplitude relative to the incident wave at the canal entrance
             n_fft = 1 << int(math.ceil(math.log2(n_click * 4)))

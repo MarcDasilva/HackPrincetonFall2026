@@ -2,6 +2,7 @@
 earpiece designed from the grid's scenes (hornsim.scene_design).
 
     GET  /api/sim/patients/{pid}/grid                       ear grid + side + audiogram
+    GET  /api/sim/patients/{pid}/head_grid                  dummy head wearing BOTH ears (hornsim.head_grid)
     POST /api/sim/patients/{pid}/design                     {audiogram_db_hl, scenes} -> 202
     GET  /api/sim/patients/{pid}/design                     status, log, result
     GET  /api/sim/patients/{pid}/design/files/{did}/{name}  earpiece mesh / print / preview
@@ -93,6 +94,30 @@ def _patient(pid, ear=None):
     return d, {"side": ear, "audiogram_db_hl": ag or EXAMPLE_AUDIOGRAM, "audiogram_is_example": example}
 
 
+@router.get("/patients/{pid}/head_grid")
+def get_head_grid(pid: str):
+    """A dummy head (hornsim.head_grid) wearing BOTH of the patient's ears, each its own shape. One plane-wave run on it
+    gives the field round the whole head, so the far ear sits in the head's shadow — the per-ear grid's flat wall cannot
+    show that. Head shape: the average head (head_grid's default). Built once, then cached in head/."""
+    if not ID_RE.match(pid):
+        raise HTTPException(404, "patient not found")
+    job = jobs.read_job(pid)
+    if job is None or "ears" not in job:
+        raise HTTPException(404, "this patient has no two-ear record")
+    out = os.path.join(jobs.head_dir(pid), "head_grid.json")
+    if not os.path.exists(out):
+        ears = {e: os.path.join(jobs.ear_dir(pid, e, job), "ear", "ear.ply") for e in ("left", "right")}
+        missing = [e for e, path in ears.items() if not os.path.exists(path)]
+        if missing:
+            raise HTTPException(409, f"no {' or '.join(missing)} ear mesh yet")
+        from hornsim import head_grid
+        os.makedirs(jobs.head_dir(pid), exist_ok=True)
+        with _lock:
+            if not os.path.exists(out):
+                head_grid.export(out, ears)
+    return FileResponse(out, media_type="application/json")
+
+
 @router.get("/patients/{pid}/grid")
 def get_grid(pid: str, ear: str | None = None):
     d, info = _patient(pid, ear)
@@ -114,6 +139,9 @@ class GridScene(BaseModel):
     weight: float = Field(ge=0, le=100)
     deficit_db: list[float] = Field(min_length=N_BANDS, max_length=N_BANDS)
     deficit_weighted: list[float] | None = Field(None, min_length=N_BANDS, max_length=N_BANDS)
+    # Where the scene's talker is (0 front, 90 straight out from the aided ear); ABSENT aims straight out.
+    talker_az_deg: float | None = Field(None, ge=-360, le=360)
+    talker_el_deg: float | None = Field(None, ge=-90, le=90)
 
 
 class DesignRequest(BaseModel):
@@ -216,17 +244,23 @@ def _run_wave(d, did, azimuths, dx):
 
 
 class WaveCheck(BaseModel):
-    azimuths: list[float] = Field(default_factory=lambda: [0.0, 90.0], min_length=1, max_length=4)
+    # Five is the backend wave runs' own set (0 front ... 180 behind): the validation scores each scene source on its nearest.
+    azimuths: list[float] = Field(default_factory=lambda: [0.0, 90.0], min_length=1, max_length=5)
     dx_mm: float = Field(1.0, ge=0.75, le=2.5)
+    # The design the patient PICKED; ABSENT checks the designer's top choice.
+    design_id: str | None = None
 
 
 @router.post("/patients/{pid}/design/wave_check", status_code=202)
 def start_wave_check(pid: str, body: WaveCheck, ear: str | None = None):
     d, _ = _patient(pid, ear)
     st = json.load(open(_status_path(d))) if os.path.exists(_status_path(d)) else {}
-    did = ((st.get("result") or {}).get("design") or {}).get("id")
+    result = st.get("result") or {}
+    did = body.design_id or (result.get("design") or {}).get("id")
     if st.get("status") != "done" or not did:
         raise HTTPException(409, "design an earpiece first")
+    if did not in {o.get("id") for o in result.get("options") or [result.get("design") or {}]}:
+        raise HTTPException(404, f"no design {did} in this patient's options")
     if any(not (0 <= a <= 180) for a in body.azimuths):
         raise HTTPException(422, "azimuths must be 0-180 (the flat head plane cannot model the far side)")
     if os.path.exists(_wave_path(d)) and json.load(open(_wave_path(d))).get("status") in ("queued", "running"):
@@ -240,3 +274,21 @@ def start_wave_check(pid: str, body: WaveCheck, ear: str | None = None):
 def wave_check_status(pid: str, ear: str | None = None):
     d, _ = _patient(pid, ear)
     return json.load(open(_wave_path(d))) if os.path.exists(_wave_path(d)) else {"status": "none"}
+
+
+SOUNDS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "sounds")
+
+
+@router.get("/sounds/{name}")
+def get_sound(name: str):
+    """One clip of the everyday sound bank (hornsim.sounds: FSD50K, one clip per class, CC BY / CC0 per clip) for the sim
+    view's listening and fields. ONLY names in catalog.json are served, so a request can never leave the bank. The bank is
+    local (data/ is gitignored; `python -m hornsim.sounds fetch` builds it), which keeps the clips out of the repo."""
+    try:
+        catalog = json.load(open(os.path.join(SOUNDS_DIR, "catalog.json")))
+    except FileNotFoundError:
+        raise HTTPException(404, "no sound bank here; run python -m hornsim.sounds fetch")
+    rel = catalog.get(name)
+    if not rel:
+        raise HTTPException(404, "unknown sound")
+    return FileResponse(os.path.join(SOUNDS_DIR, rel), media_type="audio/wav")

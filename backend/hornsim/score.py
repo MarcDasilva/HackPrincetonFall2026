@@ -12,6 +12,9 @@ patient's audiogram. The reward term is the share of the gap it closes:
 """
 import json
 import os
+# Background workers yield the CPU: ONE patient's pool is sized to every core but one, and two patients run at once — at
+# normal priority they starved the next patient's ear reconstruction and the agents' start-up (their capability check took 51 s).
+BACKGROUND_NICE = 10
 import sys
 
 import numpy as np
@@ -55,7 +58,8 @@ def score(patient_dir, n_canals=5, log=print):
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor
     tasks = [(*clips[r["clip"]], freqs, g, ag, r["level_db_spl"], seed) for r in used for g in ig]
-    with ProcessPoolExecutor(max_workers=max(1, min(len(tasks), (os.cpu_count() or 2) - 1)), mp_context=mp.get_context("spawn")) as ex:
+    with ProcessPoolExecutor(max_workers=max(1, min(len(tasks), (os.cpu_count() or 2) - 1)), mp_context=mp.get_context("spawn"),
+                             initializer=os.nice, initargs=(BACKGROUND_NICE,)) as ex:
         scores = list(ex.map(_haspi, tasks))
     rows = []
     for i, r in enumerate(used):

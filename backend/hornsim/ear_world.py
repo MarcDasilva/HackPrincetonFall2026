@@ -149,10 +149,11 @@ def _fit_setup(world, aid_defaults):
     from .aid import DEFAULT, solid_edt   # aid imports this module; importing at call time breaks the cycle
     D = DEFAULT | (aid_defaults or {})
     tip_r = world.canal_diameter_mm / 2 - D["tip_clearance_mm"]
-    # SAME distance map aid.build checks against — aid.clearance indexes it with solid_edt's padding.
-    edt = solid_edt(world, tip_r, D["tip_length_mm"])
+    # SAME distance map aid.build checks against — aid.clearance indexes it with solid_edt's padding. ONE map per canal-stem
+    # length, cached by coil_fits: it reads the second slot as {stem_mm: edt} — a bare array there crashes every fit check.
+    fields = {round(float(D["tip_length_mm"]), 3): solid_edt(world, tip_r, D["tip_length_mm"])}
     top = float((world.origin - world.rim_center) @ world.axes[2] + (world.voxels.shape[2] - 1) * world.voxel_mm)
-    return D, edt, top, tip_r
+    return D, fields, top, tip_r
 
 
 def coil_fits(world, spiral_params, throat_mm2, mouth_mm2, flare_mid1, flare_mid2, canal_stem_mm,

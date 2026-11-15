@@ -3,6 +3,16 @@ from dataclasses import dataclass, field
 
 BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# backend/.env holds the secrets (ANTHROPIC_API_KEY for ear detection, earrecon/detect.py). Read it HERE, at import, so EVERY
+# way of starting the server has them — a restart that forgot to export the file left detection failing with "missing key".
+# A variable already set in the environment wins.
+_env = os.path.join(BACKEND, ".env")
+if os.path.exists(_env):
+    for _line in open(_env):
+        _k, _eq, _v = _line.strip().partition("=")
+        if _eq and _k and not _k.startswith("#"):
+            os.environ.setdefault(_k.strip(), _v.strip().strip("'\""))
+
 
 @dataclass
 class Settings:

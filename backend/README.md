@@ -20,7 +20,7 @@ git submodule update --init                 # AudioEar code + ear model data
 cd backend
 uv venv -p 3.12 .venv && uv pip install -p .venv -r requirements.txt
 PATH=.venv/bin:$PATH ./scripts/fetch_weights.sh   # ~310 MB into weights/
-.venv/bin/uvicorn app.main:app --port 8000
+.venv/bin/uvicorn app.main:app --port 8000 --env-file .env   # .env holds ANTHROPIC_API_KEY (ear detection); nothing else loads it
 ```
 
 Open http://localhost:8000 for the frontend (served from `../frontend`).

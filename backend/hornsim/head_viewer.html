@@ -56,6 +56,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 .rig .key s { width: 9px; height: 9px; border-radius: 50%; }
 .rig .hud { display: none; }
 .key s.neg { background: #2f5fd0; }
+.rig .key s { background: rgb(235, 104, 52); } .rig .key s.neg { background: rgb(57, 135, 229); }
 </style>
 </head>
 <body>
@@ -135,6 +136,10 @@ const scene = new THREE.Scene();
 // Rig: a long lens, close to the thumbnails' isometric view. It stays PERSPECTIVE — the volume shader's depth test assumes it.
 const camera = new THREE.PerspectiveCamera(RIG ? 20 : 30, 1, 5, 8000);
 const controls = new OrbitControls(camera, canvas); controls.enableDamping = true;
+// Middle-drag pans (orbit controls default it to zoom; the wheel already zooms). Its mousedown would also start the
+// browser's autoscroll, which then eats the drag.
+controls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
+canvas.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
 scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8f96, 1.7));
 const key = new THREE.DirectionalLight(0xffffff, 1.1); key.position.set(150, 260, 320); scene.add(key);
 
@@ -189,6 +194,37 @@ if (RIG) {
   const t = label('100 mm', 14, '#111111'); t.position.set(-330, FLOOR + 12, 410);
   rigGroup.add(grid, pole(0, 0, hb.min.y + 10, 14), new THREE.Box3Helper(hb, 0x9a9a9a), bar, t);
 }
+// The picked earpiece on the aided ear (?piece=<earpiece.glb URL>&aided=left|right — the dashboard's validation): orange,
+// placed with THAT ear's mesh_to_head, the frame hornsim.earpiece builds it in. Added AFTER the rig greys the head.
+const PIECE = Q.get('piece'), pieceSide = Q.get('aided') || ONLY, pieceEar = H.ears && H.ears[pieceSide];
+if (PIECE && pieceEar && pieceEar.mesh_to_head) {
+  try {
+    const g = await new GLTFLoader().loadAsync(PIECE);
+    // the GLB carries no normals: without them a lit material shades the piece solid black
+    g.scene.traverse((o) => { if (o.isMesh) { o.geometry.computeVertexNormals(); o.material = new THREE.MeshStandardMaterial({ color: 0xf38c28, roughness: .6, metalness: 0, side: THREE.DoubleSide }); } });
+    g.scene.applyMatrix4(new THREE.Matrix4().set(...pieceEar.mesh_to_head));
+    headGroup.add(g.scene);
+  } catch { /* the rig still draws without it */ }
+}
+// The scene's OWN speakers (?src=az,el,role[,dist_mm];… and ?aided=left|right), placed exactly as frontend app/sim/HeadSnap.ts
+// places them. Without them the rig drew a speaker ONLY once that ear's wave runs existed — ~25 min an ear after upload —
+// and at the run's snapped direction, not the scene's.
+const SCENE_SRC = (Q.get('src') || '').split(';').filter(Boolean).map((t) => { const [az, el, role, d] = t.split(','); return { az: +az || 0, el: +el || 0, role, dist: +d || 0 }; });
+const sceneSpk = new THREE.Group(); scene.add(sceneSpk);
+{
+  const left = (Q.get('aided') || ONLY) === 'left', ringMat = new THREE.LineBasicMaterial({ color: 0x9a9a9a });
+  const circle = new THREE.BufferGeometry().setFromPoints(Array.from({ length: 64 }, (_, i) => new THREE.Vector3(Math.cos(i / 32 * Math.PI), 0, Math.sin(i / 32 * Math.PI))));
+  for (const src of SCENE_SRC) {
+    const a = THREE.MathUtils.degToRad(src.az), e = THREE.MathUtils.degToRad(src.el);
+    const dir = new THREE.Vector3((left ? 1 : -1) * Math.cos(e) * Math.sin(a), Math.sin(e), Math.cos(e) * Math.cos(a));
+    const p = src.dist ? new THREE.Vector3(Math.sign(dir.x || 1) * 85, 0, 0).addScaledVector(dir, src.dist) : dir.clone().multiplyScalar(250);
+    const d = new THREE.Mesh(new THREE.DodecahedronGeometry(16), new THREE.MeshStandardMaterial({ color: src.role === 'babble' ? 0xb4b4b4 : 0x2a2a2a, roughness: .5, flatShading: true }));
+    const edge = new THREE.LineSegments(new THREE.EdgesGeometry(d.geometry), ringMat);
+    d.position.copy(p); edge.position.copy(p); sceneSpk.add(d, edge);
+    if (!src.dist) for (const r of [34, 58, 82]) { const ring = new THREE.LineLoop(circle, ringMat); ring.position.copy(p); ring.scale.setScalar(r); sceneSpk.add(ring); }
+    if (RIG) rigGroup.add(pole(p.x, p.z, p.y - 16, 4));
+  }
+}
 // The volumes draw with depthTest off (they are ray-marched inside their box), so the head's depth comes from a
 // pre-pass into this target — without it a field beside the far side of the head shows THROUGH the head.
 const depthRT = new THREE.WebGLRenderTarget(1, 1, { depthTexture: new THREE.DepthTexture(1, 1) });
@@ -208,7 +244,7 @@ uniform float phase; uniform float iso; uniform float alpha;
 uniform vec3 dims; uniform vec3 boxMin; uniform vec3 boxSize;
 uniform mat4 toHead; uniform float side;
 uniform sampler2D sceneDepth; uniform vec2 res; uniform float near; uniform float far; uniform mat4 mv;
-uniform vec3 posCol; uniform vec3 negCol; uniform float showNeg;
+uniform vec3 posCol; uniform vec3 negCol; uniform float showNeg; uniform float tint;
 varying vec3 vOrigin; varying vec3 vDirection;
 out highp vec4 outColor;
 vec2 hitBox(vec3 o, vec3 d){ vec3 inv = 1.0 / d; vec3 t0 = (-0.5 - o) * inv; vec3 t1 = (0.5 - o) * inv;
@@ -237,6 +273,13 @@ void main(){
     if ((mv * vec4(vOrigin + t * d, 1.0)).z < sceneZ) break;
     if (texture(mask, uv).r > 0.5) break;
     float v = val(uv);
+    // Clip mode: speech is longer than this box, so ±iso surfaces rarely form — tint EVERY cell by its pressure instead.
+    if (tint > 0.5) {
+      float a = clamp(abs(v), 0.0, 1.0); a = pow(a, 1.2) * 0.12;   // above linear: crests and troughs stand out as bands, the near-zero air between them stays clear
+      vec3 col = v > 0.0 ? posCol : negCol;
+      acc.rgb += (1.0 - acc.a) * a * col; acc.a += (1.0 - acc.a) * a;
+      prev = v; has = true; continue;
+    }
     bool crossP = has && (prev - iso) * (v - iso) < 0.0;
     bool crossN = showNeg > 0.5 && has && (prev + iso) * (v + iso) < 0.0;   // the troughs: rarefaction at -iso
     if (crossP || crossN) {
@@ -296,8 +339,8 @@ for (const s of have) {
     uniforms: { field: { value: null }, mask: { value: null }, phase: { value: 0 }, iso: { value: .5 }, alpha: { value: .42 },
       dims: { value: new THREE.Vector3() }, boxMin: { value: new THREE.Vector3() }, boxSize: { value: new THREE.Vector3() },
       toHead: { value: E.toHead }, sceneDepth: { value: depthRT.depthTexture }, res: { value: new THREE.Vector2(1, 1) },
-      near: { value: camera.near }, far: { value: camera.far }, mv: { value: new THREE.Matrix4() }, side: { value: SIGN[s] }, posCol: { value: new THREE.Color('#c8413a') },
-      negCol: { value: new THREE.Color('#2f5fd0') }, showNeg: { value: RIG ? 1 : 0 } } });
+      near: { value: camera.near }, far: { value: camera.far }, mv: { value: new THREE.Matrix4() }, side: { value: SIGN[s] }, posCol: { value: new THREE.Color(RIG ? 'rgb(235, 104, 52)' : '#c8413a') },
+      negCol: { value: new THREE.Color('rgb(57, 135, 229)') }, showNeg: { value: RIG ? 1 : 0 }, tint: { value: 0 } } });
   E.volume = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), mat); E.volume.renderOrder = 10; E.volume.visible = false; grp.add(E.volume);
   E.volume.onBeforeRender = (r, sc, cam) => mat.uniforms.mv.value.multiplyMatrices(cam.matrixWorldInverse, E.volume.matrixWorld);
   E.spk = speakerModel(); E.spk.visible = false; grp.add(E.spk);
@@ -305,23 +348,24 @@ for (const s of have) {
   // the ear as seen from its own waves frame: aim the speaker at it
   const trag = new THREE.Vector3(...(E.info.tragion || [SIGN[s] * dims.breadth / 2, 0, 0]));
   E.earLocal = trag.clone().applyMatrix4(E.toHead.clone().invert());
-  E.wall = Math.abs(trag.x) - 2;
   const tag = label(s === 'left' ? 'L' : 'R', 14, '#5d646e');
   tag.position.copy(trag).add(new THREE.Vector3(SIGN[s] * 22, 48, 0)); scene.add(tag);
 }
 
 // ---------- rig: the source's open-air wavefronts BEYOND the simulated box ----------
 // The FDTD box ends a few cm past the speaker, so on its own the field looks like caps aimed at the ear. Outside the box the
-// same point source in open air is exact: spherical wavefronts, crests every wavelength, amplitude 1/r. They are clipped
-// to the ear's side of the head plane (the simulation's flat rigid wall, wavesim.py) and dropped INSIDE the box, where
-// the simulated field — ear, reflections and all — takes over. Same colours and the SAME phase as the volume shader.
+// same point source in open air: spherical wavefronts, crests every wavelength, amplitude 1/r. NO flat cut: the shells
+// flow on around the head, which hides what is behind or inside it by depth. That part is free-field — the head's own
+// shadow and reflections exist ONLY inside the box, where the simulated field takes over. Same colours and SAME phase
+// as the volume shader.
 const SHELLS = 10, C_MM_PER_MS = 343;
+// The scene grid's pressure colours (frontend app/sim): orange up, blue down.
+const UP = 'rgb(235, 104, 52)', DOWN = 'rgb(57, 135, 229)';
 const SVS = `varying vec3 vW; varying vec3 vN;
 void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; vN = normalize(mat3(modelMatrix) * normal); gl_Position = projectionMatrix * viewMatrix * w; }`;
-const SFS = `uniform vec3 col; uniform float alpha; uniform mat4 toWaves; uniform vec3 bMin; uniform vec3 bMax; uniform float side; uniform float wall;
+const SFS = `uniform vec3 col; uniform float alpha; uniform mat4 toWaves; uniform vec3 bMin; uniform vec3 bMax;
 varying vec3 vW; varying vec3 vN;
 void main(){
-  if (side * vW.x < wall) discard;
   vec3 p = (toWaves * vec4(vW, 1.0)).xyz;
   if (all(greaterThan(p, bMin)) && all(lessThan(p, bMax))) discard;
   float rim = pow(1.0 - abs(dot(normalize(vN), normalize(cameraPosition - vW))), 2.0);   // see-through face, inked edge
@@ -332,8 +376,8 @@ if (RIG) for (const s of have) {
   const E = ears[s];
   E.shells = Array.from({ length: SHELLS }, (_, k) => {
     const m = new THREE.Mesh(shellGeo, new THREE.ShaderMaterial({ vertexShader: SVS, fragmentShader: SFS, transparent: true, depthWrite: false, side: THREE.DoubleSide,
-      uniforms: { col: { value: new THREE.Color(k % 2 ? '#2f5fd0' : '#c8413a') }, alpha: { value: 0 }, toWaves: { value: E.toHead.clone().invert() },
-        bMin: { value: new THREE.Vector3() }, bMax: { value: new THREE.Vector3() }, side: { value: SIGN[s] }, wall: { value: E.wall } } }));
+      uniforms: { col: { value: new THREE.Color(k % 2 ? DOWN : UP) }, alpha: { value: 0 }, toWaves: { value: E.toHead.clone().invert() },
+        bMin: { value: new THREE.Vector3() }, bMax: { value: new THREE.Vector3() } } }));
     m.renderOrder = 5; m.visible = false; scene.add(m); return m;
   });
 }
@@ -368,9 +412,9 @@ async function loadField(s, r, sound) {
     if (sound === 'pulse') {
       const P = F.pulse.vol, im = await img(url(P.file));
       let mask = E.cache.get(maskKey);
-      if (!mask) {        // the voxel mask rides in the tone atlases' blue channel; the click atlas has none
-        const t = F.tones[0], re = await img(url(t.vol.re.file)), m = new Uint8Array(N);
-        voxels(re, V.dims, t.vol.re.cols, 0, (i, px) => { m[i] = re.d[px + 2]; });
+      if (!mask) {        // the voxel mask: its own file (wavesim volume.mask), else the first tone atlas' blue channel; the click atlas has none
+        const M = V.mask || F.tones[0].vol.re, re = await img(url(M.file)), m = new Uint8Array(N);
+        voxels(re, V.dims, M.cols, 0, (i, px) => { m[i] = re.d[px + 2]; });
         mask = tex3(m, X, Y, Z, false); E.cache.set(maskKey, mask);
       }
       return { mask, pulse: { ...P, im, tex: tex3(new Uint16Array(N * 2), X, Y, Z, true) } };
@@ -390,13 +434,53 @@ function pulseFrame(P, dims, f) {
   P.tex.needsUpdate = true; return P.tex;
 }
 
+
+// ---------- clock: the sim page drives this viewer with the scene's clip (postMessage) ----------
+// The page sends {type:'auris-clip', u, sr} once and {type:'auris-t', t} as its timeline moves; the viewer then shows the
+// CLIP at time t, never its own loop. The frames are the click response; their running sum is the response to the click's
+// Gaussian (narrower than one audio sample), so the field for clip u is Σ_k cum_k · u(t − k·Δ + 4σ) — the SAME rule as
+// the page's own fields (frontend app/sim/lib/clip.ts fieldAt). Change one, change both.
+const ONSET_S = 100e-6;                                    // the click peaks 4σ = 100 µs after the run starts
+const cumulateFrames = (fr) => { const out = []; let acc = null; for (const f of fr) { const n = acc ? f.map((v, j) => v + acc[j]) : f.slice(); out.push(n); acc = n; } return out; };
+function clockField(cum, dtS, u, sr, t, out) {
+  out.fill(0);
+  for (let k = 0; k < cum.length; k++) {
+    const p = (t - k * dtS + ONSET_S) * sr, i = Math.floor(p);
+    if (i < 0 || i >= u.length - 1) continue;
+    const w = u[i] + (p - i) * (u[i + 1] - u[i]);
+    if (!w) continue;
+    const f = cum[k];
+    for (let j = 0; j < out.length; j++) out[j] += w * f[j];
+  }
+  return out;
+}
+/** ONE fixed scale per clip (the same t always looks the same), with the click display's own reference: 1.0 = the wave as
+ * it ARRIVES AT THE EAR. Measured as the clip's RMS at `cells` (round the canal opening) × √2, so a sine of that RMS peaks
+ * at ±1 there. NEVER from the whole box: the speaker is a point, its wave falls off as 1/r, and a box-wide scale set by the
+ * cells next to it leaves the wave too faint to see by the time it reaches the ear. */
+function clockScale(cum, dtS, u, sr, cells) {
+  let s = 0, n = 0;
+  for (let k = 0; k < 400; k++) {
+    const t = ((k + .5) / 400) * u.length / sr;
+    for (const j of cells) {
+      let v = 0;
+      for (let f = 0; f < cum.length; f++) {
+        const p = (t - f * dtS + ONSET_S) * sr, i = Math.floor(p);
+        if (i >= 0 && i < u.length - 1) v += (u[i] + (p - i) * (u[i + 1] - u[i])) * cum[f][j];
+      }
+      s += v * v; n++;
+    }
+  }
+  return Math.max(1e-12, Math.sqrt(2 * s / Math.max(1, n)));
+}
+
 // ---------- state ----------
 const posName = (r) => ({ 0: 'Front', 45: 'Front-side', 90: 'Side', 135: 'Back-side', 180: 'Behind' }[r.az] || 'Az') + ` ${r.az}°` + (r.el ? ` · up ${r.el}°` : '');
 const pick = Q.get('run');
 const state = { tag: allTags.includes(pick) ? pick : (refRuns.find((r) => r.az === 90) || refRuns[0] || {}).tag, sound: '4000',
   playing: true, phase: 0, frame: 0, live: {} };        // live: side -> { run, field }
 const tones = refRuns[0] ? refRuns[0].files.tones.map((t) => `${t.hz}`) : [];
-if (!tones.includes(state.sound) && tones.length) state.sound = tones[0];
+if (!tones.includes(state.sound)) state.sound = tones[0] || 'pulse';   // a click-only run (wavesim tones_hz=()) has no tones
 $('dirs').innerHTML = refRuns.map((r) => `<button type="button" data-tag="${r.tag}">${posName(r)}</button>`).join('');
 $('sound').innerHTML = [`<button type="button" data-s="pulse">Click</button>`].concat(tones.map((h) => `<button type="button" data-s="${h}">${h / 1000} kHz tone</button>`)).join('');
 $('dirs').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) choose(b.dataset.tag, state.sound); });
@@ -423,7 +507,7 @@ async function choose(tag, sound) {
   state.tag = tag; state.sound = sound; state.live = {}; state.frame = 0;
   for (const [s, L] of got) {
     const E = ears[s], U = E.volume.material.uniforms;
-    E.volume.visible = !!L && $('tW').checked; E.spk.visible = !!L;
+    E.volume.visible = !!L && $('tW').checked; E.spk.visible = !!L && !SCENE_SRC.length;   // the scene's own speakers replace the run's
     if (!L && E.shells) for (const m of E.shells) m.visible = false;
     if (!L) continue;
     state.live[s] = L;
@@ -445,8 +529,8 @@ async function choose(tag, sound) {
       }
       const path = new THREE.Line(new THREE.BufferGeometry().setFromPoints([w, ear]), new THREE.LineDashedMaterial({ color: 0x111111, dashSize: 8, gapSize: 6 }));
       path.computeLineDistances();
-      E.rig = [pole(w.x, w.z, w.y - 11, 4), path];
-      rigGroup.add(...E.rig);
+      E.rig = SCENE_SRC.length ? [] : [pole(w.x, w.z, w.y - 11, 4), path];   // the scene's speakers bring their own stands
+      if (E.rig.length) rigGroup.add(...E.rig);
     }
   }
   const r0 = got.find(([, L]) => L)?.[1]?.run || refRuns.find((r) => r.tag === tag);
@@ -455,7 +539,7 @@ async function choose(tag, sound) {
   $('title').textContent = `${what} · ${r0 ? posName(r0) : tag}` + (missing.length ? ` · ${missing.join(', ')} ear not simulated` : '');
   $('honest').textContent = sides.length > 1 ? 'Speaker beside each ear, mirrored · each ear simulated on its own'
     : 'Speaker beside the ear · simulated on its own, head not part of the physics';
-  $('keyText').textContent = RIG ? 'compression' : sound === 'pulse' ? 'Wavefront: click pressure +0.5 × the incoming wave' : 'Wavefront: pressure +0.5 × the incoming wave';
+  $('keyText').textContent = RIG ? 'pressure up' : sound === 'pulse' ? 'Wavefront: click pressure +0.5 × the incoming wave' : 'Wavefront: pressure +0.5 × the incoming wave';
   fitCamera(); draw();
 }
 function draw() {
@@ -478,6 +562,7 @@ function fitCamera() {
   const box = new THREE.Box3().setFromObject(headGroup);
   // EVERY direction's speakers, not just this one's: the dashboard's boxes then show the head at ONE size
   for (const s of have) for (const r of ears[s].runs) box.expandByPoint(new THREE.Vector3(...r.speaker_mm).applyMatrix4(ears[s].toHead));
+  box.expandByObject(sceneSpk);
   if (RIG) box.expandByPoint(new THREE.Vector3(0, FLOOR, 0));
   const ctr = box.getCenter(new THREE.Vector3()), rad = box.getSize(new THREE.Vector3()).length() / 2;
   const vh = THREE.MathUtils.degToRad(camera.fov / 2), hh = Math.atan(Math.tan(vh) * camera.aspect);
@@ -487,9 +572,14 @@ function fitCamera() {
   camera.position.copy(ctr).addScaledVector(view.normalize(), dist);
   controls.target.copy(ctr); camera.lookAt(ctr); controls.update(); fitted = true;
 }
+// Compares CSS size with the LAST size seen, never canvas.width with a rounded product: three floors width × pixel ratio,
+// so at a fractional product (browser zoom, scaled displays) the two never matched, every frame "resized", and the
+// re-fit below snapped the camera back — the view could not be turned.
+let seen = '';
 function resize() {
   const w = canvas.clientWidth, h = canvas.clientHeight;
-  if (canvas.width === Math.round(w * renderer.getPixelRatio()) && canvas.height === Math.round(h * renderer.getPixelRatio())) return false;
+  if (`${w}x${h}` === seen) return false;
+  seen = `${w}x${h}`;
   renderer.setSize(w, h, false); camera.aspect = w / Math.max(h, 1); camera.updateProjectionMatrix();
   const px = renderer.getDrawingBufferSize(new THREE.Vector2());
   depthRT.setSize(px.x, px.y);
@@ -497,7 +587,7 @@ function resize() {
   return true;
 }
 
-if (RIG) $('keyText').insertAdjacentHTML('afterend', '<s class="neg"></s><span>rarefaction</span>');
+if (RIG) $('keyText').insertAdjacentHTML('afterend', '<s class="neg"></s><span>pressure down</span>');
 resize();
 if (!have.length) { $('title').textContent = headInfo ? 'No ear simulation yet' : 'Head model not ready yet'; $('honest').hidden = true; }
 if (state.tag) await choose(state.tag, state.sound); else fitCamera();
@@ -512,6 +602,7 @@ renderer.setAnimationLoop((now) => {
     else { state.phase = (state.phase + dt / 1800 * 2 * Math.PI) % (2 * Math.PI); draw(); }
   }
   last = now;
+  clockDraw();
   controls.update();
   const shown = have.filter((s) => ears[s].volume.visible);
   for (const s of shown) ears[s].volume.visible = false;
@@ -519,7 +610,58 @@ renderer.setAnimationLoop((now) => {
   for (const s of shown) ears[s].volume.visible = true;
   renderer.render(scene, camera);
 });
+// The clip clock (see the helpers above): per ear, the click volume's frames decoded once and summed; each repaint takes the
+// LATEST t only (a slow volume never queues behind the page's ticks).
+const clock = { u: null, sr: 0, t: 0, drawn: -1, ears: {}, scale: 1 };
+addEventListener('message', async (e) => {
+  const m = e.data;
+  if (!m || typeof m !== 'object') return;
+  if (m.type === 'auris-t') { clock.t = m.t; return; }
+  if (m.type !== 'auris-clip') return;
+  clock.u = null;
+  state.playing = false; $('play').textContent = '▶'; $('play').setAttribute('aria-label', 'Play');
+  if (state.sound !== 'pulse' && state.tag) await choose(state.tag, 'pulse');
+  const ears2 = {};
+  for (const [s, L] of Object.entries(state.live)) {
+    const P = L.field.pulse, dims = L.run.files.volume.dims, N = dims[0] * dims[1] * dims[2];
+    const fr = Array.from({ length: P.frames }, (_, f) => { const v = new Float32Array(N); voxels(P.im, dims, P.cols, f, (i, px) => { v[i] = (P.im.d[px] - 128) / 127 * P.lim; }); return v; });
+    // the 3×3×3 voxels round the ear point (volume is x-fastest: (z·Y + y)·X + x)
+    const V = L.run.files.volume, e = ears[s].earLocal, cells = [];
+    const c = [0, 1, 2].map((a) => Math.floor((e.getComponent(a) - V.box_min[a]) / V.box_size[a] * dims[a]));
+    for (let dz = -1; dz <= 1; dz++) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const x = c[0] + dx, y = c[1] + dy, z = c[2] + dz;
+      if (x >= 0 && y >= 0 && z >= 0 && x < dims[0] && y < dims[1] && z < dims[2]) cells.push((z * dims[1] + y) * dims[0] + x);
+    }
+    // DISPLAY gain r / r_ear (distance from the speaker): a point source falls off as 1/r, so without it the wave fades out
+    // a few cm from the speaker and the box's outer air reads empty. The ear keeps gain 1 — its ±1 is still the true arrival.
+    const sp = L.run.speaker_mm, rEar = Math.max(1, e.distanceTo(new THREE.Vector3(...sp))), w = new Float32Array(N);
+    for (let z = 0; z < dims[2]; z++) for (let y = 0; y < dims[1]; y++) for (let x = 0; x < dims[0]; x++) {
+      const q = [x, y, z].map((i, a) => V.box_min[a] + (i + .5) * V.box_size[a] / dims[a] - sp[a]);
+      w[(z * dims[1] + y) * dims[0] + x] = Math.min(4, Math.max(.25, Math.hypot(...q) / rEar));
+    }
+    ears2[s] = { cum: cumulateFrames(fr), dtS: P.frame_us * 1e-6, buf: new Float32Array(N), P, cells, w };
+  }
+  clock.ears = ears2;
+  // ONE scale for both ears: the louder ear's arrival reads ±1, so the far ear reads quieter, as it is
+  clock.scale = Math.max(1e-12, ...Object.values(ears2).map((E) => clockScale(E.cum, E.dtS, m.u, m.sr, E.cells)));
+  clock.u = m.u; clock.sr = m.sr; clock.t = m.t ?? clock.t; clock.drawn = -1;
+  for (const s of have) if (ears[s].shells) for (const sh of ears[s].shells) sh.visible = false;   // open-air shells follow the click, not the clip
+});
+function clockDraw() {
+  if (!clock.u || clock.t === clock.drawn) return;
+  clock.drawn = clock.t;
+  const k = 1 / clock.scale;                            // ±1 = the wave as it arrives at the ear
+  for (const [s, E] of Object.entries(clock.ears)) {
+    clockField(E.cum, E.dtS, clock.u, clock.sr, clock.t, E.buf);
+    const d = E.P.tex.image.data;
+    for (let i = 0; i < E.buf.length; i++) d[i * 2] = THREE.DataUtils.toHalfFloat(E.buf[i] * k * E.w[i]);
+    E.P.tex.needsUpdate = true;
+    const U = ears[s].volume.material.uniforms; U.field.value = E.P.tex; U.phase.value = 0; U.tint.value = 1;
+  }
+  $('time').textContent = $('sub').textContent = `t = ${(clock.t * 1000).toFixed(3)} ms into the clip`;
+}
 document.documentElement.dataset.ready = '1';
+parent.postMessage({ type: 'auris-ready' }, '*');
 </script>
 </body>
 </html>

@@ -57,7 +57,7 @@ def api(tmp_path, monkeypatch):
         return {"references_data": [], "ear_world": dict.fromkeys(
             ("bowl_volume_cc", "shell_volume_cc", "opening_area_mm2", "max_depth_mm"), 1.0)}
 
-    def simulate(out, ply, left, azimuths, landmarks_xlsx, log):
+    def simulate(out, ply, left, azimuths, landmarks_xlsx, log, **_display):   # tones_hz, dx: jobs._waves display settings
         calls.append(("waves", _ear_of(out + os.sep)))
         for name in ("index.html", "runs.json", "ear.json", "az0_p.png"):
             _touch(os.path.join(out, name), f"stale {name}")
@@ -264,3 +264,4 @@ def test_importing_the_app_never_touches_live_runs(tmp_path, monkeypatch):
     jobs.write_job("dddddddddddd", {"id": "dddddddddddd", "status": "running", "step": "left:waves"})
     importlib.reload(main)
     assert jobs.read_job("dddddddddddd")["status"] == "running"
+

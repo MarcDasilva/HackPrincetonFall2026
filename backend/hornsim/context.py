@@ -16,6 +16,9 @@ Writes <out_dir>/:
 """
 import json
 import os
+# Background workers yield the CPU: ONE patient's pool is sized to every core but one, and two patients run at once — at
+# normal priority they starved the next patient's ear reconstruction and the agents' start-up (their capability check took 51 s).
+BACKGROUND_NICE = 10
 import sys
 import time
 
@@ -138,7 +141,8 @@ def build(cfg, out, log=print, on_ready=None, stop_when_ready=False):
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor
     rows = [(c, L, fs, ag, normal, flat, rx, seed) for c in clips for L in V["levels_db_spl"]]
-    with ProcessPoolExecutor(max_workers=max(1, min(len(rows), (os.cpu_count() or 2) - 1)), mp_context=mp.get_context("spawn")) as ex:
+    with ProcessPoolExecutor(max_workers=max(1, min(len(rows), (os.cpu_count() or 2) - 1)), mp_context=mp.get_context("spawn"),
+                             initializer=os.nice, initargs=(BACKGROUND_NICE,)) as ex:
         done = list(ex.map(_reference_row, rows))
     for r in done:
         best = max(r["prescriptions"], key=r["prescriptions"].get)

@@ -193,14 +193,21 @@ def run_full(pid, request):
         return
 
     _head(pid, log)
+    # Quick context (ear world + canal samples, ~0.5 s) on the FAST lane: the browser sims and the designer read it, and
+    # behind _rest it waited out another patient's whole simulation queue (a 4-minute "waiting" on the last run).
+    for ear in ears(job):
+        try:
+            _context(pid, ear, ear_request(job, ear), _ear_logger(log, ear, job), quick=True)
+        except Exception:  # _rest's full context repeats it and reports the failure on that ear
+            log(traceback.format_exc(limit=3))
     _update(pid, step="waiting")         # until the slow lane is free (another run's simulations may be ahead)
     submit(_rest, pid)
 
 
 def _rest(pid):
     """Context, waves and the aid for each ear — the slow stages, one patient at a time. In THREE passes over the ears,
-    so the patient-facing part unblocks first: every ear's quick context (ear world + canal samples, seconds — all the
-    browser sims and the designer read), then the wave runs (~13 min an ear), then the HASPI references and the aid.
+    so the patient-facing part unblocks first: every ear's quick context (ear world + canal samples) already ran in
+    run_full, then the wave runs (~13 min an ear), then the HASPI references and the aid.
     Ear by ear in one pass, the second ear's sims waited behind the first ear's waves. An ear's references and aid start
     in a thread as soon as ITS waves finish, so they run on the CPU while the next ear's waves run on the GPU."""
     log = _logger(pid)
@@ -222,8 +229,6 @@ def _rest(pid):
         _context(pid, ear, req, elog)
         _aid(pid, ear, req.get("design"), elog)
 
-    for ear in ears(job):
-        one(ear, lambda ear, req, elog: _context(pid, ear, req, elog, quick=True))
     cpu = []
     for ear in ears(job):
         one(ear, lambda ear, req, elog: _waves(pid, ear, elog))
@@ -242,8 +247,11 @@ def _waves(pid, ear, log):
     d = ear_dir(pid, ear)
     _set(pid, ear, step="waves")
     try:
+        # Display runs, so a coarse animation: the click ONLY (the viewers switch to it on 'auris-clip'; the three steady-tone
+        # runs fed only the standalone viewer's tone buttons) at 1.5 mm, as aided_wave already uses. With VIEW_MARGIN_MM's
+        # wide box, 1.0 mm plus tones took ~3 min a direction (~30 min a patient); this is ~30 s, eardrum peak within ~1 dB.
         runs = wavesim.simulate(os.path.join(d, "waves"), os.path.join(d, "ear", "ear.ply"), left=ear == "left",
-                                azimuths=WAVE_DIRECTIONS, landmarks_xlsx=er.LANDMARKS_XLSX, log=log)
+                                azimuths=WAVE_DIRECTIONS, tones_hz=(), dx=1.5, landmarks_xlsx=er.LANDMARKS_XLSX, log=log)
         _set(pid, ear, waves=[{k: r[k] for k in ("tag", "az", "el", "eardrum_peak_hz")} for r in runs])
     except Exception:
         log("wave simulation failed:\n" + traceback.format_exc(limit=3))
@@ -326,6 +334,11 @@ def warm(log=print):
             importlib.import_module(m)
         except Exception as e:  # a missing optional model must not stop the server; the stage reports it
             log(f"warm: {m} not imported ({type(e).__name__}: {e})")
+    # The ear networks + SAM lazy-load on the first reconstruct (~10 s): the first ear of the first patient paid it.
+    try:
+        importlib.import_module("earrecon.reconstruct").models_()
+    except Exception as e:
+        log(f"warm: ear models not loaded ({type(e).__name__}: {e})")
 
 
 def recover():

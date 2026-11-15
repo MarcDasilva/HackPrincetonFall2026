@@ -150,6 +150,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 const $ = (id) => document.getElementById(id);
 const CLIP = 2.0;                       // colour range: ±2 × the incoming wave
@@ -181,6 +182,10 @@ const cutPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), 0);   // set per v
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(32, 1, 1, 5000);
 const controls = new OrbitControls(camera, canvas); controls.enableDamping = true;
+// Middle-drag pans (orbit controls default it to zoom; the wheel already zooms). Its mousedown would also start the
+// browser's autoscroll, which then eats the drag.
+controls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
+canvas.addEventListener('mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
 scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8f96, 1.7));
 const key = new THREE.DirectionalLight(0xffffff, 1.1); key.position.set(150, 220, 120); scene.add(key);
 
@@ -200,6 +205,16 @@ const earMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: .
   polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });   // offset: the mesh lines must win the depth test
 const edgeMat = new THREE.LineBasicMaterial({ color: 0x4a3a30, transparent: true, opacity: .45 });
 const earMesh = new THREE.Mesh(geo, earMat); scene.add(earMesh);
+// The picked earpiece in this ear (?piece=<earpiece.glb URL> — the dashboard's validation): orange, and in THIS frame
+// already (hornsim.earpiece builds it on the same ear mesh wavesim reads), clipped with the ear in the slice views.
+const pieceMat = new THREE.MeshStandardMaterial({ color: 0xf38c28, roughness: .6, metalness: 0, side: THREE.DoubleSide });
+if (new URLSearchParams(location.search).get('piece')) {
+  new GLTFLoader().loadAsync(new URLSearchParams(location.search).get('piece')).then((g) => {
+    // the GLB carries no normals: without them a lit material shades the piece solid black
+    g.scene.traverse((o) => { if (o.isMesh) { o.geometry.computeVertexNormals(); o.material = pieceMat; } });
+    scene.add(g.scene);
+  }).catch(() => { /* the ear still draws without it */ });
+}
 scene.add(new THREE.LineSegments(new THREE.WireframeGeometry(geo), edgeMat));
 
 const cp = new THREE.Vector3(...ear.canal.point), ca = new THREE.Vector3(...ear.canal.axis);
@@ -394,23 +409,72 @@ async function loadRun(r) {
     voxels(im, V.dims, t.vol.im.cols, 0, (i, px) => { d[i * 2 + 1] = THREE.DataUtils.toHalfFloat(((im.d[px] * 256 + im.d[px + 1]) / 65535 - .5) * 2 * lim); });
     data.vol.tones[t.hz] = tex3(d, X, Y, Z, true);
   }));
+  // a click-only run (wavesim tones_hz=()) has no tone atlases to carry the mask: it has its own file
+  if (!F.tones.length && V.mask) { const m = await img(V.mask.file); voxels(m, V.dims, V.mask.cols, 0, (i, px) => { vmask[i] = m.d[px + 2]; }); }
   data.vol.mask = tex3(vmask, X, Y, Z, false);
   data.vol.pulse = { ...F.pulse.vol, im: await img(F.pulse.vol.file), tex: tex3(new Uint16Array(N * 2), X, Y, Z, true) };
   cache.set(r.tag, data); return data;
 }
-function pulseTex(a, f, key) {     // one frame of a pulse atlas -> half-float texture, reused between frames
+/** One frame of a pulse atlas as floats (× the incoming wave). */
+function atlasFrame(a, f) {
   const [A, B] = a.tile, r = Math.floor(f / a.cols), c = f % a.cols, v = new Float32Array(A * B);
   for (let i = 0; i < A; i++) for (let k = 0; k < B; k++) v[i * B + k] = (a.im.d[((r * A + i) * a.im.w + c * B + k) * 4] - 128) / 127 * a.lim;
+  return v;
+}
+function pulseTex(a, f, key) { return fieldTex(atlasFrame(a, f), a, key); }   // one frame -> half-float texture, reused between frames
+function fieldTex(v, a, key) {
+  const [A, B] = a.tile;
   const cache = state.data.pulse.tex, t = cache[key];
   if (t) { for (let i = 0; i < v.length; i++) t.image.data[i * 2] = THREE.DataUtils.toHalfFloat(v[i]); t.needsUpdate = true; return t; }
   return (cache[key] = rgTex(v, null, B, A));
+}
+
+// ---------- clock: the sim page drives this viewer with the scene's clip (postMessage) ----------
+// The page sends {type:'auris-clip', u, sr} once and {type:'auris-t', t} as its timeline moves; the viewer then shows the
+// CLIP at time t, never its own loop. The frames are the click response; their running sum is the response to the click's
+// Gaussian (narrower than one audio sample), so the field for clip u is Σ_k cum_k · u(t − k·Δ + 4σ) — the SAME rule as
+// the page's own fields (frontend app/sim/lib/clip.ts fieldAt). Change one, change both.
+const ONSET_S = 100e-6;                                    // the click peaks 4σ = 100 µs after the run starts
+const cumulateFrames = (fr) => { const out = []; let acc = null; for (const f of fr) { const n = acc ? f.map((v, j) => v + acc[j]) : f.slice(); out.push(n); acc = n; } return out; };
+function clockField(cum, dtS, u, sr, t, out) {
+  out.fill(0);
+  for (let k = 0; k < cum.length; k++) {
+    const p = (t - k * dtS + ONSET_S) * sr, i = Math.floor(p);
+    if (i < 0 || i >= u.length - 1) continue;
+    const w = u[i] + (p - i) * (u[i + 1] - u[i]);
+    if (!w) continue;
+    const f = cum[k];
+    for (let j = 0; j < out.length; j++) out[j] += w * f[j];
+  }
+  return out;
+}
+/** ONE fixed scale per clip (the same t always looks the same), with the click display's own reference: 1.0 = the wave as
+ * it ARRIVES AT THE EAR. Measured as the clip's RMS at `cells` (round the canal opening) × √2, so a sine of that RMS peaks
+ * at ±1 there. NEVER from the whole box: the speaker is a point, its wave falls off as 1/r, and a box-wide scale set by the
+ * cells next to it leaves the wave too faint to see by the time it reaches the ear. */
+function clockScale(cum, dtS, u, sr, cells) {
+  let s = 0, n = 0;
+  for (let k = 0; k < 400; k++) {
+    const t = ((k + .5) / 400) * u.length / sr;
+    for (const j of cells) {
+      let v = 0;
+      for (let f = 0; f < cum.length; f++) {
+        const p = (t - f * dtS + ONSET_S) * sr, i = Math.floor(p);
+        if (i >= 0 && i < u.length - 1) v += (u[i] + (p - i) * (u[i + 1] - u[i])) * cum[f][j];
+      }
+      s += v * v; n++;
+    }
+  }
+  return Math.max(1e-12, Math.sqrt(2 * s / Math.max(1, n)));
 }
 
 // ---------- state ----------
 // ?run=<tag> picks the direction (the dashboard's one-direction boxes); without it, the side view.
 const Q = new URLSearchParams(location.search);
 if (Q.has('embed')) document.documentElement.classList.add('embed');
-const state = { run: runs.find((r) => r.tag === Q.get('run')) || runs.find((r) => r.az === 90) || runs[0], sound: '4000', mode: 0, disp: '3d', playing: true, phase: 0, frame: 0, data: null };
+const state = { run: runs.find((r) => r.tag === Q.get('run')) || runs.find((r) => r.az === 90) || runs[0], sound: runs[0]?.files.tones.length ? '4000' : 'pulse', mode: 0, disp: '3d', playing: true, phase: 0, frame: 0, data: null };
+/** ?silent=1: the ear with NO wave in it — the sim detail shows this for a source the head stands between (SimRuns earRun). Playback and the page's clip are ignored, or a wave would draw in. */
+const SILENT = Q.has('silent');
 const is3d = () => state.disp === '3d';
 const nFrames = () => is3d() ? state.data.vol.pulse.frames : state.data.pulse.n;
 // 3D click frames are spaced wider than slice frames; map by time so both show the same instant
@@ -651,7 +715,7 @@ function setCut(on) {
   const P = state.run.planes;
   if (cutMode === 'front') cutPlane.set(front.clone().negate(), front.z * P.v.z);   // keep the ear behind the vertical slice
   else cutPlane.set(new THREE.Vector3(0, -1, 0), P.h.y + 0.5);                     // keep the ear below the horizontal slice
-  earMat.clippingPlanes = edgeMat.clippingPlanes = on ? [cutPlane] : [];
+  earMat.clippingPlanes = edgeMat.clippingPlanes = pieceMat.clippingPlanes = on ? [cutPlane] : [];
   volMat.uniforms.cutOn.value = on ? 1 : 0; volMat.uniforms.cut.value.set(cutPlane.normal.x, cutPlane.normal.y, cutPlane.normal.z, cutPlane.constant);
   earMat.needsUpdate = edgeMat.needsUpdate = true;
 }
@@ -678,11 +742,66 @@ function view(v) {
 }
 document.querySelector('.views').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) view(b.dataset.view); });
 
-await choose(state.run, '4000');
-// ?disp=slices opens on the 2D slices (the dashboard's sim detail shows them under the 3D head); 3D wavefronts otherwise.
-if (Q.get('disp') === 'slices') document.querySelector('#disp [data-disp="slices"]').click();
-// The sim detail labels its own figures: drop the overlay caption there.
-if (Q.get('disp') === 'slices') document.querySelector('.hud')?.setAttribute('hidden', '');
+await choose(state.run, state.sound);   // 'pulse' for a click-only run: there is no 4 kHz tone to open on
+// The clip clock (helpers above): both slices and the ear surface, from their click frames, at the page's t. Each repaint
+// takes the LATEST t only.
+const clock = { u: null, sr: 0, t: 0, drawn: -1 };
+addEventListener('message', async (e) => {
+  const m = e.data;
+  if (!m || typeof m !== 'object') return;
+  if (m.type === 'auris-t') { clock.t = m.t; return; }
+  if (m.type !== 'auris-clip' || SILENT) return;
+  clock.u = null;
+  state.playing = false; $('play').textContent = '▶';
+  if (state.sound !== 'pulse') await choose(state.run, 'pulse');
+  const P = state.data.pulse, n = P.n, S = P.s, nVs = S.im.w;
+  const frames = (a) => cumulateFrames(Array.from({ length: n }, (_, f) => atlasFrame(a, f)));
+  const surf = cumulateFrames(Array.from({ length: Math.min(n, S.im.h) }, (_, f) => Float32Array.from({ length: nVs }, (_, i) => (S.im.d[(f * S.im.w + i) * 4] - 128) / 127 * S.lim)));
+  const dtS = P.meta.frame_us * 1e-6, h = frames(P.h);
+  // the 3×3 cells round the canal opening (1.5 mm in, as wavesim's entrance receiver) in the horizontal slice, x-major
+  const Ph = state.run.planes.h, [A, B] = P.h.tile, at = cp.clone().addScaledVector(ca, 1.5);
+  const ci = Math.round((at.x - Ph.x[0]) / (Ph.x[1] - Ph.x[0]) * (A - 1)), ck = Math.round((at.z - Ph.z[0]) / (Ph.z[1] - Ph.z[0]) * (B - 1)), cells = [];
+  for (let di = -1; di <= 1; di++) for (let dk = -1; dk <= 1; dk++) { const i = ci + di, k2 = ck + dk; if (i >= 0 && k2 >= 0 && i < A && k2 < B) cells.push(i * B + k2); }
+  Object.assign(clock, { h, v: frames(P.v), s: surf, dtS, bh: new Float32Array(h[0].length), bv: new Float32Array(P.v.tile[0] * P.v.tile[1]), bs: new Float32Array(nVs),
+    scale: clockScale(h, dtS, m.u, m.sr, cells), u: m.u, sr: m.sr, t: m.t ?? clock.t, drawn: -1 });
+});
+function clockDraw() {
+  if (!clock.u || clock.t === clock.drawn || !state.data) return;
+  clock.drawn = clock.t;
+  const k = 1 / clock.scale, P = state.data.pulse;       // ±1 = the wave as it arrives at the canal opening
+  const scaled = (b) => { for (let i = 0; i < b.length; i++) b[i] *= k; return b; };
+  sliceH.material.uniforms.field.value = fieldTex(scaled(clockField(clock.h, clock.dtS, clock.u, clock.sr, clock.t, clock.bh)), P.h, 'h');
+  sliceV.material.uniforms.field.value = fieldTex(scaled(clockField(clock.v, clock.dtS, clock.u, clock.sr, clock.t, clock.bv)), P.v, 'v');
+  for (const sl of [sliceH, sliceV]) sl.material.uniforms.phase.value = 0;
+  if ($('tS').checked) {            // ear surface: SAME colour scale as the slices
+    const val = scaled(clockField(clock.s, clock.dtS, clock.u, clock.sr, clock.t, clock.bs));
+    for (let j = 0; j < nS; j++) {
+      const c = sample(0, ((val[SK.parents[2 * j]] + val[SK.parents[2 * j + 1]]) / 2) / CLIP * .5 + .5);
+      vcol[j * 3] = c[0]; vcol[j * 3 + 1] = c[1]; vcol[j * 3 + 2] = c[2];
+    }
+    geo.attributes.color.needsUpdate = true;
+  }
+  $('sub').textContent = $('time').textContent = `t = ${(clock.t * 1000).toFixed(3)} ms into the clip`;
+}
+/** No speaker and no flow lines (every frame: the slices view turns the lines back on), then a zero field on both slices and a neutral ear surface, once per loaded run. */
+function drawSilent() {
+  spk.visible = false; flowLines.visible = false;
+  if (!state.data || state.silent === state.data) return;
+  state.silent = state.data;
+  const P = state.data.pulse;
+  sliceH.material.uniforms.field.value = fieldTex(new Float32Array(P.h.tile[0] * P.h.tile[1]), P.h, 'h');
+  sliceV.material.uniforms.field.value = fieldTex(new Float32Array(P.v.tile[0] * P.v.tile[1]), P.v, 'v');
+  for (const sl of [sliceH, sliceV]) sl.material.uniforms.phase.value = 0;
+  const c = sample(0, .5);
+  for (let j = 0; j < nS; j++) { vcol[j * 3] = c[0]; vcol[j * 3 + 1] = c[1]; vcol[j * 3 + 2] = c[2]; }
+  geo.attributes.color.needsUpdate = true;
+}
+if (SILENT) state.playing = false;
+// ?disp=slices opens on the 2D slices (the dashboard's sim detail shows them beside the 3D head); 3D wavefronts otherwise.
+if (Q.get('disp') === 'slices') {
+  document.querySelector('#disp [data-disp="slices"]').click();
+  document.querySelector('.hud')?.setAttribute('hidden', '');     // the sim detail captions its own figures
+}
 view('3d');
 
 const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -690,15 +809,18 @@ if (reduce) { state.playing = false; $('play').textContent = '▶'; }
 let last = 0;
 renderer.setAnimationLoop((now) => {
   const w = canvas.clientWidth, h = canvas.clientHeight;
-  if (canvas.width !== Math.round(w * renderer.getPixelRatio())) { renderer.setSize(w, h, false); camera.aspect = w / Math.max(h, 1); camera.updateProjectionMatrix(); }
+  // three floors width × pixel ratio: compare the SAME way, or a fractional product re-sizes the canvas every frame.
+  if (canvas.width !== Math.floor(w * renderer.getPixelRatio()) || canvas.height !== Math.floor(h * renderer.getPixelRatio())) { renderer.setSize(w, h, false); camera.aspect = w / Math.max(h, 1); camera.updateProjectionMatrix(); }
   if (state.playing && state.data) {
     const dt = last ? now - last : 0;
     if (state.sound === 'pulse') { if (now - (state.tick || 0) > 70) { state.tick = now; state.frame = (state.frame + 1) % nFrames(); draw(); } }
     else if (state.mode === 0) { state.phase = (state.phase + dt / 1800 * 2 * Math.PI) % (2 * Math.PI); draw(); }
   }
   last = now;
+  if (SILENT) drawSilent(); else clockDraw();
   controls.update(); renderer.render(scene, camera);
 });
+parent.postMessage({ type: 'auris-ready' }, '*');
 </script>
 </body>
 </html>
