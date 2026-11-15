@@ -22,7 +22,9 @@ _pool = ThreadPoolExecutor(max_workers=settings.workers)
 # The FAST lane: ear meshes and the head take seconds and are what the patient watches. Behind one queue they
 # waited out every earlier run's ~12-minute simulations, and the screen sat on "Processing…" with nothing to show.
 _fast = ThreadPoolExecutor(max_workers=1)
-_write_lock = threading.Lock()
+# Held over EVERY read-modify-write of job.json, not just the write: _rest runs one ear's aid beside the other ear's
+# waves, and two unlocked _set calls lose one ear's results. Reentrant because write_job takes it too.
+_write_lock = threading.RLock()
 
 EARS = ("left", "right")
 STEPS = ["ear", "context", "waves", "aid", "acoustics", "score"]   # a two-ear job reports "<ear>:<step>"; "head" runs between ear and context
@@ -51,19 +53,21 @@ def write_job(pid, job):
 
 
 def _update(pid, **kw):
-    job = read_job(pid) or {}
-    job.update(kw)
-    job["updated_at"] = time.time()
-    write_job(pid, job)
+    with _write_lock:
+        job = read_job(pid) or {}
+        job.update(kw)
+        job["updated_at"] = time.time()
+        write_job(pid, job)
     return job
 
 
 def _logger(pid):
     def log(msg):
-        job = read_job(pid) or {}
-        job.setdefault("log", []).append(f"{time.strftime('%H:%M:%S')} {msg}")
-        job["updated_at"] = time.time()
-        write_job(pid, job)
+        with _write_lock:
+            job = read_job(pid) or {}
+            job.setdefault("log", []).append(f"{time.strftime('%H:%M:%S')} {msg}")
+            job["updated_at"] = time.time()
+            write_job(pid, job)
     return log
 
 
@@ -96,17 +100,18 @@ def ear_results(job, ear):
 
 def _set(pid, ear, /, step=None, **results):
     """Store results for one ear (None deletes the key) and, when given, the step it is on."""
-    job = read_job(pid)
-    res = ear_results(job, ear)
-    for k, v in results.items():
-        if v is None:
-            res.pop(k, None)
-        else:
-            res[k] = v
-    if step:
-        job["step"] = f"{ear}:{step}" if "ears" in job else step
-    job["updated_at"] = time.time()
-    write_job(pid, job)
+    with _write_lock:
+        job = read_job(pid)
+        res = ear_results(job, ear)
+        for k, v in results.items():
+            if v is None:
+                res.pop(k, None)
+            else:
+                res[k] = v
+        if step:
+            job["step"] = f"{ear}:{step}" if "ears" in job else step
+        job["updated_at"] = time.time()
+        write_job(pid, job)
 
 
 def _ear_logger(log, ear, job):
@@ -121,7 +126,9 @@ def write_skin(ear_dir):
     s.export(os.path.join(ear_dir, "ear_skin.glb"))
 
 
-def _context(pid, ear, request, log):
+def _context(pid, ear, request, log, quick=False):
+    """quick: ONLY the ear world and canal samples (seconds) and a preliminary context.json — what /api/sim reads. The
+    HASPI references (the slow part, hornsim/context.py) come in the full call later."""
     from earrecon import reconstruct as er
     from hornsim import context
 
@@ -132,7 +139,10 @@ def _context(pid, ear, request, log):
                            "ear_height_mm": request["ear_height_mm"], "side": ear,
                            "audiogram_db_hl": {int(k): float(v) for k, v in request["audiogram_db_hl"].items()}})
     cfg["ear_world"]["landmarks_xlsx"] = er.LANDMARKS_XLSX
-    ctx = context.build(cfg, os.path.join(d, "context"), log=log)
+    ctx = context.build(cfg, os.path.join(d, "context"), log=log, stop_when_ready=quick)
+    if quick:
+        _set(pid, ear, context={"ear_world": ctx["ear_world"]})
+        return
     refs = [{k: r[k] for k in ("clip", "level_db_spl", "unaided", "ceiling", "ceiling_from", "headroom", "use_in_reward")}
             for r in ctx["references_data"]]
     _set(pid, ear, context={"ear_world": {k: ctx["ear_world"][k] for k in
@@ -188,21 +198,39 @@ def run_full(pid, request):
 
 
 def _rest(pid):
-    """Context, waves and the aid for each ear — the slow stages, one patient at a time."""
+    """Context, waves and the aid for each ear — the slow stages, one patient at a time. In THREE passes over the ears,
+    so the patient-facing part unblocks first: every ear's quick context (ear world + canal samples, seconds — all the
+    browser sims and the designer read), then the wave runs (~13 min an ear), then the HASPI references and the aid.
+    Ear by ear in one pass, the second ear's sims waited behind the first ear's waves. An ear's references and aid start
+    in a thread as soon as ITS waves finish, so they run on the CPU while the next ear's waves run on the GPU."""
     log = _logger(pid)
     job = read_job(pid)
     failed = {}
-    for ear in ears(job):
+
+    def one(ear, stage):
+        if ear in failed:
+            return
         elog = _ear_logger(log, ear, job)
         try:
-            req = ear_request(job, ear)
-            _context(pid, ear, req, elog)
-            _waves(pid, ear, elog)
-            _aid(pid, ear, req.get("design"), elog)
+            stage(ear, ear_request(job, ear), elog)
         except Exception as e:  # one ear failing must NOT cost the patient the other ear
             elog(traceback.format_exc(limit=3))
             _set(pid, ear, error=str(e))
             failed[ear] = str(e)
+
+    def aid(ear, req, elog):
+        _context(pid, ear, req, elog)
+        _aid(pid, ear, req.get("design"), elog)
+
+    for ear in ears(job):
+        one(ear, lambda ear, req, elog: _context(pid, ear, req, elog, quick=True))
+    cpu = []
+    for ear in ears(job):
+        one(ear, lambda ear, req, elog: _waves(pid, ear, elog))
+        cpu.append(threading.Thread(target=one, args=(ear, aid)))
+        cpu[-1].start()
+    for t in cpu:
+        t.join()
     _finish(pid, failed, len(ears(job)))
 
 

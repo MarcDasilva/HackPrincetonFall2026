@@ -27,6 +27,17 @@ from scipy.stats import qmc
 
 from . import audio, ear_world, scoring
 
+
+def _reference_row(args):
+    """One (clip, level) row of the HASPI references, in a worker process. Every score is seeded (scoring.haspi), so a
+    row is the SAME wherever it runs."""
+    c, L, fs, ag, normal, flat, rx, seed = args
+    r = {"clip": c["name"], "level_db_spl": L}
+    r["healthy_check"] = scoring.score_gain({"reference": c["reference"], "input": c["reference"]}, fs, normal, L, *flat, seed)
+    r["unaided"] = scoring.score_gain(c, fs, ag, L, *flat, seed)
+    r["prescriptions"] = {k: scoring.score_gain(c, fs, ag, L, f, g, seed) for k, (f, g) in rx.items()}
+    return r
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPEECH_CACHE = os.path.join(HERE, "..", "assets", "speech")
 
@@ -121,21 +132,25 @@ def build(cfg, out, log=print, on_ready=None, stop_when_ready=False):
     rx = {name: scoring.prescription_gain(name, ag) for name in V["ceiling_prescriptions"]}
     seed = V["haspi_seed"]
     refs = []
-    for c in clips:
-        for L in V["levels_db_spl"]:
-            r = {"clip": c["name"], "level_db_spl": L}
-            r["healthy_check"] = scoring.score_gain({"reference": c["reference"], "input": c["reference"]}, fs, normal, L, *flat, seed)
-            r["unaided"] = scoring.score_gain(c, fs, ag, L, *flat, seed)
-            r["prescriptions"] = {k: scoring.score_gain(c, fs, ag, L, f, g, seed) for k, (f, g) in rx.items()}
-            best = max(r["prescriptions"], key=r["prescriptions"].get)
-            r["ceiling"], r["ceiling_from"] = r["prescriptions"][best], best
-            if r["unaided"] >= r["ceiling"]:  # amplification hurt here (e.g. loud babble): no gain is best
-                r["ceiling"], r["ceiling_from"] = r["unaided"], "no_gain"
-            r["headroom"] = round(r["ceiling"] - r["unaided"], 4)
-            r["use_in_reward"] = r["headroom"] >= 0.02  # too little room to tell designs apart otherwise
-            refs.append(r)
-            log(f"  {c['name']:9s} {L} dB  healthy {r['healthy_check']:.3f}  unaided {r['unaided']:.3f}  "
-                  f"ceiling {r['ceiling']:.3f} ({best})")
+    # The rows are independent and ~5 HASPI each (~20 s): run them across processes. ~6 min per ear serially, under a
+    # minute in parallel — and in processes, NOT threads, so the API's own thread is not starved meanwhile (HASPI holds
+    # the GIL). "spawn": a fork of the server would copy its threads and locks.
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+    rows = [(c, L, fs, ag, normal, flat, rx, seed) for c in clips for L in V["levels_db_spl"]]
+    with ProcessPoolExecutor(max_workers=max(1, min(len(rows), (os.cpu_count() or 2) - 1)), mp_context=mp.get_context("spawn")) as ex:
+        done = list(ex.map(_reference_row, rows))
+    for r in done:
+        best = max(r["prescriptions"], key=r["prescriptions"].get)
+        r["ceiling"], r["ceiling_from"] = r["prescriptions"][best], best
+        if r["unaided"] >= r["ceiling"]:  # amplification hurt here (e.g. loud babble): no gain is best
+            r["ceiling"], r["ceiling_from"] = r["unaided"], "no_gain"
+        r["headroom"] = round(r["ceiling"] - r["unaided"], 4)
+        r["use_in_reward"] = r["headroom"] >= 0.02  # too little room to tell designs apart otherwise
+        refs.append(r)
+        log(f"  {r['clip']:9s} {r['level_db_spl']} dB  healthy {r['healthy_check']:.3f}  unaided {r['unaided']:.3f}  "
+            f"ceiling {r['ceiling']:.3f} ({best})")
+    log(f"references: {len(rows)} rows ({time.time()-t0:.1f}s)")
     json.dump({"metric": "HASPI v2 (pyclarity)", "seed": seed, "prescription_gains_db":
                {k: {"freqs_hz": f.tolist(), "gain_db": np.round(g, 2).tolist()} for k, (f, g) in rx.items()},
                "results": refs}, open(os.path.join(out, "references.json"), "w"), indent=1)

@@ -22,6 +22,12 @@ from . import scoring
 from .audio import apply_gain, rms
 
 
+def _haspi(args):
+    """One (condition, canal) HASPI score, in a worker process. Seeded, so it is the SAME wherever it runs."""
+    x_ref, x_in, fs, freqs, g, ag, level, seed = args
+    return scoring.haspi(x_ref, apply_gain(x_in, fs, freqs, g), fs, ag, level, seed)
+
+
 def score(patient_dir, n_canals=5, log=print):
     ctx, aid_dir = os.path.join(patient_dir, "context"), os.path.join(patient_dir, "aid")
     cfg = json.load(open(os.path.join(ctx, "context.json")))["config"]
@@ -38,18 +44,23 @@ def score(patient_dir, n_canals=5, log=print):
     ig = ac.insertion_gain_db(design, canals, freqs)
 
     clips = {}
+    used = [r for r in refs["results"] if r["use_in_reward"]]
+    for name in {r["clip"] for r in used}:
+        x_ref, fs = sf.read(os.path.join(ctx, "speech", f"{name}_reference.wav"))
+        x_in, _ = sf.read(os.path.join(ctx, "speech", f"{name}_input.wav"))
+        k = 1 / rms(x_ref)                          # files are stored scaled; restore RMS 1 for the reference
+        clips[name] = (x_ref * k, x_in * k, fs)
+    # 45-odd HASPI calls took ~50 s an ear one after another. Processes, NOT threads (HASPI holds the GIL), and "spawn"
+    # for the same reason as hornsim/context.py: a fork of the server would copy its threads and locks.
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+    tasks = [(*clips[r["clip"]], freqs, g, ag, r["level_db_spl"], seed) for r in used for g in ig]
+    with ProcessPoolExecutor(max_workers=max(1, min(len(tasks), (os.cpu_count() or 2) - 1)), mp_context=mp.get_context("spawn")) as ex:
+        scores = list(ex.map(_haspi, tasks))
     rows = []
-    for r in refs["results"]:
-        if not r["use_in_reward"]:
-            continue
+    for i, r in enumerate(used):
         name = r["clip"]
-        if name not in clips:
-            x_ref, fs = sf.read(os.path.join(ctx, "speech", f"{name}_reference.wav"))
-            x_in, _ = sf.read(os.path.join(ctx, "speech", f"{name}_input.wav"))
-            k = 1 / rms(x_ref)                      # files are stored scaled; restore RMS 1 for the reference
-            clips[name] = (x_ref * k, x_in * k, fs)
-        x_ref, x_in, fs = clips[name]
-        per_canal = [scoring.haspi(x_ref, apply_gain(x_in, fs, freqs, g), fs, ag, r["level_db_spl"], seed) for g in ig]
+        per_canal = scores[i * len(ig):(i + 1) * len(ig)]
         head = r["ceiling"] - r["unaided"]
         clos = [(h - r["unaided"]) / head for h in per_canal]
         rows.append({"clip": name, "level_db_spl": r["level_db_spl"], "unaided": r["unaided"], "ceiling": r["ceiling"],
