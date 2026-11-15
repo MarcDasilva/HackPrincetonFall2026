@@ -1,5 +1,7 @@
 # Auris
-<img width="570" height="330" alt="auris" src="https://github.com/user-attachments/assets/94d0ea14-1312-455b-8210-59ae8c631412" />
+
+<img width="1926" height="1232" alt="auris" src="https://github.com/user-attachments/assets/a831f355-8572-4460-9bc5-e83f83396ca7" />
+
 A personalized passive acoustic hearing device: a printed horn whose geometry is chosen for a modeled hearing profile and the user's intended use.
 
 ## Layout
