@@ -3,6 +3,7 @@
 // contexts per page, so 100 live 3D tiles would kill the dashboard's metal rings (see SimRuns).
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { loadGlb, meshToHead, posed } from "./lib/aidSnap";
 
 /** Head frame (backend head.json): mm, origin midway between the tragions, +x the person's LEFT, +y up, +z forward. */
 const EAR_X = 85;
@@ -47,13 +48,18 @@ let renderer: THREE.WebGLRenderer | null = null;
 // ONE grey for every surface: the figure is monochrome, and the head's own GLB colours (skin, photo-tinted ears) would break it.
 const GREY = new THREE.MeshStandardMaterial({ color: 0xdedede, roughness: 0.7 });
 
-/** The tile's camera: yaw and pitch in degrees ON TOP of the default three-quarter view, zoom as a factor. */
-export type View = { yaw: number; pitch: number; zoom: number };
-export const DEFAULT_VIEW: View = { yaw: 0, pitch: 0, zoom: 1 };
+/** The tile's camera: yaw and pitch in degrees ON TOP of the default three-quarter view, zoom as a factor, and pan as a
+ * shift of the picture in canvas heights (+x right, +y down), so a drag moves the rig with the pointer at any zoom. */
+export type View = { yaw: number; pitch: number; zoom: number; panX?: number; panY?: number };
+export const DEFAULT_VIEW: View = { yaw: 0, pitch: 0, zoom: 1, panX: 0, panY: 0 };
 const TARGET = new THREE.Vector3(0, -60, 0);
 
-export async function snapHead(pid: string, left: boolean, sources: { role: "talker" | "babble"; az: number; el: number; level_db: number }[], canvas: HTMLCanvasElement, view: View = DEFAULT_VIEW) {
+/** `aid`: the picked earpiece's earpiece.glb, drawn orange in the aided ear (the validation) — the ONE colour on the figure. */
+export async function snapHead(pid: string, left: boolean, sources: { role: "talker" | "babble"; az: number; el: number; level_db: number; dist_mm?: number }[], canvas: HTMLCanvasElement, view: View = DEFAULT_VIEW, aid?: string) {
   const head = await loadHead(pid);
+  // A patient without a head stage has no pose to seat it with: the average head then goes without it.
+  const [piece, poses] = aid ? await Promise.all([loadGlb(aid).catch(() => null), meshToHead(pid)]) : [null, null];
+  const pose = poses?.[left ? "left" : "right"];
   renderer ??= new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
   renderer.setPixelRatio(1);
   renderer.setSize(canvas.width, canvas.height, false);
@@ -71,6 +77,7 @@ export async function snapHead(pid: string, left: boolean, sources: { role: "tal
   const saved = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>();
   head.traverse((o) => { const m = o as THREE.Mesh; if (m.isMesh) { saved.set(m, m.material); m.material = GREY; } });
   scene.add(head); // one parent at a time: the next snap re-parents it, and snaps run one after another
+  if (piece && pose) scene.add(posed(piece, pose));
   const bbox = new THREE.Box3().setFromObject(head);
   const outline = new THREE.Box3Helper(bbox, 0x9a9a9a);
   scene.add(outline);
@@ -95,7 +102,10 @@ export async function snapHead(pid: string, left: boolean, sources: { role: "tal
   const ringMat = keep(new THREE.LineBasicMaterial({ color: 0x9a9a9a }));
   const circle = keep(new THREE.BufferGeometry().setFromPoints(Array.from({ length: 64 }, (_, i) => new THREE.Vector3(Math.cos((i / 64) * Math.PI * 2), 0, Math.sin((i / 64) * Math.PI * 2)))));
   const spk = sources.map((src) => {
-    const p = headDir(src.az, src.el, left).multiplyScalar(SPEAKER_MM);
+    // a speaker touching the ear sits dist_mm out from it, the SAME place the simulations put it (lib/lead.ts dist_mm)
+    // ...at the ear on ITS side (the other ear for az past 180), as lib/twoEar.ts nearSide puts it in the head run
+    const dir = headDir(src.az, src.el, left), at = src.dist_mm && Math.abs(dir.x) > 1e-6 ? new THREE.Vector3(Math.sign(dir.x) * EAR_X, 0, 0) : ear;
+    const p = src.dist_mm ? at.clone().addScaledVector(dir, src.dist_mm) : dir.multiplyScalar(SPEAKER_MM);
     // A dodecahedron: the lab's omnidirectional source, as the simulation's point source radiates equally every way.
     // Talker solid, babble pale — role by SHADE, so the figure needs no colour. The rings mark sound leaving in ALL directions.
     const src3 = new THREE.Mesh(keep(new THREE.DodecahedronGeometry(16)), src.role === "talker" ? dark : pale);
@@ -103,7 +113,7 @@ export async function snapHead(pid: string, left: boolean, sources: { role: "tal
     const edge = new THREE.LineSegments(keep(new THREE.EdgesGeometry(src3.geometry)), ringMat);
     edge.position.copy(p);
     scene.add(src3, edge);
-    for (const r of [34, 58, 82]) {
+    if (!src.dist_mm) for (const r of [34, 58, 82]) {
       const ring = new THREE.LineLoop(circle, ringMat);
       ring.position.copy(p);
       ring.scale.setScalar(r);
@@ -120,7 +130,8 @@ export async function snapHead(pid: string, left: boolean, sources: { role: "tal
 
   const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, 6000);
   const half = 340 / view.zoom, aspect = canvas.width / canvas.height;
-  Object.assign(camera, { left: -half * aspect, right: half * aspect, top: half, bottom: -half });
+  const px = -(view.panX ?? 0) * 2 * half, py = (view.panY ?? 0) * 2 * half;   // the frustum moves opposite the picture
+  Object.assign(camera, { left: -half * aspect + px, right: half * aspect + px, top: half + py, bottom: -half + py });
   // Orbit the default view about the rig's centre; pitch stays between just above the floor and straight down.
   const orbit = new THREE.Spherical().setFromVector3(new THREE.Vector3(s * 700, 560, 700).sub(TARGET));
   orbit.theta += THREE.MathUtils.degToRad(view.yaw);

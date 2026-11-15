@@ -6,9 +6,9 @@ const RUN = "d60d88e7550d"; // the dev chord's run (Dashboard DEV_RUN_ID)
 // A real earpiece (preview.png, earpiece*.glb) when this checkout has one; AID_FIXTURE_DIR points at another build.
 const DIR = process.env.AID_FIXTURE_DIR ?? "../backend/data/patients/8e0c9758fead/aid/cone";
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
-const OPTIONS = [1, 2, 3, 4].map((i) => ({ id: `grid${i}`, reason: `Reason for option ${i}.`, key_met: "3 of 4", gain_mean_db: Array(18).fill(4 + i), files: { "preview.png": "x" } }));
+const OPTIONS = [1, 2, 3, 4].map((i) => ({ id: `grid${i}`, reason: `Reason for option ${i}.`, key_met: "3 of 4", gain_mean_db: Array(18).fill(4 + i), files: { "preview.png": "x" }, recommended: i === 1 }));
 
-// Catches the four designs drifting off the orb (a 2×2 grid in front of it, centred on it), a card that does not lift on hover, an expanded view missing a model, or a select that never reaches the lead.
+// Catches the four designs drifting off the orb (one row in front of it, centred on it), a card that does not lift on hover, an expanded view missing a model, or a select that never reaches the lead.
 test("the four designs sit in front of the orb, lift on hover, expand into both models and select", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   const posted: unknown[] = [];
@@ -30,6 +30,7 @@ test("the four designs sit in front of the orb, lift on hover, expand into both 
     return !!w && getComputedStyle(w).opacity === "1";
   });
   await page.locator("body").click({ position: { x: 5, y: 400 } });
+  const t0 = Date.now();
   await page.keyboard.down("1");
   await page.keyboard.down("2");
   await page.keyboard.up("2");
@@ -37,17 +38,24 @@ test("the four designs sit in front of the orb, lift on hover, expand into both 
 
   const cards = page.getByTestId("aid-option");
   await expect(cards).toHaveCount(4);
+  // ONLY the designer's top performer carries the badge — catches the flag dropped between backend and card.
+  await expect(page.getByTestId("aid-recommended")).toHaveCount(1);
+  await expect(cards.nth(0).getByTestId("aid-recommended")).toBeVisible();
+  // The cards wait for the orb's 0.9 s rise — catches them popping in before the orb they sit in front of.
+  expect(Date.now() - t0).toBeGreaterThan(800);
   await page.waitForTimeout(2000); // orb rise, then the cards re-measure around it
   const orb = (await page.getByTestId("orb").boundingBox())!;
   const cx = orb.x + orb.width / 2, cy = orb.y + orb.height / 2;
   const boxes = await Promise.all([0, 1, 2, 3].map((i) => cards.nth(i).boundingBox()));
-  // A 2×2 grid in front of the orb: 1 2 over 3 4, its centre on the orb's centre.
-  expect(boxes[1]!.x).toBeGreaterThan(boxes[0]!.x + boxes[0]!.width);
-  expect(boxes[2]!.y).toBeGreaterThan(boxes[0]!.y + boxes[0]!.height);
+  // One row in front of the orb, 1 to 4 left to right, its centre on the orb's centre.
+  for (let i = 1; i < 4; i++) {
+    expect(boxes[i]!.x).toBeGreaterThan(boxes[i - 1]!.x + boxes[i - 1]!.width);
+    expect(Math.abs(boxes[i]!.y - boxes[0]!.y)).toBeLessThan(2);
+  }
   expect(Math.abs((boxes[0]!.x + boxes[3]!.x + boxes[3]!.width) / 2 - cx)).toBeLessThan(8);
-  expect(Math.abs((boxes[0]!.y + boxes[3]!.y + boxes[3]!.height) / 2 - cy)).toBeLessThan(8);
+  expect(Math.abs(boxes[0]!.y + boxes[0]!.height / 2 - cy)).toBeLessThan(8);
   // In front: the topmost element at the orb's centre is a card's gap or a card, never the orb above them.
-  expect(await page.evaluate(([x, y]) => !!document.elementFromPoint(x, y - 60)?.closest("[data-testid=aid-options]"), [cx, cy])).toBe(true);
+  expect(await page.evaluate(([x, y]) => !!document.elementFromPoint(x, y)?.closest("[data-testid=aid-options]"), [cx, cy])).toBe(true);
   await page.screenshot({ path: test.info().outputPath("around.png") });
 
   const before = boxes[1]!.y;
@@ -60,6 +68,12 @@ test("the four designs sit in front of the orb, lift on hover, expand into both 
   const expanded = page.getByTestId("aid-expanded");
   await expect(expanded.getByTestId("aid-model")).toHaveCount(2);
   await expect(expanded).toContainText("Reason for option 2.");
+  // Reason centred UNDER the models in the standard grey — catches it drifting back beside Select or above the models.
+  const panel = (await expanded.boundingBox())!, reason = expanded.getByText("Reason for option 2.");
+  const rb = (await reason.boundingBox())!, mb = (await expanded.getByTestId("aid-model").first().boundingBox())!;
+  expect(Math.abs(rb.x + rb.width / 2 - (panel.x + panel.width / 2))).toBeLessThan(4);
+  expect(rb.y).toBeGreaterThan(mb.y + mb.height);
+  await expect(reason).toHaveCSS("color", "rgb(154, 160, 168)");
   await page.waitForTimeout(1500); // meshes load
   await page.screenshot({ path: test.info().outputPath("expanded.png") });
   await expanded.getByRole("button", { name: "Select option 2" }).click();

@@ -13,6 +13,7 @@ const SCENES = [
   { id: "s2", name: "Friend on the right", sound: "friend talking", why: "Aided side.", weight: 2, sources: [{ role: "talker", az: 90, el: 0, level_db: 60 }] },
   { id: "s3", name: "Busy cafe", sound: "cafe chatter", why: "Noise at the front.", weight: 1, sources: [{ role: "talker", az: 90, el: 0, level_db: 65 }, { role: "babble", az: 0, el: 0, level_db: 60 }] },
 ];
+const WAVE = JSON.parse(fs.readFileSync("public/sim/wave_check_example.json", "utf8"));
 const OPTIONS = [1, 2, 3, 4].map((i) => ({ id: `grid${i}`, reason: `Reason for option ${i}.`, key_met: `${5 - i} of 4`, objective: i, gain_mean_db: Array(18).fill(4 + i), files: { "preview.png": `aid/grid${i}/preview.png`, "earpiece_print.stl": `aid/grid${i}/earpiece_print.stl` } }));
 
 /** The agents server's lead (agents/src/horn_study/server.py), as a small stage machine with the real copy. */
@@ -33,12 +34,12 @@ async function mockLead(page: Page, log: string[]) {
       log.push(event ?? message);
       if (event === "sims_done") go("design_ready", "Great, I have enough data to develop a hearing aid. Ready to see it?", { sims: data });
       else if (event === "options") go("options", "Here are four options, each with its reasoning. Pick the one you want.", { options: data.options });
-      else if (event === "picked") go("validating", "Let's check it really helps you. Click the orb to watch.", { picked: data.design_id });
-      else if (event === "validated") go("final", `${data.summary} Ask me anything, or say "report" for your final report and the file to print.`, { validation: data });
+      else if (event === "picked") go("validating", "Let's check it really helps you: your simulations are running again with that earpiece in your ear.", { picked: data.design_id });
+      else if (event === "validated") go("final", `${data.summary} Want your final report and the file to print?`, { validation: data });
       else if (message === "yes" && s.stage === "sim_ready") go("sim_count", "How many simulations should I run? Pick a number from 1 to 100.");
       else if (message === "3" && s.stage === "sim_count") go("sim_prep", "Setting up 3 simulations from your profile and the research.");
       else if (message === "yes" && s.stage === "design_ready") go("designing", "Designing your hearing aid. Four options are on the way.");
-      else if (message === "report" && s.stage === "final") go("done", "Your report is ready, with the file to print.", { report: "Your hearing test shows a high-frequency loss.\n\nOption 2 helped in every scene." });
+      else if (message === "yes" && s.stage === "final") go("done", "Your report is ready, with the file to print.", { report: "Your hearing test shows a high-frequency loss.\n\nOption 2 helped in every scene." });
     }
     return route.fulfill({ contentType: "application/json", headers: CORS, body: JSON.stringify({ ...s, polls }) });
   });
@@ -48,6 +49,7 @@ async function mockLead(page: Page, log: string[]) {
 async function mockSim(page: Page, asked: string[]) {
   const grid = JSON.parse(fs.readFileSync("public/sim/ear_grid.json", "utf8"));
   grid.patient = { id: RUN, average_ear: false, side: "left", audiogram_db_hl: { "250": 15, "500": 20, "1000": 30, "2000": 45, "4000": 55, "6000": 55 }, audiogram_is_example: false };
+  let picked: string | null = null;
   await page.route("**/api/sim/patients/**", (route) => {
     const url = route.request().url();
     asked.push(`${route.request().method()} ${url.replace(/^.*\/patients\//, "")}`);
@@ -57,6 +59,11 @@ async function mockSim(page: Page, asked: string[]) {
       const name = url.split("/").pop()!.split("?")[0], real = `${PREVIEW_DIR}/${name}`;
       const body = fs.existsSync(real) ? fs.readFileSync(real) : PNG;
       return route.fulfill({ contentType: name.endsWith(".png") ? "image/png" : name.endsWith(".glb") ? "model/gltf-binary" : "model/stl", body });
+    }
+    // The picked earpiece's 3D wave check: done on its first poll, for whichever design was asked for.
+    if (url.includes("/wave_check")) {
+      if (route.request().method() === "POST") { picked = route.request().postDataJSON().design_id; return route.fulfill({ status: 202, contentType: "application/json", body: "{}" }); }
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify(picked ? { status: "done", design_id: picked, result: { ...WAVE, design_id: picked } } : { status: "none" }) });
     }
     if (url.includes("/grid")) return route.fulfill({ contentType: "application/json", body: JSON.stringify(grid) });
     if (route.request().method() === "POST") return route.fulfill({ status: 202, contentType: "application/json", body: "{}" });
@@ -115,10 +122,11 @@ test("after research the lead runs the simulations, offers four aids, validates 
   // A tile opens its run: the 3D wave field on the head, the ear's 2D wave slices, the live pixel field, and the run's numbers. Catches the detail view losing a figure or its way back.
   await sims.getByTestId("sim-tile").first().click();
   const detail = page.getByTestId("sim-detail");
-  await expect(detail.getByTestId("sim-3d")).toHaveAttribute("src", /\/head\/viewer\.html\?embed=1&run=az000_el%2B00&rig=1&ear=left$/);
-  await expect(detail.getByTestId("sim-2d-lab")).toHaveAttribute("src", /\/waves\/left\/index\.html\?embed=1&run=az000_el%2B00&disp=slices$/);
-  await expect(detail.getByTestId("sim-slice")).toBeVisible();
-  await expect(detail.getByTestId("sim-info")).toContainText("family talking");
+  await expect(detail.getByTestId("sim-3d")).toHaveAttribute("src", /\/head\/viewer\.html\?embed=1&run=az000_el%2B00&rig=1&ear=left(&|$)/);
+  await expect(detail.getByTestId("sim-ear")).toHaveAttribute("src", /\/waves\/left\/index\.html\?embed=1&run=az000_el%2B00&disp=slices$/);
+  // No head grid in this mock: c says so instead of painting a field.
+  await expect(detail.getByText(/No head grid for this patient/).first()).toBeVisible({ timeout: 10_000 });
+  await expect(detail.getByTestId("sim-info")).toContainText("Speech heard");
   await expect(detail.getByTestId("sim-deficit")).toBeVisible();
   await page.waitForTimeout(1500);
   await page.screenshot({ path: test.info().outputPath("detail.png") });
@@ -153,16 +161,25 @@ test("after research the lead runs the simulations, offers four aids, validates 
   // Picking reopens the orb on the same runs, now scored with the aid. Visible, not just opaque: the hidden layer keeps its old opacity.
   await expect(sims).toBeVisible({ timeout: 10_000 });
   await expect(sims).toHaveCSS("opacity", "1");
-  await expect(sims.getByTestId("sim-sii").first()).toContainText("→");
+  // The SAME scenes, now normal hearing against the aid — from the PICKED earpiece in the wave sim. Catches the reopen never asking for the wave check, or for the wrong design (the mock answers only the design asked for).
+  await expect(sims.getByTestId("sim-sii").first()).toContainText("aid", { timeout: 15_000 });
+  await expect(sims.getByTestId("sim-sii").first()).toContainText("normal");
+  expect(asked).toContain("POST d60d88e7550d/design/wave_check?ear=left");
   await page.screenshot({ path: test.info().outputPath("validate.png") });
   await page.getByRole("button", { name: "Exit simulation" }).click();
   await expect(line).toContainText("With option 2 you hear");
+  await expect(line).toContainText("Want your final report and the file to print?");
 
-  await send(page, "report");
-  const report = page.getByTestId("final-report");
-  await expect(report).toContainText("Option 2 helped in every scene.");
-  await expect(report.getByRole("link", { name: "Download STL to print" })).toHaveAttribute("href", "/api/sim/patients/d60d88e7550d/design/files/grid2/earpiece_print.stl?ear=left");
+  // the report is a downloaded PDF and the PICKED design's print file, never a pop-up (e2e/report-download.spec.ts checks the PDF)
+  const downloads: string[] = [];
+  page.on("download", (d) => downloads.push(d.suggestedFilename()));
+  const stl = page.waitForRequest((r) => r.url().includes("/design/files/grid2/earpiece_print.stl?ear=left"), { timeout: 60_000 });
+  await send(page, "yes");
+  await stl;
+  await expect.poll(() => downloads.length, { timeout: 60_000 }).toBe(2);
+  expect(downloads.some((n) => n.endsWith(".pdf")) && downloads.some((n) => n.endsWith(".stl"))).toBe(true);
+  await expect(page.getByTestId("final-report")).toHaveCount(0);
   await page.waitForTimeout(800);
   await page.screenshot({ path: test.info().outputPath("report.png") });
-  expect(said).toEqual(["", "yes", "3", "sims_done", "yes", "options", "picked", "validated", "report"]);
+  expect(said).toEqual(["", "yes", "3", "sims_done", "yes", "options", "picked", "validated", "yes"]);
 });

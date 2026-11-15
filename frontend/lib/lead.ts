@@ -6,11 +6,15 @@ export type StudyStatus = "none" | "running" | "completed" | "failed" | "cancell
 /** stage "new": the run is still processing (or its ear cards have not cleared), so the lead has not spoken yet. */
 export type LeadStage = "new" | "opening" | "begin" | "launched" | "sim_ready" | "sim_count" | "sim_prep" | "sim_running" | "design_ready" | "designing" | "options" | "validating" | "final" | "done";
 /** One simulation the lead picked (agents lead.PickedScene): talkers and babble around the aided ear, az 0–180 only. */
-export type LeadScene = { id: string; name: string; sound: string; why: string; weight: number; sources: { role: "talker" | "babble"; az: number; el: number; level_db: number }[] };
+/** A scene source. `sound` picks a clip from the backend's sound bank (GET /api/sim/sounds/{name}; absent = the speech
+ * clips). `dist_mm` puts the speaker that close to the aided ear's canal opening — a phone or a whisper touching the ear;
+ * absent = the grid's usual distance. With `dist_mm`, level_db is the free-field level it makes AT the ear. */
+export type LeadSource = { role: "talker" | "babble"; az: number; el: number; level_db: number; sound?: string; dist_mm?: number };
+export type LeadScene = { id: string; name: string; sound: string; why: string; weight: number; sources: LeadSource[] };
 /** One finished simulation as the dashboard reports it; deficit_db is what scene_design designs from. */
 export type SimResult = { id: string; name: string; weight: number; sii_healthy: number; sii_unaided: number; deficit_db: number[]; deficit_weighted: number[] };
 /** One of the four designs (backend hornsim.scene_design options). */
-export type AidOption = { id: string; reason: string; key_met: string; gain_mean_db: number[]; files: Record<string, string> };
+export type AidOption = { id: string; reason: string; key_met: string; gain_mean_db: number[]; files: Record<string, string>; recommended?: boolean };
 /** The simulation half's fields are ABSENT until their stage has produced them. `ear` is the aided ear the study targeted. */
 export type LeadReply = {
   run_id: string; stage: LeadStage; reply: string; awaiting_launch: boolean; launch_requested: boolean; study_id: string | null; status: StudyStatus; updated_at: number;

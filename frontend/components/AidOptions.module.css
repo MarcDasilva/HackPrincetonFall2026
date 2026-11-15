@@ -1,5 +1,6 @@
-.row { position: fixed; top: 150px; left: 16px; right: 16px; z-index: 15; display: flex; justify-content: center; }
-.around { position: fixed; z-index: 15; transform: translate(-50%, -50%); }
+/* Mounted ONLY once the orb has settled (Dashboard's `arrived`), then fades in — mounting earlier showed the cards before the orb. */
+.row { position: fixed; top: 150px; left: 16px; right: 16px; z-index: 15; display: flex; justify-content: center; animation: fade 0.6s ease-out both; }
+.around { position: fixed; z-index: 15; transform: translate(-50%, -50%); animation: fade 0.6s ease-out both; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 250px)); gap: 18px; justify-content: center; width: 100%; max-width: 1120px; }
 
 /* Solid black: the cards sit IN FRONT of the orb, and its network showed straight through the metal frame. */
@@ -10,20 +11,29 @@
 
 /* Blue select button with an arrow, in the card's bottom-right corner. */
 .select { position: absolute; right: 12px; bottom: 12px; display: flex; align-items: center; justify-content: center; gap: 6px; height: 40px; min-width: 40px; padding: 0; border: 0; border-radius: 999px; background: #3b82f6; color: #fff; font: inherit; font-size: 14px; cursor: pointer; box-shadow: 0 4px 14px rgba(59, 130, 246, 0.45); transition: transform 0.2s ease, background 0.2s ease; }
+/* Top-left, clear of the select button bottom-right: marks the designer's top performer. */
+.badge { position: absolute; top: 12px; left: 12px; padding: 3px 10px; border-radius: 999px; background: #3b82f6; color: #fff; font-size: 12px; pointer-events: none; }
 .select:hover { background: #2f74e6; transform: translate(2px, -2px); }
 .select.labelled { padding: 0 16px 0 18px; }
 
 .backdrop { position: fixed; inset: 0; z-index: 40; display: flex; align-items: center; justify-content: center; padding: 24px 16px; background: rgba(0, 0, 0, 0.6); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
 .panel { width: min(1100px, 100%); animation: grow 0.35s cubic-bezier(0.2, 0.8, 0.2, 1); }
 .inner { position: relative; display: flex; flex-direction: column; gap: 14px; padding: 18px; border: 2px solid transparent; border-radius: 24px; color: #c9ccd1; font-size: 14px; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.7); }
-.head { display: flex; justify-content: space-between; align-items: center; color: #e6e8eb; font-size: 17px; }
+.head { position: relative; display: flex; justify-content: center; align-items: center; min-height: 34px; padding: 0 52px; text-align: center; }
+.title { color: #e6e8eb; font-size: 17px; }
+/* #9aa0a8: the dashboard's standard grey (run status, session picker). */
+.reason { color: #9aa0a8; font-size: 14px; line-height: 1.45; }
+.head .close { position: absolute; top: 0; right: 0; }
 .models { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .model { position: relative; height: min(52vh, 460px); border-radius: 14px; overflow: hidden; background: radial-gradient(circle at 50% 45%, #1c1d20, #000 70%); }
 .tag { position: absolute; top: 10px; left: 12px; z-index: 1; padding: 3px 10px; border-radius: 999px; background: rgba(0, 0, 0, 0.6); color: #e6e8eb; font-size: 12px; pointer-events: none; }
-.foot { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 40px; padding-right: 2px; }
-.foot .select { position: static; }
+/* Reason centred under the models; side padding keeps it clear of the Select button pinned right. */
+.foot { position: relative; display: flex; align-items: center; justify-content: center; min-height: 40px; padding: 0 130px; text-align: center; }
+.foot .select { position: absolute; right: 2px; bottom: auto; top: 50%; transform: translateY(-50%); }
+.foot .select:hover { transform: translate(2px, calc(-50% - 2px)); }
 .close { width: 34px; height: 34px; border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 999px; background: transparent; color: #e6e8eb; cursor: pointer; display: flex; align-items: center; justify-content: center; }
 
 @media (max-width: 720px) { .models { grid-template-columns: 1fr; } .model { height: 34vh; } }
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes grow { from { opacity: 0; transform: scale(0.92) translateY(12px); } to { opacity: 1; transform: none; } }
-@media (prefers-reduced-motion: reduce) { .card, .select { transition: none; } .card:hover { transform: none; } .panel { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .card, .select { transition: none; } .card:hover { transform: none; } .panel, .row, .around { animation: none; } }

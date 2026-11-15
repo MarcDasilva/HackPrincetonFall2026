@@ -10,7 +10,7 @@ export const FRAME_EVERY = 4;       // frames cover the first FRAME_STEPS: the p
 export const FRAME_STEPS = 480;
 
 type Job = {
-  id: number; owner: string; az: number; el: number;
+  id: number; owner: string; az: number; el: number; dist?: number;
   onFrame?: (step: number, slice: Float32Array) => void;
   resolve: (spectrum: number[]) => void; reject: (e: Error) => void;
 };
@@ -41,9 +41,10 @@ export class SimPool {
   subscribe(fn: () => void) { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; }
   private emit() { this.listeners.forEach((f) => f()); }
 
-  run(owner: string, az: number, el: number, onFrame?: Job["onFrame"]): Promise<number[]> {
+  /** `dist` (mm from the canal opening) moves the speaker in from the grid's radius: a source touching the ear. */
+  run(owner: string, az: number, el: number, onFrame?: Job["onFrame"], dist?: number): Promise<number[]> {
     return new Promise((resolve, reject) => {
-      this.queue.push({ id: this.nextId++, owner, az, el, onFrame, resolve, reject });
+      this.queue.push({ id: this.nextId++, owner, az, el, dist, onFrame, resolve, reject });
       this.pump();
     });
   }
@@ -59,7 +60,7 @@ export class SimPool {
     while (this.idle.length && this.queue.length) {
       const w = this.idle.pop()!, j = this.queue.shift()!;
       this.running.set(w, j);
-      w.postMessage({ type: "run", job: j.id, az: j.az, el: j.el, nSteps: N_STEPS, frameEvery: FRAME_EVERY, frameSteps: FRAME_STEPS });
+      w.postMessage({ type: "run", job: j.id, az: j.az, el: j.el, dist: j.dist, nSteps: N_STEPS, frameEvery: FRAME_EVERY, frameSteps: FRAME_STEPS });
     }
     this.emit();
   }

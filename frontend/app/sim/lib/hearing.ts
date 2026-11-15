@@ -46,9 +46,10 @@ export function nalR(ag: Audiogram) {
   return hearingLevel(Object.fromEntries(HASPI_FREQS.map((f, i) => [f, g[i]])), SII_FREQS);
 }
 
-/** Band spectrum levels (dB SPL/Hz) of standard-spectrum speech at `level_db`, shifted per band by `gainDb`. */
-export function speechBands(levelDb: number, gainDb: number[]) {
-  return SII_U.map((u, i) => u + levelDb - U_OVERALL + gainDb[i]);
+/** Band spectrum levels (dB SPL/Hz) of a source at `level_db`, shifted per band by `gainDb`. `shapeDb` is the source's OWN
+ * clip (clip.ts bandShape: its long-term level per band at 0 dB overall); ABSENT, the ANSI standard speech spectrum stands in. */
+export function speechBands(levelDb: number, gainDb: number[], shapeDb?: number[]) {
+  return SII_U.map((u, i) => (shapeDb ? shapeDb[i] : u - U_OVERALL) + levelDb + gainDb[i]);
 }
 
 /** Sum of incoherent band levels (dB). */
@@ -78,7 +79,7 @@ export function sii(E: number[], N: number[] | null, hl: number[]) {
   return aud.reduce((s, a, i) => s + SII_IMPORTANCE[i] * L[i] * ((a + 15) / 30), 0);
 }
 
-export type SceneSource = { role: "talker" | "babble"; az: number; el: number; levelDb: number; gainDb: number[] };
+export type SceneSource = { role: "talker" | "babble"; az: number; el: number; levelDb: number; gainDb: number[]; shapeDb?: number[] };
 
 /** One scene through a healthy ear and this ear, no device (runner.run_scene). With `deviceGainDb`
  * (the earpiece's insertion gain per band) also the aided SII: the device sits in front of the
@@ -87,8 +88,8 @@ export function sceneDeficit(sources: SceneSource[], ag: Audiogram, deviceGainDb
   const talk = sources.filter((s) => s.role === "talker");
   const noise = sources.filter((s) => s.role === "babble");
   if (!talk.length) return null;
-  const E = powerSum(talk.map((s) => speechBands(s.levelDb, s.gainDb)));
-  const N = noise.length ? powerSum(noise.map((s) => speechBands(s.levelDb, s.gainDb))) : null;
+  const E = powerSum(talk.map((s) => speechBands(s.levelDb, s.gainDb, s.shapeDb)));
+  const N = noise.length ? powerSum(noise.map((s) => speechBands(s.levelDb, s.gainDb, s.shapeDb))) : null;
   const hl0 = SII_FREQS.map(() => 0), hl = hearingLevel(ag, SII_FREQS);
   const healthy = siiTerms(E, N, hl0), impaired = siiTerms(E, N, hl);
   const deficit = healthy.aud.map((a, i) => a - impaired.aud[i]);

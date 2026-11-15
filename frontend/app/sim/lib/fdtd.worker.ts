@@ -4,7 +4,7 @@
 import { bandFreqs } from "./bands";
 import { decodeSolid, dtFor, runClick, speakerMm, spectrumAt, toCell, type EarGrid } from "./fdtd";
 
-export type JobIn = { type: "init"; grid: EarGrid } | { type: "run"; job: number; az: number; el: number; nSteps: number; frameEvery: number; frameSteps: number };
+export type JobIn = { type: "init"; grid: EarGrid } | { type: "run"; job: number; az: number; el: number; nSteps: number; frameEvery: number; frameSteps: number; dist?: number };
 export type JobOut =
   | { type: "frame"; job: number; step: number; slice: Float32Array }
   | { type: "done"; job: number; spectrum: number[]; ms: number }
@@ -23,7 +23,7 @@ self.onmessage = (e: MessageEvent<JobIn>) => {
   }
   if (!grid || !solid) { self.postMessage({ type: "error", job: m.job, message: "worker has no grid" } satisfies JobOut); return; }
   const t0 = performance.now();
-  const src = toCell(grid, solid, speakerMm(grid, m.az, m.el));
+  const src = toCell(grid, solid, speakerMm(grid, m.az, m.el, m.dist));
   const trace = runClick(grid, solid, [src], {
     nSteps: m.nSteps,
     frameEvery: m.frameEvery,

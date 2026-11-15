@@ -16,18 +16,20 @@ export type DesignResult = {
     geometry: Record<string, number | string | boolean>; files: Record<string, string>;
   };
   /** The four distinct buildable designs, best first; `design` is options[0]. ABSENT from designs made before options existed. */
-  options?: (DesignResult["design"] & { reason: string })[];
+  options?: (DesignResult["design"] & { reason: string; recommended?: boolean })[];
   attempts: { design_id: string; objective: number; ok: boolean; reasons: string[] }[];
   swept: number; elapsed_s: number; notes: string[];
 };
 export type DesignStatus = { status: "none" | "queued" | "running" | "done" | "error"; log?: string[]; error?: string | null; result?: DesignResult | null };
 
-export type DesignScene = { id: string; name: string; weight: number; deficit_db: number[]; deficit_weighted: number[] };
+export type DesignScene = { id: string; name: string; weight: number; deficit_db: number[]; deficit_weighted: number[]; talker_az_deg?: number; talker_el_deg?: number };
 
 async function json<T>(r: Response): Promise<T> {
   if (!r.ok) {
     const body = await r.json().catch(() => ({}));
-    throw new Error(body.detail ? String(body.detail) : `HTTP ${r.status}`);
+    // FastAPI's 422 detail is a LIST of {loc, msg}: String() of it reads "[object Object]" to the patient.
+    const d = body.detail;
+    throw new Error(Array.isArray(d) ? d.map((e: { loc?: unknown[]; msg?: string }) => `${(e.loc ?? []).slice(1).join(".")}: ${e.msg}`).join("; ") : d ? String(d) : `HTTP ${r.status}`);
   }
   return r.json();
 }
@@ -46,7 +48,9 @@ export type WaveCheck = {
   model_1d_db: number[]; wave: { az: number; gain_db: number[] }[]; elapsed_s: number; notes: string[];
 };
 export type WaveStatus = { status: "none" | "queued" | "running" | "done" | "error"; design_id?: string; log?: string[]; error?: string | null; result?: WaveCheck | null };
-export const startWaveCheck = (pid: string, azimuths = [0, 90], dx_mm = 1.0) =>
-  fetch(`/api/sim/patients/${pid}/design/wave_check`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ azimuths, dx_mm }) })
+export const startWaveCheck = (pid: string, azimuths = [0, 90], dx_mm = 1.0, design_id?: string, ear?: string) =>
+  fetch(`/api/sim/patients/${pid}/design/wave_check${q(ear)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ azimuths, dx_mm, design_id }) })
     .then((r) => json<{ status_url: string }>(r));
-export const waveStatus = (pid: string) => fetch(`/api/sim/patients/${pid}/design/wave_check`).then((r) => json<WaveStatus>(r));
+export const waveStatus = (pid: string, ear?: string) => fetch(`/api/sim/patients/${pid}/design/wave_check${q(ear)}`).then((r) => json<WaveStatus>(r));
+/** The earpiece's insertion gain per band, power-averaged over the check's directions: ONE curve the orb applies to every scene. */
+export const waveGain = (w: WaveCheck) => w.wave[0].gain_db.map((_, b) => 10 * Math.log10(w.wave.reduce((t, r) => t + 10 ** (r.gain_db[b] / 10), 0) / w.wave.length));

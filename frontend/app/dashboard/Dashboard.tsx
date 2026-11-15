@@ -10,10 +10,10 @@ import { fakeHearing } from "@/lib/fakeHearing";
 import type { Result } from "@/lib/audiometry";
 import { pollRun, runNote, startRun, type EarPhoto, type Run } from "@/lib/run";
 import type { Ear } from "@/lib/audiometry";
-import { createSession, getLead, leadEvent, listSessions, MOVING, talkToLead, type LeadReply } from "@/lib/lead";
+import { createSession, getLead, leadEvent, listSessions, MOVING, studyEvents, talkToLead, type LeadReply } from "@/lib/lead";
 import SimRuns, { type Outcome } from "@/app/sim/SimRuns";
 import AidOptions from "@/components/AidOptions";
-import { designFile, designStatus, startDesign } from "@/app/sim/lib/api";
+import { designFile, designStatus, startDesign, startWaveCheck, waveGain, waveStatus } from "@/app/sim/lib/api";
 import ResearchBoxes, { RESEARCH_LINE } from "@/components/ResearchBoxes";
 import EarViews, { type View } from "@/components/EarViews";
 import WaveBento from "@/components/WaveBento";
@@ -301,7 +301,8 @@ export default function Dashboard() {
   // Poll the backend job. Deps are id+status only — new files and steps arrive through setRun without restarting the timer.
   useEffect(() => {
     if (!run || run.status === "done" || run.status === "error") return;
-    const t = setInterval(() => pollRun(run).then(setRun, () => {}), 1500);
+    // 750 ms: each ear's views appear as soon as the backend writes them; half the old 1.5 s between a file landing and the reveal.
+    const t = setInterval(() => pollRun(run).then(setRun, () => {}), 750);
     return () => clearInterval(t);
   }, [run?.id, run?.status]); // eslint-disable-line react-hooks/exhaustive-deps
   const rowGone = (row: string) => !!run && goneRows.includes(`${run.id}:${row}`);
@@ -380,6 +381,7 @@ export default function Dashboard() {
     const tw = gsap.to(boxes.current, { opacity: 0, duration: 0.8, ease: "power1.out", onComplete: () => setResearch(false) });
     return () => { tw.kill(); };
   }, [view?.stage, research]); // eslint-disable-line react-hooks/exhaustive-deps
+  const DESIGN_MAX_SCENES = 64;
   // designing: ask the backend for the four designs from the simulations' deficits, poll, and hand them to the lead. ONE request per entry into the stage.
   const designing = useRef(false);
   useEffect(() => {
@@ -388,7 +390,13 @@ export default function Dashboard() {
     const { results, audiogram_db_hl } = view.sims, ear = view.ear ?? undefined;
     let live = true;
     (async () => {
-      const scenes = results.filter((x) => x.weight > 0).map((x) => ({ id: x.id, name: x.name, weight: x.weight, deficit_db: x.deficit_db, deficit_weighted: x.deficit_weighted }));
+      // The backend designs from at most 64 scenes (sim_api DesignRequest); a 100-scene run sends the 64 that weigh most:
+      // scene weight × speech-weighted hearing lost. Over 64, the whole request failed with a 422.
+      // The talker of each scene the lead picked: the designer aims each option at one of them.
+      const talker = (id: string) => view.scenes?.find((sc) => sc.id === id)?.sources.find((src) => src.role === "talker");
+      const need = (x: (typeof results)[number]) => x.weight * x.deficit_weighted.reduce((a, b) => a + b, 0);
+      const scenes = results.filter((x) => x.weight > 0).sort((a, b) => need(b) - need(a)).slice(0, DESIGN_MAX_SCENES)
+        .map((x) => ({ id: x.id, name: x.name, weight: x.weight, deficit_db: x.deficit_db, deficit_weighted: x.deficit_weighted, talker_az_deg: talker(x.id)?.az, talker_el_deg: talker(x.id)?.el }));
       // "already running" (a reload mid-design) is fine: the poll below picks that design up.
       await startDesign(run.id, audiogram_db_hl, scenes, ear).catch((e: Error) => { if (!/already running/.test(e.message)) throw e; });
       for (;;) {
@@ -398,13 +406,57 @@ export default function Dashboard() {
         if (st?.status === "error") throw new Error(st.error ?? "design failed");
         if (st?.status !== "done" || !st.result) continue;
         const opts = st.result.options ?? [{ ...st.result.design, reason: "The best design for your scenes." }];
-        return stepRef.current("options", { options: opts.map((o) => ({ id: o.id, reason: o.reason, key_met: o.key_met, gain_mean_db: o.gain_mean_db, files: o.files })) });
+        return stepRef.current("options", { options: opts.map((o) => ({ id: o.id, reason: o.reason, key_met: o.key_met, gain_mean_db: o.gain_mean_db, files: o.files, recommended: o.recommended })) });
       }
     })().catch((e: Error) => { if (live) void stepRef.current("design_failed", { error: e.message }); }).finally(() => { designing.current = false; });
     return () => { live = false; };
   }, [run?.id, view?.stage]); // eslint-disable-line react-hooks/exhaustive-deps
   // The simulations' latest numbers (SimRuns onDone), sent to the lead when the patient closes the orb.
   const [outcome, setOutcome] = useState<Outcome | null>(null);
+  // validating onward: the SAME scenes again, with the PICKED earpiece voxelized into the backend's wave sim (hornsim.aided_wave). Its gain is
+  // the aided curve; the design's own 1D gain stands in ONLY if the check fails. A reload re-reads a finished check.
+  // ponytail: 1.5 mm, not the check's 1.0 default — 1.0 takes 10+ minutes for five directions, 1.5 a couple of minutes.
+  const [aidGain, setAidGain] = useState<number[] | null>(null);
+  useEffect(() => {
+    const did = view?.picked;
+    setAidGain(null);
+    if (!run || !did || !(view.stage === "validating" || view.stage === "final" || view.stage === "done")) return;
+    const ear = view.ear ?? undefined;
+    let live = true;
+    (async () => {
+      let st = await waveStatus(run.id, ear);
+      if (st.design_id !== did || st.status === "none" || st.status === "error") await startWaveCheck(run.id, [0, 45, 90, 135, 180], 1.5, did, ear);
+      for (;;) {
+        await new Promise((ok) => setTimeout(ok, 2000));
+        if (!live) return;
+        st = await waveStatus(run.id, ear);
+        if (st.status === "error") throw new Error(st.error ?? "wave check failed");
+        if (st.status === "done" && st.result && st.design_id === did) return setAidGain(waveGain(st.result));
+      }
+    })().catch(() => { if (live) setAidGain(view.options?.find((o) => o.id === did)?.gain_mean_db ?? null); });
+    return () => { live = false; };
+  }, [run?.id, view?.picked, view?.stage === "validating" || view?.stage === "final" || view?.stage === "done"]); // eslint-disable-line react-hooks/exhaustive-deps
+  // done: the report PDF (lib/reportPdf.ts) and the print file download by themselves, ONCE per session — a reload of a
+  // finished session must not download them again. The lead's own line under the orb says they are on the way.
+  useEffect(() => {
+    if (!run || view?.stage !== "done" || !view.report) return;
+    const key = `auris-report:${run.id}`;
+    try { if (localStorage.getItem(key)) return; } catch {}
+    let live = true;
+    const v = view, id = run.id;
+    (async () => {
+      const [{ buildReport, save }, events] = await Promise.all([import("@/lib/reportPdf"), studyEvents(id).then((r) => r.events, () => [])]);
+      const pdf = await buildReport({ runId: id, view: v, events });
+      if (!live) return;
+      try { localStorage.setItem(key, "1"); } catch {}
+      const day = new Date().toISOString().slice(0, 10);
+      save(pdf, `Auris report ${day}.pdf`);
+      if (!v.picked) return;
+      const stl = await fetch(designFile(id, v.picked, "earpiece_print.stl", v.ear ?? undefined)).then((r) => (r.ok ? r.blob() : null), () => null);
+      if (stl) save(stl, `Auris earpiece ${day}.stl`);
+    })().catch(() => { if (live) setLead({ line: "I couldn't build the report file. Ask me again for your report.", waiting: false }); });
+    return () => { live = false; };
+  }, [run?.id, view?.stage, !!view?.report]); // eslint-disable-line react-hooks/exhaustive-deps
   if (!ready) return null;
 
   const openCam = async () => {
@@ -568,7 +620,6 @@ export default function Dashboard() {
       else setLead({ line: "The assistant is unreachable. Is the agents server running on :8010?", waiting: false });
     }
   };
-  const pickedGain = view?.options?.find((o) => o.id === view.picked)?.gain_mean_db;
   const exitSim = () => {
     setZoomed(false);
     if (!view || (view.stage !== "sim_running" && view.stage !== "validating")) return;
@@ -578,14 +629,13 @@ export default function Dashboard() {
     const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / Math.max(1, xs.length);
     const pct = (v: number) => `${Math.round(v * 100)}%`;
     const unaided = mean(outcome.results.map((x) => x.sii_unaided));
+    const healthy = mean(outcome.results.map((x) => x.sii_healthy));
     if (view.stage === "sim_running") {
-      const healthy = mean(outcome.results.map((x) => x.sii_healthy));
       return void step("sims_done", { ...outcome, summary: `Across ${outcome.results.length} scenes you hear ${pct(unaided)} of speech on average, against ${pct(healthy)} with normal hearing.` });
     }
     const aided = outcome.aided!.map((v) => v ?? 0);
-    const better = aided.filter((v, i) => v > outcome.results[i].sii_unaided).length;
     const n = (view.options?.findIndex((o) => o.id === view.picked) ?? 0) + 1;
-    void step("validated", { aided, summary: `With option ${n} you hear ${pct(mean(aided))} of speech on average, up from ${pct(unaided)}. It helps in ${better} of ${aided.length} scenes.` });
+    void step("validated", { aided, gain_db: aidGain, summary: `With option ${n} you hear ${pct(mean(aided))} of speech on average, against ${pct(healthy)} with normal hearing (${pct(unaided)} without it).` });
   };
   exitRef.current = exitSim;
   /** The orb's centre on screen (its rect already includes the rise's scale). */
@@ -916,25 +966,17 @@ export default function Dashboard() {
     {/* Inside the orb: one bento box per speaker direction, left and right ear side by side (components/WaveBento), gain panel on the right. Mounted ONLY once the zoom lands (see inside) — ten wave viewers loading at once stall the main thread, and mid-zoom that freezes the zoom. The top padding keeps the header clear of the X. */}
     {/* The lead's simulations mount as soon as they exist and STAY mounted (hidden) outside the orb: the workers run in the background, and closing the orb must not restart them. */}
     {run && view?.scenes?.length ? (
-      <div ref={simWrap} data-testid="sims" style={{ position: "fixed", inset: 0, zIndex: 25, overflow: "auto", paddingTop: 56, opacity: 0, display: inside ? "block" : "none", background: "#fff" }}>
-        <SimRuns pid={run.id} ear={view.ear} scenes={view.scenes} gain={view.stage === "validating" || view.stage === "final" || view.stage === "done" ? pickedGain : undefined} onDone={setOutcome} />
+      <div ref={simWrap} data-testid="sims" style={{ position: "fixed", inset: 0, zIndex: 25, overflow: "auto", paddingTop: 56, opacity: 0, display: inside ? "block" : "none" }}>
+        <SimRuns pid={run.id} ear={view.ear} scenes={view.scenes} gain={aidGain ?? undefined} aidUrl={aidGain && view.picked ? designFile(run.id, view.picked, "earpiece.glb", view.ear ?? undefined) : undefined} onDone={setOutcome} />
       </div>
     ) : inside && run && (
       <div ref={simWrap} data-testid="sims" style={{ position: "fixed", inset: 0, zIndex: 25, overflow: "auto", paddingTop: 56, opacity: 0 }}>
         <WaveBento run={run} />
       </div>
     )}
-    {run && view?.stage === "options" && view.options && (
+    {/* `arrived`: the cards fade in ONLY once the orb has settled — mounted earlier they showed before it and were measured against a moving orb. */}
+    {run && view?.stage === "options" && view.options && arrived && (
       <AidOptions runId={run.id} ear={view.ear} options={view.options} around={orbSphere} onPick={async (id) => { await step("picked", { design_id: id }); setZoomed(true); }} />
-    )}
-    {run && view?.stage === "done" && view.report && (
-      <div data-testid="final-report" style={{ position: "fixed", top: 150, left: "50%", transform: "translateX(-50%)", width: 640, maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 470px)", minHeight: 160, overflow: "auto", zIndex: 15, padding: 18, borderRadius: 16, background: "#121212", border: "1px solid rgba(255,255,255,0.14)", color: "#c9ccd1", fontSize: 14, lineHeight: 1.5 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-          <strong style={{ color: "#e6e8eb", fontWeight: 500, fontSize: 16 }}>Your report</strong>
-          {view.picked && <a href={designFile(run.id, view.picked, "earpiece_print.stl", view.ear ?? undefined)} download style={{ padding: "6px 14px", borderRadius: 999, background: "#3b82f6", color: "#fff", textDecoration: "none" }}>Download STL to print</a>}
-        </div>
-        <div style={{ whiteSpace: "pre-wrap" }}>{view.report}</div>
-      </div>
     )}
     {zoomed && (
       <button type="button" aria-label="Exit simulation" onClick={exitSim} style={{ position: "fixed", top: 20, left: 20, zIndex: 30, ...iconBtn, width: 40, height: 40, border: "1px solid rgba(255,255,255,0.18)", background: "rgba(0,0,0,0.55)", color: "#e6e8eb" }}>

@@ -1,13 +1,14 @@
 "use client";
-// The chosen earpiece seated in the ear (earpiece_in_ear.glb from hornsim.earpiece).
+// The chosen earpiece seated in the ear (earpiece_in_ear.glb from hornsim.earpiece), or several GLBs in ONE frame —
+// the patient's photo-coloured ear_skin.glb with earpiece.glb inside it (components/AidOptions).
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
-import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { loadGlb } from "./lib/aidSnap";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import styles from "./sim.module.css";
 
 /** `className` replaces the /sim panel's fixed 210px box — the dashboard's option viewer fills its own. */
-export default function EarpieceView({ url, className = styles.earpiece }: { url: string; className?: string }) {
+export default function EarpieceView({ url, className = styles.earpiece }: { url: string | string[]; className?: string }) {
   const mount = useRef<HTMLDivElement>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -25,20 +26,18 @@ export default function EarpieceView({ url, className = styles.earpiece }: { url
     key.position.set(120, 160, 80);
     scene.add(key);
     let alive = true;
-    new GLTFLoader().load(url, (g) => {
+    // clones: the GLBs are cached and shared, and an Object3D has ONE parent
+    Promise.all((Array.isArray(url) ? url : [url]).map((u) => loadGlb(u).then((o) => o.clone()))).then((objs) => {
       if (!alive) return;
+      const g = { scene: new THREE.Group().add(...objs) };
       const box = new THREE.Box3().setFromObject(g.scene);
       const c = box.getCenter(new THREE.Vector3()), r = box.getSize(new THREE.Vector3()).length() / 2;
-      g.scene.traverse((o) => {
-        const m = o as THREE.Mesh;
-        if (m.isMesh) (Array.isArray(m.material) ? m.material : [m.material]).forEach((mat) => { mat.side = THREE.DoubleSide; });
-      });
       scene.add(g.scene);
       controls.target.copy(c);
       // Back far enough that the bounding sphere fits the 30° view, from the same angle as before.
       const dist = (r / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2))) * 1.1;
       camera.position.copy(c).add(new THREE.Vector3(1.9, 0.6, 0.9).normalize().multiplyScalar(dist));
-    }, undefined, (e) => setErr(String((e as Error).message ?? e)));
+    }, (e) => setErr(String((e as Error).message ?? e)));
 
     const resize = () => {
       renderer.setSize(el.clientWidth, el.clientHeight, false);
@@ -54,7 +53,7 @@ export default function EarpieceView({ url, className = styles.earpiece }: { url
     const tick = () => { controls.update(); renderer.render(scene, camera); raf = requestAnimationFrame(tick); };
     tick();
     return () => { alive = false; cancelAnimationFrame(raf); ro.disconnect(); controls.dispose(); renderer.dispose(); renderer.forceContextLoss(); el.removeChild(renderer.domElement); };
-  }, [url]);
+  }, [String(url)]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className={className} ref={mount}>
