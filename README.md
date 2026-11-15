@@ -1,5 +1,5 @@
-# HackPrincetonFall2026
-
+# Auris
+<img width="1670" height="1030" alt="auris" src="https://github.com/user-attachments/assets/94d0ea14-1312-455b-8210-59ae8c631412" />
 A personalized passive acoustic hearing device: a printed horn whose geometry is chosen for a modeled hearing profile and the user's intended use.
 
 ## Layout
