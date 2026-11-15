@@ -19,18 +19,14 @@ const sgn = (v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}`;
 const SEQ = ["#0d366b", "#104281", "#184f95", "#1c5cab", "#256abf", "#2a78d6", "#3987e5", "#5598e7", "#6da7ec", "#86b6ef", "#9ec5f4", "#b7d3f6", "#cde2fb"];
 
 type Props = {
-  /** "Left" / "Right": which ear this panel shows */
-  ear: string;
   rows: SceneRow[]; target: number[]; need: number[]; nal: number[]; complete: number; total: number;
-  pid: string; design: DesignStatus; designStale: boolean; canDesign: boolean;
-  /** a design is running for either ear (the button designs both) */
-  designing: boolean; onDesign: () => void;
+  pid: string; design: DesignStatus; designStale: boolean; canDesign: boolean; onDesign: () => void;
   wave: WaveStatus; onWaveCheck: () => void;
 };
 // 3D-measured gain, one line per talker direction (categorical slots 3 and 4, fixed order)
 const WAVE_COLORS = ["var(--series-3)", "var(--series-4)"];
 
-export default function Aggregate({ ear, rows, target, need, nal, complete, total, pid, design, designStale, canDesign, designing, onDesign, wave, onWaveCheck }: Props) {
+export default function Aggregate({ rows, target, need, nal, complete, total, pid, design, designStale, canDesign, onDesign, wave, onWaveCheck }: Props) {
   const [hover, setHover] = useState<{ band: number; row?: number; x: number; y: number } | null>(null);
   const res = design.status === "done" ? design.result ?? null : null;
   const G = res?.design.gain_mean_db, Gw = res?.design.gain_worst_db, reach = res?.reach_db;
@@ -60,11 +56,11 @@ export default function Aggregate({ ear, rows, target, need, nal, complete, tota
   return (
     <aside className={styles.panel}>
       <div className={styles.panelHead}>
-        <h2>{ear} ear: target gain for its earpiece</h2>
+        <h2>Target gain for the earpiece</h2>
         <span className={styles.num}>{complete}/{total} runs</span>
       </div>
       <p className={styles.caption}>
-        T(f) = scene-weighted mean audibility gap of the sounds you listen for (speech, music, alarms…), floored at 0 and capped at NAL-R (hornsim/target.py).
+        T(f) = scene-weighted mean audibility gap, floored at 0 and capped at NAL-R (hornsim/target.py).
         {target.some((t) => t > 0) && <> Largest need: <b>{target[peak].toFixed(1)} dB at {fmtHz(SII_FREQS[peak])} Hz</b>.</>}
       </p>
       <div className={styles.legend}>
@@ -133,25 +129,25 @@ export default function Aggregate({ ear, rows, target, need, nal, complete, tota
       {key.size > 0 && <p className={styles.caption}>▾ key bands (filled when the earpiece meets them)</p>}
 
       <div className={styles.designBar}>
-        <button className={styles.primary} disabled={!canDesign || designing} onClick={onDesign}>
-          {designing ? "Designing both…" : res ? "Redesign both earpieces" : "Design both earpieces"}
+        <button className={styles.primary} disabled={!canDesign || busy} onClick={onDesign}>
+          {busy ? "Designing…" : res ? "Redesign earpiece" : "Design earpiece"}
         </button>
         {res && !busy && (
           <button className={styles.btn} disabled={waveBusy} onClick={onWaveCheck}>
-            {waveBusy ? "3D wave sim running…" : wv ? `Re-check ${ear.toLowerCase()} in 3D` : `Check ${ear.toLowerCase()} with 3D wave sim`}
+            {waveBusy ? "3D wave sim running…" : wv ? "Re-check in 3D" : "Check with 3D wave sim"}
           </button>
         )}
         {busy && <span className={styles.caption}>{design.log?.at(-1)?.slice(9) ?? "queued"}</span>}
         {waveBusy && <span className={styles.caption}>{wave.log?.at(-1)?.slice(9) ?? "queued"}</span>}
         {!busy && res && designStale && <span className={styles.caption}>scenes changed</span>}
       </div>
-      {design.status === "error" && <p className={styles.errorBox}>{ear} earpiece design failed: {design.error}</p>}
+      {design.status === "error" && <p className={styles.errorBox}>Design failed: {design.error}</p>}
       {wave.status === "error" && <p className={styles.errorBox}>3D wave check failed: {wave.error}</p>}
       {res?.design.files["earpiece_in_ear.glb"] && (
         <>
           <EarpieceView url={designFile(pid, res.design.id, "earpiece_in_ear.glb")} />
           <div className={styles.links}>
-            {res.design.files["earpiece_print.stl"] && <a href={designFile(pid, res.design.id, "earpiece_print.stl")}>Download {ear.toLowerCase()} print STL</a>}
+            {res.design.files["earpiece_print.stl"] && <a href={designFile(pid, res.design.id, "earpiece_print.stl")}>Download print STL</a>}
             {res.design.files["earpiece.glb"] && <a href={designFile(pid, res.design.id, "earpiece.glb")}>earpiece.glb</a>}
           </div>
         </>
@@ -184,7 +180,7 @@ export default function Aggregate({ ear, rows, target, need, nal, complete, tota
       </div>
 
       <table className={styles.table}>
-        <thead><tr><th>Scene</th><th>weight</th><th title="SII for speech, AI (audibility index) for other sounds">healthy</th><th>this ear</th>{G && <th>aided</th>}</tr></thead>
+        <thead><tr><th>Scene</th><th>weight</th><th>SII healthy</th><th>this ear</th>{G && <th>aided</th>}</tr></thead>
         <tbody>
           {rows.map((r) => (
             <tr key={r.id}>
