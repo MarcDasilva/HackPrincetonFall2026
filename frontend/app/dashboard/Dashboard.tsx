@@ -452,8 +452,14 @@ export default function Dashboard() {
       const day = new Date().toISOString().slice(0, 10);
       save(pdf, `Auris report ${day}.pdf`);
       if (!v.picked) return;
-      const stl = await fetch(designFile(id, v.picked, "earpiece_print.stl", v.ear ?? undefined)).then((r) => (r.ok ? r.blob() : null), () => null);
-      if (stl) save(stl, `Auris earpiece ${day}.stl`);
+      // The lead's custom earpiece in S, M and L when it built; else the picked design's own print file.
+      const e = v.earpiece;
+      const prints = e?.status === "built" ? Object.entries(e.sizes ?? {}).filter(([, z]) => z.ok).map(([k, z]) => [`Auris earpiece ${k} ${day}.stl`, z.design_id] as const)
+        : [[`Auris earpiece ${day}.stl`, v.picked] as const];
+      for (const [name, did] of prints) {
+        const stl = await fetch(designFile(id, did, "earpiece_print.stl", v.ear ?? undefined)).then((r) => (r.ok ? r.blob() : null), () => null);
+        if (stl) save(stl, name);
+      }
     })().catch(() => { if (live) setLead({ line: "I couldn't build the report file. Ask me again for your report.", waiting: false }); });
     return () => { live = false; };
   }, [run?.id, view?.stage, !!view?.report]); // eslint-disable-line react-hooks/exhaustive-deps

@@ -29,7 +29,8 @@ from . import jobs
 router = APIRouter(prefix="/api/sim")
 AVERAGE_ID = "000000000000"
 ID_RE = re.compile(r"^[a-f0-9]{12}$")
-DESIGN_RE = re.compile(r"^grid\d{1,2}$")
+# grid<N>: the designer's options. custom-e<N>[-S|-L]: the lead agent's custom earpiece builds (agents lead.custom_earpiece).
+DESIGN_RE = re.compile(r"^(grid\d{1,2}|custom-e\d{1,2}(-[SL])?)$")
 DESIGN_FILES = {"earpiece_in_ear.glb": "model/gltf-binary", "earpiece.glb": "model/gltf-binary",
                 "earpiece_print.stl": "model/stl", "preview.png": "image/png"}
 EXAMPLE_AUDIOGRAM = {"250": 15, "500": 20, "1000": 30, "2000": 45, "4000": 55, "6000": 55}

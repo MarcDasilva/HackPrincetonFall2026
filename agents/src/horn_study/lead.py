@@ -42,6 +42,8 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, BeforeValidator, Field
 
+from horn_study.lead_tools import SESSION_TOOLS, session_tools
+
 OPENING = "Anything I should know before I launch research based on your audiogram?"
 NOTED = "Noted."
 BEGIN = "May I begin?"
@@ -312,6 +314,9 @@ that were hardest and easiest, with their numbers, and patterns by direction, di
 THE FOUR DESIGNS: each option, what it does, its average gain by frequency, why it ranked where it did.
 THE DESIGN YOU PICKED: why it suits them; its gain with the earpiece in the ear, described the way the numbers below say
 it was obtained (3D wave simulation or the 1D acoustic model).
+YOUR CUSTOM EARPIECE: only when the session below has a custom earpiece: how it was shaped for their ear (where it
+aims, its collector or hood, its fit), its measurements, the S, M and L sizes to print and try, and any way it differs
+from the design that was tested. Leave this section out when there is none.
 HOW MUCH IT HELPS: the validation: before and after per scene for the most important scenes, the overall change, where
 it helps most, and where it does not help or makes things worse, and why.
 LIMITS OF THIS STUDY: simulations, not clinical measurements; a passive device cannot amplify; fit and canal shape vary.
@@ -327,28 +332,43 @@ Research findings:
 Session: {session}"""
 
 
-async def write_report(
-    model: BaseChatModel, *, patient: str, notes: list[str], findings: list[str], session: str
-) -> str:
-    prompt = _REPORT.format(
-        patient=patient,
-        notes="; ".join(notes) or "none",
-        findings="\n".join(f"- {f}" for f in findings[-40:]) or "- none",
-        session=session,
-    )
-    out = await model.ainvoke([HumanMessage(prompt)])
-    return str(out.text).strip()
+_REPORT_FILES = """
 
+Evidence files, readable with ls, read_file, glob and grep: /findings/<agent>/ each sourced finding with its source, URL
+and verbatim passage, /board/<agent>/ every info-board post, /sources/ the full text of each paper read, /earpiece/ the
+custom earpiece's record. The findings above are one-line summaries WITHOUT their sources: open the finding files
+you cite and name each source (title and URL) in WHAT THE RESEARCH FOUND. Read only what the report needs, then
+write it."""
 
-_SYSTEM = """You are the lead of a team designing a passive, 3D-printed hearing aid shaped to one patient's ear.
+# ONE Deep Agent per run does everything the lead does: answers the patient, shapes and builds the earpiece, writes the
+# report. Same tools, same file system, same model; each job arrives as a message headed QUESTION, EARPIECE TASK or REPORT
+# TASK. Its memory is two checkpointed threads: "chat" (the patient's questions) and "work" (earpiece, then report — so the
+# report is written by the agent that built the earpiece). Chat is separate because a build takes minutes and a question
+# must not wait behind it.
+_LEAD_SYSTEM = """You are the lead of a team designing a passive, 3D-printed hearing aid shaped to one patient's ear.
 Four research agents (hearing research, use context, acoustic design, ear fit) research the patient's needs. Then the
-patient runs listening simulations on their own ear, sees four designs, picks one, and validates it in simulation.
+patient runs listening simulations on their own ear, sees four designs, picks one, and validates it in simulation. You
+then shape and build the picked design's earpiece and write the patient's final report.
 
-Answer the patient's question from the study progress below. Reply in plain words, at most 40 words: the reply
-shows as two or three short lines under an orb, with no room for lists or markdown. Never diagnose, and never
-claim a result the progress does not show.
+Each message names the job:
 
-Patient: {patient}
+QUESTION: the patient asked something. Answer from the study progress in the message. Reply in plain words, at most 40
+words: the reply shows as two or three short lines under an orb, with no room for lists or markdown. Never diagnose, and
+never claim a result the progress does not show.
+
+EARPIECE TASK: shape and build the picked design's earpiece with build_earpiece and finish, following the instructions
+in the message. When you have finished, reply with one plain sentence.
+
+REPORT TASK: write the final report exactly as the message instructs, and make it your final message, with no preamble.
+
+You can read the study's evidence files (ls, read_file, glob, grep) when they exist. They are read-only; never try to
+write one. You also have read-only tools for the patient's own data (get_hearing_profile, get_ear_measurements, get_scenes,
+get_design_options, compare_designs, get_validation) and for the literature (search_literature, read_source). Use them
+instead of guessing a number, and cite a URL for anything you take from a paper. In a QUESTION keep the 40-word limit
+however much you read."""
+
+# The live study state, sent with each QUESTION so every reply reads the latest board and progress.
+_STATUS = """Patient: {patient}
 Their notes before launch: {notes}
 Research status: {status}
 Session so far: {session}
@@ -361,9 +381,10 @@ Study progress, oldest first:
 
 # Read-only: the evidence tree is the research record, so the lead NEVER gets write_file or edit_file.
 READ_TOOLS = frozenset({"ls", "read_file", "glob", "grep"})
+LEAD_TOOLS = READ_TOOLS | {"build_earpiece", "finish"} | SESSION_TOOLS
 _FILES = """Evidence files, sorted, readable with ls, read_file, glob and grep. Open them when the question needs more
 than the board: /board/<agent>/ every info-board post, /findings/<agent>/ each sourced finding with its verbatim
-passage, /sources/ the full text of every paper read, /photos/ the patient's ear and head photos."""
+passage, /sources/ the full text of every paper read, /photos/ the patient's ear and head photos, /earpiece/ the custom earpiece built for the picked design (record.md)."""
 
 
 class _Verbatim(AgentMiddleware[Any, Any, Any]):
@@ -404,56 +425,182 @@ class _KeepRefusals(AgentMiddleware[Any, Any, Any]):
         return "ModelRefusalMiddleware"
 
 
-def _messages(
+class Lead:
+    """The run's one Deep Agent (see _LEAD_SYSTEM). build_earpiece and finish are stable proxies: while an earpiece task runs,
+    `desk` holds earpiece.produce_earpiece's live tools and the proxies call them; outside one they say there is nothing to build."""
+
+    def __init__(self, model: BaseChatModel) -> None:
+        from langgraph.checkpoint.memory import MemorySaver
+
+        self.model = model
+        self.desk: dict[str, Any] = {}
+        self.ctx: dict[str, Any] = {}   # the session and patient folder the data tools read (server.agent_ctx), set before each job
+        self.memory = MemorySaver()
+        self.chatted = False   # False until the chat thread holds a turn: the first QUESTION carries the session's recent messages
+        self._agents: dict[bool, Any] = {}
+
+    def _proxy(self, name: str, schema: type[BaseModel], description: str) -> Any:
+        from langchain_core.tools import StructuredTool
+
+        def run(**args: Any) -> Any:
+            tool = self.desk.get(name)
+            return tool.invoke(args) if tool else "No design is being built right now, so there is nothing to do."
+
+        return StructuredTool.from_function(func=run, name=name, description=description, args_schema=schema)
+
+    def agent(self, evidence: Path | None) -> Any:
+        from horn_study.earpiece import BuildArgs, FinishArgs
+
+        has_files = evidence is not None
+        if has_files not in self._agents:   # the evidence folder appears only once research writes its first file
+            system = SystemMessage(_LEAD_SYSTEM)
+            self._agents[has_files] = create_deep_agent(
+                model=self.model,
+                system_prompt=_LEAD_SYSTEM,
+                tools=[
+                    self._proxy("build_earpiece", BuildArgs, BuildArgs.__doc__ or ""),
+                    self._proxy("finish", FinishArgs, FinishArgs.__doc__ or ""),
+                    *session_tools(lambda: self.ctx),
+                ],
+                middleware=[_Verbatim(system, LEAD_TOOLS if has_files else LEAD_TOOLS - READ_TOOLS), _KeepRefusals()],
+                backend=FilesystemBackend(root_dir=evidence, virtual_mode=True) if has_files else None,
+                checkpointer=self.memory,
+                name="lead",
+            )
+        return self._agents[has_files]
+
+    @staticmethod
+    def _call(thread: str, limit: int) -> dict[str, Any]:
+        return {"recursion_limit": limit, "configurable": {"thread_id": thread}}
+
+    async def ask(self, thread: str, text: str, evidence: Path | None, limit: int) -> str:
+        result = await self.agent(evidence).ainvoke({"messages": [HumanMessage(text)]}, config=self._call(thread, limit))  # pyright: ignore[reportArgumentType]
+        return str(result["messages"][-1].text).strip()
+
+    def ask_sync(self, thread: str, text: str, evidence: Path | None, limit: int) -> str:
+        """For work in a thread (every build is a blocking backend subprocess)."""
+        result = self.agent(evidence).invoke({"messages": [HumanMessage(text)]}, config=self._call(thread, limit))  # pyright: ignore[reportArgumentType]
+        return str(result["messages"][-1].text).strip()
+
+
+_LEADS: dict[str, Lead] = {}
+
+
+def lead_for(run_id: str, model: BaseChatModel, ctx: dict[str, Any] | None = None) -> Lead:
+    """The run's lead agent, created on first use. In memory ONLY: after a server restart it starts a fresh conversation,
+    and the first QUESTION then carries the session's recent messages."""
+    if run_id not in _LEADS:
+        _LEADS[run_id] = Lead(model)
+    if ctx is not None:
+        _LEADS[run_id].ctx = ctx
+    return _LEADS[run_id]
+
+
+async def answer(
+    model: BaseChatModel,
     history: Iterable[dict[str, str]],
     *,
+    run_id: str,
+    ctx: dict[str, Any] | None = None,
+    evidence: Path | None = None,
     patient: str,
     notes: list[str],
     status: str,
     events: list[dict[str, Any]],
     board: Sequence[dict[str, Any]] = (),
     session: str = "research only",
-    files: bool = False,
-) -> list[AnyMessage]:
-    """The system prompt with the study's live progress, then the session's messages."""
-    # ponytail: the last 60 event summaries, not the artifacts; read research.json if answers need the findings in full.
-    progress = (
-        "\n".join(f"- [{e.get('component')}] {e.get('summary')}" for e in events[-60:]) or "- nothing yet"
-    )
+) -> str:
+    """One reply after launch, from the run's lead agent. history is the session's messages, the question last.
+
+    evidence is the study's sorted evidence tree (server.evidence_dir); ABSENT or not yet written, the lead answers from the
+    status alone."""
+    lead = lead_for(run_id, model, ctx)
+    turns = list(history)
+    # ponytail: the last 60 event summaries, not the artifacts; the lead reads /board and /findings when it needs more.
+    progress = "\n".join(f"- [{e.get('component')}] {e.get('summary')}" for e in events[-60:]) or "- nothing yet"
     posts = "\n".join(f"- [{p.get('investigator')}] {p.get('headline')}: {p.get('detail')}" for p in board)
-    system = _SYSTEM.format(
+    text = "QUESTION\n" + _STATUS.format(
         patient=patient,
         notes="; ".join(notes) or "none",
         status=status,
         board=posts or "- nothing posted yet",
         progress=progress,
         session=session,
-        files=_FILES if files else "",
+        files=_FILES if evidence is not None else "",
     )
-    turns: list[AnyMessage] = [
-        HumanMessage(m["text"]) if m["role"] == "patient" else AIMessage(m["text"]) for m in history
-    ]
-    return [SystemMessage(system), *turns]
+    if not lead.chatted and len(turns) > 1:
+        text += "\n\nThe conversation so far:\n" + "\n".join(f"{m['role']}: {m['text']}" for m in turns[-7:-1])
+    text += f"\n\nThe patient asks: {turns[-1]['text']}"
+    reply = await lead.ask("chat", text, evidence, 25)
+    lead.chatted = True
+    return reply
 
 
-async def answer(
-    model: BaseChatModel, history: Iterable[dict[str, str]], *, evidence: Path | None = None, **context: Any
+async def write_report(
+    model: BaseChatModel,
+    *,
+    run_id: str,
+    patient: str,
+    notes: list[str],
+    findings: list[str],
+    session: str,
+    evidence: Path | None = None,
+    ctx: dict[str, Any] | None = None,
 ) -> str:
-    """One reply after launch, from the lead Deep Agent. history is the session's messages, the question last.
-
-    evidence is the study's sorted evidence tree (server.evidence_dir); ABSENT or not yet
-    written, the lead answers from the prompt alone with no tools.
-    """
-    has_files = evidence is not None
-    system, *turns = _messages(history, files=has_files, **context)
-    assert isinstance(system, SystemMessage)
-    agent = create_deep_agent(
-        model=model,
-        system_prompt=str(system.content),
-        middleware=[_Verbatim(system, READ_TOOLS if has_files else frozenset()), _KeepRefusals()],
-        backend=FilesystemBackend(root_dir=evidence, virtual_mode=True) if has_files else None,
-        name="lead",
+    """The final report, written by the run's lead agent in its work thread — the same agent that built the earpiece, with
+    the evidence folder to name each finding's source."""
+    prompt = _REPORT.format(
+        patient=patient,
+        notes="; ".join(notes) or "none",
+        findings="\n".join(f"- {f}" for f in findings[-40:]) or "- none",
+        session=session,
     )
-    # ponytail: 12 model calls is plenty of file reads for a 40-word answer; raise if answers run out mid-read.
-    result = await agent.ainvoke({"messages": turns}, config={"recursion_limit": 25})  # pyright: ignore[reportArgumentType]
-    return str(result["messages"][-1].text).strip()
+    # ponytail: 60 model calls covers a few dozen file reads, then the writing turn; raise if reports end mid-read.
+    return await lead_for(run_id, model, ctx).ask("work", "REPORT TASK\n" + prompt + (_REPORT_FILES if evidence else ""), evidence, 60)
+
+
+async def custom_earpiece(
+    model: BaseChatModel,
+    *,
+    run_id: str,
+    study_dir: Path,
+    ear_dir: Path,
+    picked: str,
+    context: dict[str, Any],
+    evidence: Path | None = None,
+    ctx: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The picked design, shaped for this patient by the run's lead agent and built in the backend (S, M and L sizes).
+
+    The picked option's numbers are what the session scored, so earpiece.produce_earpiece LOCKS them (throat, mouth, stem,
+    flare, collector reach and opening) and the agent only sets the aim, the rim and the fit. Builds land in
+    <ear_dir>/aid/custom-e<N>[-S|-L]/. Returns earpiece.json's record; raises EarpieceError when it already exists."""
+    import asyncio
+
+    from horn_study.earpiece import COLLECTOR_OPENING, COLLECTOR_REACH, PROTRUSION, produce_earpiece
+
+    result = json.loads((ear_dir / "scene_design" / "result.json").read_text(encoding="utf-8"))
+    option = next(o for o in result["options"] if o["id"] == picked)
+    geo = option.get("geometry") or {}
+    reach = float(option.get("collector_reach_mm") or 0.0)
+    params = {k: v for k, v in option["params"].items() if k != "collector"}
+    params[COLLECTOR_REACH] = reach
+    params[COLLECTOR_OPENING] = float(geo.get("collector_mouth_mm2") or 0.0) if reach > 0 else 0.0
+    proud = geo.get("proud_of_concha_mm")
+    results = {
+        "study_id": "custom",   # the builds' ids: custom-e1, custom-e1-S ... (backend app/sim_api.py DESIGN_RE serves them)
+        "selected_candidate_id": picked,
+        "selected_candidate": {"kind": "design", "candidate_id": picked, "label": picked, "rationale": option.get("reason", ""), "parameters": params},
+        "report": {"candidates": [{"candidate_id": picked, "metrics": [{"name": PROTRUSION, "mean": proud}]}]} if proud is not None else {},
+        "study_context": context,
+    }
+    lead = lead_for(run_id, model, ctx)
+
+    def run(tools: list[Any], system_text: str, brief_text: str) -> None:
+        lead.desk = {t.name: t for t in tools}
+        try:
+            lead.ask_sync("work", "EARPIECE TASK\n" + system_text + "\n\nBrief:\n" + brief_text, evidence, 40)
+        finally:
+            lead.desk = {}
+
+    return await asyncio.to_thread(produce_earpiece, study_dir, ear_dir, model, results=results, runner=run)

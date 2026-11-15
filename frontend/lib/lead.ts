@@ -20,6 +20,10 @@ export type LeadReply = {
   run_id: string; stage: LeadStage; reply: string; awaiting_launch: boolean; launch_requested: boolean; study_id: string | null; status: StudyStatus; updated_at: number;
   ear?: "left" | "right" | null; scenes?: LeadScene[] | null; sims?: { results: SimResult[]; audiogram_db_hl: Record<string, number>; summary: string } | null;
   options?: AidOption[] | null; picked?: string | null; validation?: { summary: string } | null; report?: string | null;
+  /** The lead's custom earpiece for the picked design (agents server earpiece_job): "building" while it works, "built" with
+   * its S/M/L print designs, "failed" with `error` (the picked design's own print file stays the fallback). */
+  earpiece?: { status: "building" | "built" | "failed" | "no_buildable_design"; design_id?: string | null; explanation?: string; error?: string;
+    sizes?: Record<string, { design_id: string; ok: boolean }> } | null;
 };
 /** Stages that move on their own (research finishing, the scene picker): the dashboard polls the lead through them. */
 export const MOVING: LeadStage[] = ["launched", "sim_prep"];

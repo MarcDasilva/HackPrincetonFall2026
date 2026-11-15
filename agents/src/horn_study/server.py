@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import os
 import random
@@ -48,6 +49,8 @@ def patients_dir() -> Path:
 class State:
     # Study tasks by run ID. In memory ONLY: a study whose task died with the process reads as "stopped".
     tasks: dict[str, asyncio.Task[Any]] = {}  # noqa: RUF012
+    # The custom-earpiece build per run (earpiece_job), started when the patient picks a design. In memory ONLY.
+    earpieces: dict[str, asyncio.Task[Any]] = {}  # noqa: RUF012
 
 
 state = State()
@@ -88,6 +91,12 @@ def load(run_id: str) -> dict[str, Any] | None:
 
 def save(s: dict[str, Any]) -> None:
     p = _path(s["run_id"])
+    # earpiece_job writes s["earpiece"] from a background task: a request that loaded the session BEFORE it finished must
+    # not save the old "building" (or nothing) over the result.
+    on_disk = ((load(s["run_id"]) or {}).get("earpiece")) if p.exists() else None
+    mine = s.get("earpiece")
+    if on_disk and (not mine or (mine.get("status") == "building" and on_disk.get("status") != "building")):
+        s["earpiece"] = on_disk
     p.parent.mkdir(parents=True, exist_ok=True)
     s["updated_at"] = time.time()
     tmp = p.with_suffix(".tmp")
@@ -148,6 +157,7 @@ def view(s: dict[str, Any]) -> dict[str, Any]:
         "picked": s.get("picked"),
         "validation": s.get("validation"),
         "report": s.get("report"),
+        "earpiece": s.get("earpiece"),
     }
 
 
@@ -394,6 +404,7 @@ def report_facts(s: dict[str, Any]) -> str:
             out.append(f"option {i} ({o['id']}) mean gain dB: {band(o['gain_mean_db'])}")
     if (s.get("validation") or {}).get("gain_db"):
         out.append(f"picked earpiece, 3D wave simulation gain over the open ear, dB: {band(s['validation']['gain_db'])}")
+    out.extend(earpiece_facts(s.get("earpiece")))
     return "\n".join(out)
 
 
@@ -428,6 +439,13 @@ def session_line(s: dict[str, Any]) -> str:
 PHOTOS = (".jpg", ".jpeg", ".png", ".webp")
 
 
+def agent_ctx(s: dict[str, Any]) -> dict[str, Any]:
+    """What the lead agent's data tools (lead_tools.session_tools) read: the live session and the patient's backend folder.
+    The session is re-read from disk on each call, so a tool sees what the dashboard has saved since the job began."""
+    run_id = s["run_id"]
+    return {"run_id": run_id, "ear": s.get("ear"), "patient_dir": patients_dir() / run_id, "session": lambda: load(run_id)}
+
+
 def evidence_dir(s: dict[str, Any]) -> Path | None:
     """The study's evidence tree for the lead, with the patient's photos copied into photos/ (once each).
 
@@ -458,8 +476,10 @@ async def reply_after_launch(s: dict[str, Any]) -> str:
         return f"Research could not start: {s['error']}"
     try:
         return await lead.answer(
-            load_model("coordinator"),
+            load_model("interpreter"),
             s["messages"][-12:],
+            run_id=s["run_id"],
+            ctx=agent_ctx(s),
             patient=patient_line(s),
             notes=s["notes"],
             status=st,
@@ -546,6 +566,7 @@ def on_event(s: dict[str, Any], event: str, data: dict[str, Any]) -> str:
         return f"The design failed ({str(data.get('error', 'unknown error'))[:200]}). {lead.ASK_DESIGN}"
     if event == "picked":
         s["picked"] = data.get("design_id")
+        start_earpiece(s)
         return lead.VALIDATING
     s["validation"] = data
     return f"{data.get('summary', 'Validation finished.')} {lead.FINAL}"
@@ -653,16 +674,103 @@ async def post_lead(run_id: str, body: Message) -> dict[str, Any]:
     return view(s)
 
 
+def earpiece_summary(record: dict[str, Any]) -> dict[str, Any]:
+    """What the session keeps of earpiece.json: the chosen build, its sizes and where it departs from the tested design."""
+    chosen = record.get("chosen") or {}
+    build = next((b for b in record.get("builds", []) if b["design_id"] == chosen.get("design_id")), {})
+    scalar = lambda d: {k: v for k, v in (d or {}).items() if isinstance(v, (int, float, str)) and not isinstance(v, bool)}  # noqa: E731
+    return {
+        "status": record.get("status"),
+        "design_id": chosen.get("design_id"),
+        "explanation": chosen.get("explanation") or "",
+        "chosen_by": chosen.get("chosen_by"),
+        "sizes": {k: {"design_id": v["design_id"], "ok": v["ok"], "fit_offset_mm": v.get("fit_offset_mm")} for k, v in (record.get("sizes") or {}).items()},
+        "shaping": scalar(build.get("shaping")),
+        "geometry": scalar((build.get("report") or {}).get("geometry")),
+        "locked": record.get("locked"),
+        "departures": record.get("departures_from_study") or [],
+    }
+
+
+def earpiece_facts(e: dict[str, Any] | None) -> list[str]:
+    """The custom earpiece, as report_facts lines. Nothing while it is building or when it failed (the report says so)."""
+    if not e:
+        return []
+    if e.get("status") != "built":
+        return [f"custom earpiece: not built ({e.get('status')}{': ' + e['error'] if e.get('error') else ''}); the printable file is the picked design as the designer made it"]
+    sizes = ", ".join(f"{k} {'built' if v['ok'] else 'FAILED'}" for k, v in e["sizes"].items())
+    return [
+        f"custom earpiece {e['design_id']} (the picked design shaped for this ear; sizes {sizes}): {e.get('explanation') or 'no explanation given'}",
+        f"custom earpiece shaping dials: {json.dumps(e.get('shaping'))}",
+        f"custom earpiece geometry, mm and mm2: {json.dumps(e.get('geometry'))}",
+        f"numbers fixed from the tested design: {json.dumps(e.get('locked'))}; departures from it: {'; '.join(e.get('departures') or []) or 'none'}",
+    ]
+
+
+def start_earpiece(s: dict[str, Any]) -> None:
+    """The picked design goes to the lead Deep Agent to be shaped and built, in the background while the patient validates."""
+    if not s.get("study_id") or not s.get("picked"):
+        return
+    s["earpiece"] = {"status": "building"}
+    state.earpieces[s["run_id"]] = asyncio.get_running_loop().create_task(earpiece_job(s["run_id"]))
+
+
+async def earpiece_job(run_id: str) -> None:
+    """lead.custom_earpiece for the session's picked design; the outcome (or the failure) lands in s["earpiece"]."""
+    from horn_study.llm import load_model
+
+    s = load(run_id)
+    if s is None:
+        return
+    try:
+        run_dir = patients_dir() / run_id
+        ear_dir = run_dir / s["ear"] if s.get("ear") and (run_dir / s["ear"]).is_dir() else run_dir
+        evidence = evidence_dir(s)
+        record = await lead.custom_earpiece(
+            load_model("interpreter"),
+            run_id=run_id,
+            ctx=agent_ctx(s),
+            study_dir=studies_dir() / s["study_id"],
+            ear_dir=ear_dir,
+            picked=s["picked"],
+            context={"patient": patient_line(s), "notes": s["notes"]},
+            evidence=evidence,
+        )
+        summary = earpiece_summary(record)
+        if evidence is not None:   # the lead and the report read it from their file system
+            (evidence / "earpiece").mkdir(exist_ok=True)
+            (evidence / "earpiece" / "record.md").write_text(
+                "# Custom earpiece\n\n" + "\n".join(earpiece_facts(summary)) + "\n", encoding="utf-8")
+    except Exception as error:  # the patient keeps the picked design's own print file
+        summary = {"status": "failed", "error": f"{type(error).__name__}: {error}"[:300]}
+    later = load(run_id)
+    if later is not None:
+        later["earpiece"] = summary
+        save(later)
+
+
+EARPIECE_WAIT_S = 600   # the report waits this long for a build still running when the patient asks for it
+
+
 async def final_report(s: dict[str, Any]) -> str:
     from horn_study.llm import load_model
 
+    task = state.earpieces.get(s["run_id"])
+    if task is not None and not task.done():
+        with contextlib.suppress(Exception):   # a slow or failed build must not cost the patient the report
+            await asyncio.wait_for(asyncio.shield(task), EARPIECE_WAIT_S)
+    if (later := load(s["run_id"])) is not None and later.get("earpiece"):
+        s["earpiece"] = later["earpiece"]
     try:
         s["report"] = await lead.write_report(
             load_model("interpreter"),
+            run_id=s["run_id"],
+            ctx=agent_ctx(s),
             patient=patient_line(s),
             notes=s["notes"],
             findings=findings(s),
             session=report_facts(s),
+            evidence=evidence_dir(s),
         )
         return lead.DONE
     except Exception as error:

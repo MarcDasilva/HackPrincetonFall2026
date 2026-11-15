@@ -33,12 +33,38 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
+from pydantic import BaseModel, Field
 
 BACKEND_DIR_ENV = "HORN_STUDY_BACKEND_DIR"
 BACKEND_PYTHON_ENV = "HORN_STUDY_BACKEND_PYTHON"
 OUTPUT_NAME = "earpiece.json"
 
+class BuildArgs(BaseModel):
+    """Build one earpiece with these dials and an optional collector, and run its fit checks. Only while an EARPIECE TASK is running."""
+
+    aim_yaw_deg: float = Field(description="Which way the mouth faces the main talker, in degrees.")
+    aim_pitch_deg: float = Field(description="Tilt of that aim up or down, in degrees.")
+    hood_mm: float = Field(description="Hood on a flush piece, in mm; 0 when there is a collector.")
+    rim_conformity: float = Field(description="How closely the mouth follows this concha's opening, 0 to 1.")
+    mouth_stretch: float = Field(description="How the mouth is stretched along the concha.")
+    flare_mid1: float = Field(description="Bore flare, first midpoint (the study's value is applied).")
+    flare_mid2: float = Field(description="Bore flare, second midpoint (the study's value is applied).")
+    canal_stem_mm: float = Field(description="Canal stem length in mm (the study's value is applied).")
+    tab_side_deg: float = Field(description="Where the removal tab sits, in degrees.")
+    why: str = Field(description="One line: why this attempt.")
+    collector: dict[str, Any] | None = Field(None, description='Optional collector {"spine": [[out, up, front], ...], "sections": [[12 radii], ...]}.')
+
+
+class FinishArgs(BaseModel):
+    """Choose the finished earpiece. Only a design_id whose build succeeded is accepted. Only while an EARPIECE TASK is running."""
+
+    design_id: str = Field(description="The design_id of a build that succeeded.")
+    explanation: str = Field(description="One plain sentence for the patient's screen.")
+
+
 Builder = Callable[[Path, dict[str, Any], str], dict[str, Any]]
+# Runs the earpiece tools: (tools, system prompt, brief). Returns when the agent is done; `finish` fills `chosen`.
+Runner = Callable[[list[Any], str, str], None]
 
 
 class EarpieceError(Exception):
@@ -331,12 +357,20 @@ def produce_earpiece(
     build: Builder = backend_build,
     dials: dict[str, Any] | None = None,
     max_builds: int = 4,
+    results: dict[str, Any] | None = None,
+    runner: Runner | None = None,
 ) -> dict[str, Any]:
-    """Run the shaping agent for one finished study and write `earpiece.json` beside it."""
+    """Run the shaping agent for one finished study and write `earpiece.json` beside it.
+
+    results: the study's results when the caller holds them (the dashboard builds them from the picked option); else
+    read from study_dir/results.json. runner: drives the tools (build_earpiece, finish) with the system prompt and the
+    brief — the lead's Deep Agent in the dashboard; ABSENT, the manual tool loop below runs them (the CLI).
+    """
     out_path = study_dir / OUTPUT_NAME
     if out_path.exists():
         raise EarpieceError(f"{out_path} already exists; an earpiece record is never overwritten.")
-    results = json.loads((study_dir / "results.json").read_text(encoding="utf-8"))
+    if results is None:
+        results = json.loads((study_dir / "results.json").read_text(encoding="utf-8"))
     selected = results.get("selected_candidate")
     if not selected or selected.get("kind") != "design":
         raise EarpieceError("The study selected no design, so there is nothing to build.")
@@ -430,26 +464,11 @@ def produce_earpiece(
         return "Done."
 
     tools = {t.name: t for t in (build_earpiece, finish)}
-    bound = model.bind_tools(list(tools.values()))
-    messages: list[BaseMessage] = [
-        SystemMessage(SYSTEM),
-        HumanMessage(brief(results, patient_dir, locked, dials)),
-    ]
-    for _ in range(2 * max_builds + 2):
-        reply = bound.invoke(messages)
-        messages.append(reply)
-        calls = getattr(reply, "tool_calls", None) or []
-        if not calls:
-            break
-        for call in calls:
-            handler = tools.get(call["name"])
-            n_before = len(builds)
-            content = handler.invoke(call["args"]) if handler else f"Unknown tool {call['name']}."
-            messages.append(
-                ToolMessage(content=_with_preview(str(content), builds[n_before:]), tool_call_id=call["id"])
-            )
-        if chosen:
-            break
+    text = brief(results, patient_dir, locked, dials)
+    if runner is not None:
+        runner(list(tools.values()), SYSTEM, text)
+    else:
+        _manual_loop(model, tools, text, builds, chosen, max_builds)
 
     ok = [b for b in builds if b["report"].get("ok")]
     if not chosen and ok:
@@ -508,3 +527,31 @@ def produce_earpiece(
     }
     out_path.write_text(json.dumps(record, indent=1), encoding="utf-8")
     return record
+
+
+def _manual_loop(
+    model: BaseChatModel,
+    tools: dict[str, Any],
+    text: str,
+    builds: list[dict[str, Any]],
+    chosen: dict[str, Any],
+    max_builds: int,
+) -> None:
+    """The CLI's loop: the model calls the tools, and each build's picture rides back with its numbers."""
+    bound = model.bind_tools(list(tools.values()))
+    messages: list[BaseMessage] = [SystemMessage(SYSTEM), HumanMessage(text)]
+    for _ in range(2 * max_builds + 2):
+        reply = bound.invoke(messages)
+        messages.append(reply)
+        calls = getattr(reply, "tool_calls", None) or []
+        if not calls:
+            break
+        for call in calls:
+            handler = tools.get(call["name"])
+            n_before = len(builds)
+            content = handler.invoke(call["args"]) if handler else f"Unknown tool {call['name']}."
+            messages.append(
+                ToolMessage(content=_with_preview(str(content), builds[n_before:]), tool_call_id=call["id"])
+            )
+        if chosen:
+            break
