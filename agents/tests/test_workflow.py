@@ -49,6 +49,8 @@ from horn_study.workflow import (
 
 EVIDENCE_TOOLS = {"search_literature", "read_source", "record_finding", "submit_finding"}
 READ_ONLY_FILE_TOOLS = {"ls", "read_file", "grep"}
+# The coordinator's review reads the investigators' shared folder: reads ONLY, never write, delete, shell, todos or subagents.
+REVIEW_TOOLS = {"ls", "read_file", "glob", "grep"}
 
 
 def types(outcome) -> list[str]:
@@ -176,8 +178,40 @@ async def test_investigators_hold_evidence_tools_only(tmp_path):
 
     for offered in harness.research_model.log.bound_tool_sets:
         assert set(offered) == EVIDENCE_TOOLS | READ_ONLY_FILE_TOOLS | {"InvestigatorOutput"}
-    assert harness.coordinator_model.log.bound_tool_sets == [["PlanDraft"]]
+    # The review offers the reads; the plan call offers ONLY its structured output (Anthropic cannot take both at once).
+    offered = [set(b) for b in harness.coordinator_model.log.bound_tool_sets]
+    assert offered[0] == REVIEW_TOOLS
+    assert offered[-1] == {"PlanDraft"}
+    assert all(o in (REVIEW_TOOLS, {"PlanDraft"}) for o in offered)
     assert harness.interpreter_model.log.bound_tool_sets == [["ReportNarrative"]]
+
+
+async def test_the_coordinator_reads_the_investigators_shared_folder_before_planning(tmp_path):
+    """The plan must rest on what the parallel investigators actually wrote: catches the coordinator losing its view of
+    the shared research folder (and with it every verbatim passage), or its review never reaching the plan."""
+    seen: dict[str, str] = {}
+
+    def respond(messages, bound):
+        if "PlanDraft" in bound:
+            seen["plan_prompt"] = "\n".join(str(m.content) for m in messages)
+            return call("PlanDraft", valid_draft(), "plan")
+        reads = tool_messages(messages)
+        if not reads:
+            return call("glob", {"pattern": "/findings/**/*.md"}, "find")
+        if len(reads) == 1:
+            seen["path"] = re.search(r"/findings/\S+?\.md", str(reads[0].content)).group(0)
+            return call("read_file", {"file_path": seen["path"]}, "open")
+        seen["text"] = str(reads[-1].content)
+        return AIMessage(content="REVIEW-MARKER: the passage supports the claim.")
+
+    respond.reviews = True  # type: ignore[attr-defined]
+    harness = Harness(tmp_path, coordinator=respond)
+    await run_study(make_request(), harness.deps)
+
+    finding_id = seen["path"].rsplit("/", 1)[-1].removesuffix(".md")
+    assert f"{finding_id}:" in seen["text"]
+    assert "evidence:" in seen["text"]
+    assert "REVIEW-MARKER" in seen["plan_prompt"]
 
 
 async def test_the_report_states_how_much_of_the_evidence_is_scholarly(tmp_path):
@@ -376,7 +410,8 @@ async def test_a_draft_is_corrected_before_freezing_and_never_after(tmp_path):
     revision = first(outcome, "plan.revision_requested")
     assert "Over budget" in revision.data["errors"][0]
     assert revision.sequence < first(outcome, "plan.frozen").sequence
-    assert harness.coordinator_model.log.calls == 2
+    # One evidence review before the first draft, then the two drafts: the review is NOT repeated per revision.
+    assert harness.coordinator_model.log.calls == 1 + 2
     assert load(outcome, "plan.json")["plan_version"] == 2
     assert len(harness.evaluator.calls) == 12
 
@@ -390,7 +425,8 @@ async def test_a_plan_that_stays_invalid_fails_without_evaluating(tmp_path):
     assert outcome.state is StudyState.FAILED
     assert outcome.failure["kind"] == "plan_invalid"
     assert "Over budget" in outcome.failure["details"][0]
-    assert harness.coordinator_model.log.calls == 1 + make_request().get("budget", {}).get(
+    # The evidence review, the first draft, then each allowed revision.
+    assert harness.coordinator_model.log.calls == 1 + 1 + make_request().get("budget", {}).get(
         "max_plan_revisions", 2
     )
     assert harness.evaluator.calls == []

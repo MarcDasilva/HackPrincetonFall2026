@@ -19,24 +19,28 @@ that wait on the dashboard or on background work):
     sim_running -> design_ready   the patient closed the finished simulations
     design_ready -> designing     yes; the dashboard asks the backend for four designs
     designing -> options      the four designs came back
-    options -> validating     the patient picked one; the orb re-scores the scenes with it
+    options -> validating     the patient picked one; the orb reopens and re-scores the scenes with it, the
+                              earpiece voxelized into the 3D wave sim (backend wave_check)
     validating -> final       the patient closed the validation
     final -> done             "report": the final report and the print file
 """
 
 from __future__ import annotations
 
+import json
+import os
+import random
 import re
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
 from langchain.agents.middleware import AgentMiddleware, ModelRequest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
 
 OPENING = "Anything I should know before I launch research based on your audiogram?"
 NOTED = "Noted."
@@ -55,10 +59,12 @@ DESIGN_READY = "Great, I have enough data to develop a hearing aid. Ready to see
 ASK_DESIGN = "Ready to see it?"
 DESIGNING = "Designing your hearing aid. Four options are on the way."
 OPTIONS = "Here are four options, each with its reasoning. Pick the one you want."
-VALIDATING = "Let's check it really helps you. Click the orb to watch."
-FINAL = 'Ask me anything, or say "report" for your final report and the file to print.'
-ASK_FINAL = 'Say "report" when you want the final report.'
-DONE = "Your report is ready, with the file to print."
+VALIDATING = (
+    "Let's check it really helps you: your simulations are running again with that earpiece in your ear."
+)
+FINAL = "Want your final report and the file to print?"
+ASK_FINAL = FINAL
+DONE = "Your report and the file to print are downloading now. 😊"
 MAX_SIMS = 100
 
 Stage = Literal[
@@ -149,20 +155,81 @@ def flow(stage: Stage, text: str) -> tuple[str | None, Stage, str | None]:
 
 class PickedSource(BaseModel):
     role: Literal["talker", "babble"]
-    # The live grid holds speakers on the aided half only: the flat head plane cannot pass sound to the far side.
+    # All round the head: the sims run on a head wearing BOTH ears (frontend app/sim/lib/twoEar.ts) and score each ear,
+    # so a source past 180 is on the OTHER ear's side. 0–180 only held while the grid was one ear on a flat wall.
     az: int = Field(
-        ge=0, le=180, description="Degrees: 0 in front, 90 straight out from the aided ear, 180 behind."
+        ge=0,
+        le=359,
+        description="Degrees: 0 in front, 90 straight out from the aided ear, 180 behind, 270 straight out from the other ear.",
     )
     el: int = Field(ge=-60, le=70, description="Degrees above the horizontal.")
     level_db: int = Field(ge=40, le=90, description="dB SPL at the head.")
+    # Default "": a missing or unknown name is replaced from the bank (_fill_sounds), NEVER a reason to drop the scene set.
+    sound: str = Field("", description="Exactly one name from the sound bank list; talkers should be voices.")
+
+
+SOUND_CATALOG_ENV = "HORN_STUDY_SOUND_CATALOG"
+# Clips a talker can fall back to: a talker playing a door slam would score speech the patient never heard.
+_VOICES = ("speech", "conversation", "whisper", "shout", "yell", "chatter", "laughter", "singing")
+
+
+def sound_bank() -> list[str]:
+    """Names in the backend's sound bank (GET /api/sim/sounds/{name} serves ONLY these). Empty when this machine has no
+    bank; the sims then play their built-in speech clips (frontend app/sim/lib/clip.ts clipNames)."""
+    default = Path(__file__).resolve().parents[3] / "backend" / "data" / "sounds" / "catalog.json"
+    try:
+        return sorted(json.loads(Path(os.environ.get(SOUND_CATALOG_ENV) or default).read_text()))
+    except (OSError, ValueError):
+        return []
+
+
+def _fill_sounds(scene: dict[str, Any], bank: list[str], rng: random.Random) -> None:
+    """Every source ends with a sound the bank serves: the model's pick when it is a bank name, else a random one."""
+    voices = [k for k in bank if any(v in k for v in _VOICES)] or bank
+    for src in scene["sources"]:
+        if not bank:
+            src.pop("sound", None)
+        elif src.get("sound") not in bank:
+            src["sound"] = rng.choice(voices if src["role"] == "talker" else bank)
+
+
+def _random_scene(i: int, rng: random.Random) -> dict[str, Any]:
+    """A stand-in scene for when the picker call fails: the sims still run, on random directions and levels."""
+    sources = [
+        {"role": "talker", "az": rng.randrange(0, 360, 15), "el": 0, "level_db": rng.randrange(55, 76, 5)}
+    ]
+    if rng.random() < 0.5:
+        sources.append(
+            {"role": "babble", "az": rng.randrange(0, 360, 15), "el": 0, "level_db": rng.randrange(50, 71, 5)}
+        )
+    return {
+        "name": f"Random scene {i}",
+        "sound": "random sound",
+        "weight": 3,
+        "sources": sources,
+        "why": "The scene picker failed, so this scene was chosen at random.",
+    }
+
+
+def _clip(n: int):
+    """Trim to n characters at a word boundary. The limits below ride along in the model's schema, but a model can still
+    overrun one; these are display labels, so one long label must NEVER throw away the whole scene set."""
+
+    def f(v: Any) -> Any:
+        if not isinstance(v, str) or len(v) <= n:
+            return v
+        cut = v[: n - 1].rsplit(" ", 1)[0].rstrip(" ,;:-")
+        return (cut or v[: n - 1]) + "…"
+
+    return BeforeValidator(f)
 
 
 class PickedScene(BaseModel):
-    name: str = Field(max_length=60)
-    sound: str = Field(
+    name: Annotated[str, _clip(60)] = Field(max_length=60)
+    sound: Annotated[str, _clip(60)] = Field(
         max_length=60, description="The everyday sound this stands for, e.g. 'grandchild talking'."
     )
-    why: str = Field(
+    why: Annotated[str, _clip(200)] = Field(
         max_length=200, description="One sentence tying it to the patient's profile or the research."
     )
     weight: int = Field(ge=1, le=5, description="How much this situation matters to the patient.")
@@ -177,7 +244,9 @@ _PICKER = """You set up listening simulations for one patient's hearing aid. Eac
 babble noise) around the patient's aided ear; a wave simulation measures how much speech they miss in it.
 Choose scenes that match this patient's life, using their audiogram, their notes, and the research findings.
 Return exactly {n} scenes. Every scene needs at least one talker. Spread them across directions and levels;
-do not repeat a scene already chosen.
+do not repeat a scene already chosen. Give every source a `sound` copied exactly from this sound bank, the clip it
+plays; a talker should be a voice:
+{bank}
 
 Patient: {patient}
 Their notes: {notes}
@@ -193,6 +262,7 @@ async def pick_scenes(
 ) -> list[dict[str, Any]]:
     """n scenes for the dashboard's simulations, BATCH per model call (one call cannot spread 100 well)."""
     picker = model.with_structured_output(PickedScenes)
+    bank, rng = sound_bank(), random.Random()
     scenes: list[dict[str, Any]] = []
     while len(scenes) < n:
         want = min(BATCH, n - len(scenes))
@@ -202,25 +272,53 @@ async def pick_scenes(
             notes="; ".join(notes) or "none",
             findings="\n".join(f"- {f}" for f in findings[-40:]) or "- none",
             chosen=", ".join(s["name"] for s in scenes) or "none",
+            bank=", ".join(bank) or "(none on this machine; leave sound empty)",
         )
-        out = await picker.ainvoke([HumanMessage(prompt)])
-        got = out.scenes if isinstance(out, PickedScenes) else PickedScenes.model_validate(out).scenes
-        if not got:
-            raise ValueError("the scene picker returned no scenes")
-        for p in got[:want]:
-            scene = p.model_dump()
+        try:
+            out = await picker.ainvoke([HumanMessage(prompt)])
+            got = [
+                p.model_dump()
+                for p in (
+                    out.scenes if isinstance(out, PickedScenes) else PickedScenes.model_validate(out).scenes
+                )
+            ]
+        except Exception:  # a failed call must NOT stop the sims: this batch is picked at random instead
+            got = []
+        got = got[:want] or [_random_scene(len(scenes) + k + 1, rng) for k in range(want)]
+        for scene in got:
             if not any(src["role"] == "talker" for src in scene["sources"]):
                 scene["sources"][0]["role"] = "talker"  # sceneDeficit scores nothing without a talker
+            _fill_sounds(scene, bank, rng)
             scene["id"] = f"s{len(scenes) + 1}"
             scenes.append(scene)
     return scenes
 
 
-_REPORT = """Write the final report for a patient whose passive, 3D-printed hearing aid was just designed.
-Plain words, no markdown symbols, at most 300 words in short paragraphs: what their hearing test shows, what the
-research found that mattered, what the simulations measured, which design they picked and why, how much it helped
-in the validation, and what to do next (print the file, try it, see an audiologist for anything worse). Never
-diagnose; say these are simulations, not clinical results.
+_REPORT = """Write the final report for a patient whose passive, 3D-printed hearing aid was just designed. It is the
+complete record of their session, so be thorough: 1500 to 2500 words, plain text, no markdown symbols. Put each section
+title on its own line in capitals, then paragraphs; where you list scenes or numbers, one item per line starting "- ".
+Write it as a professional design report addressed to the patient: precise, complete sentences, a measured tone, every
+claim tied to a number below; no casual phrases, no exclamation marks. The dashboard lays these sections out beside its
+own figures and tables, so do not describe charts; state the results.
+
+Sections, in this order:
+SUMMARY: the outcome in five sentences: their hearing, the design picked, how much it helped, the main caveat.
+YOUR HEARING TEST: each ear, frequency by frequency, in words; which sounds that loss affects in daily life.
+WHAT YOU TOLD US: their notes, and how they shaped the study.
+WHAT THE RESEARCH FOUND: the findings that mattered for this design, each with its source, in plain words.
+THE LISTENING SIMULATIONS: what was simulated and how (each scene a real recorded sound played from a direction round
+a model of their own head and ears; speech audibility measured per ear). The overall unaided result, then the scenes
+that were hardest and easiest, with their numbers, and patterns by direction, distance and background noise.
+THE FOUR DESIGNS: each option, what it does, its average gain by frequency, why it ranked where it did.
+THE DESIGN YOU PICKED: why it suits them; its gain with the earpiece in the ear, described the way the numbers below say
+it was obtained (3D wave simulation or the 1D acoustic model).
+HOW MUCH IT HELPS: the validation: before and after per scene for the most important scenes, the overall change, where
+it helps most, and where it does not help or makes things worse, and why.
+LIMITS OF THIS STUDY: simulations, not clinical measurements; a passive device cannot amplify; fit and canal shape vary.
+NEXT STEPS: print the file, how to try it, what to listen for, and when to see an audiologist.
+
+Use the numbers below; never invent one. Never diagnose; say these are simulations, not clinical results. Never mention
+"key bands" or how many bands a design meets; talk about gain by frequency instead.
 
 Patient: {patient}
 Their notes: {notes}

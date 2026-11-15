@@ -8,14 +8,20 @@ here, before any result exists.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import re
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal
 
+from deepagents import create_deep_agent
+from deepagents.backends import FilesystemBackend
+from deepagents.middleware.filesystem import FilesystemPermission
 from langchain.agents import create_agent
-from langchain.agents.middleware import ModelRetryMiddleware
+from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelRetryMiddleware
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage
 from pydantic import BaseModel, Field, ValidationError
@@ -217,10 +223,96 @@ def revision_request(errors: list[str]) -> str:
     )
 
 
+REVIEW_PROMPT = """\
+You review the research for the coordinator of a study of a passive, battery-free hearing \
+device (a printed horn). Four investigators researched in parallel and wrote their work to one \
+shared folder, which you can read with ls, read_file, glob and grep (read only):
+- /findings/<investigator>/<finding_id>.md: each accepted finding with its verbatim evidence passage
+- /board/<investigator>/: their info-board posts, including what they could not confirm
+- /sources/<source_id>.md: the full text of every source read
+
+The brief below lists the findings and the evaluator's capabilities. Open the findings a study \
+plan would rest on, check that each passage supports the claim, and read the source around it \
+when the passage is short or the claim is strong. Then write the review the coordinator will plan \
+from, at most 400 words: per finding ID, whether it holds up and what it can and cannot support; \
+what the board says is missing; and which comparisons the evaluator can actually run that the \
+evidence motivates. Do not write the plan. Use only finding IDs that exist."""
+
+# ONLY reads: the shared folder is the research record, and the review is text. NEVER write, delete, shell, todos or subagents.
+READ_TOOLS = frozenset({"ls", "read_file", "glob", "grep"})
+
+
+class _ReadOnlyTools(AgentMiddleware[Any, Any, Any]):
+    """Offers the model the deep agent's read tools and nothing else, on every call."""
+
+    def _strip(self, request: ModelRequest[Any]) -> ModelRequest[Any]:
+        keep = [t for t in request.tools if (t.get("name") if isinstance(t, dict) else t.name) in READ_TOOLS]
+        return request.override(tools=keep)
+
+    def wrap_model_call(self, request: ModelRequest[Any], handler: Callable[..., Any]) -> Any:
+        return handler(self._strip(request))
+
+    async def awrap_model_call(
+        self, request: ModelRequest[Any], handler: Callable[..., Awaitable[Any]]
+    ) -> Any:
+        return await handler(self._strip(request))
+
+
+async def review_evidence(
+    model: BaseChatModel, messages: list[BaseMessage], evidence: Path, *, study_id: str
+) -> str:
+    """The coordinator's Deep Agent reads the investigators' shared folder (ResearchLedger's root) READ-ONLY and
+    returns a written review of the evidence.
+
+    A step of its own, NEVER merged into the plan call: Anthropic compiles the PlanDraft schema plus ANY tool into one
+    grammar over its size limit (400 "compiled grammar is too large"), and forcing a tool call instead is unsupported.
+    """
+    agent: Any = create_deep_agent(
+        model=model,
+        system_prompt=REVIEW_PROMPT,
+        middleware=[_ReadOnlyTools(), ModelRetryMiddleware(max_retries=2, on_failure="error")],
+        backend=FilesystemBackend(root_dir=evidence, virtual_mode=True),
+        # Belt and braces with _ReadOnlyTools: a write that slipped through is still refused.
+        permissions=[FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")],
+        name="study_coordinator_review",
+    )
+    result = await agent.ainvoke(
+        {"messages": messages},
+        config={
+            "run_name": "study_coordinator_review",
+            # ponytail: 40 steps is ~18 file reads; raise if real reviews run out mid-read.
+            "recursion_limit": 40,
+            "tags": ["planning"],
+            "metadata": {"study_id": study_id, "component": "study_coordinator"},
+        },
+    )
+    return str(result["messages"][-1].text).strip()
+
+
 async def propose_plan(
-    model: BaseChatModel, messages: list[BaseMessage], *, study_id: str, revision: int
+    model: BaseChatModel,
+    messages: list[BaseMessage],
+    *,
+    study_id: str,
+    revision: int,
+    evidence: Path | None = None,
 ) -> tuple[PlanDraft, list[BaseMessage]]:
-    """Ask the coordinator for a draft. It has no tools of any kind."""
+    """Ask the coordinator for a draft.
+
+    Before the FIRST draft, with the research folder the investigators wrote, the coordinator reviews it
+    (review_evidence) and plans from the brief plus that review; revisions keep the review in the conversation.
+    The plan call itself has no tools of any kind.
+    """
+    if revision == 0 and evidence is not None and await asyncio.to_thread(evidence.is_dir):
+        review = await review_evidence(model, messages, evidence, study_id=study_id)
+        # A user turn, not an assistant one: the conversation must end on the user for the plan call.
+        messages = [
+            *messages,
+            HumanMessage(
+                "Your review of the investigators' research folder, written before planning:\n\n"
+                f"{review}\n\nDesign the study plan."
+            ),
+        ]
     agent = create_agent(
         model,
         tools=[],

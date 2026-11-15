@@ -179,7 +179,8 @@ def build_graph(
     `evaluate`. The interpretation node gets a model with no tools at all.
     """
     capabilities: EvaluatorCapabilities = package.capabilities
-    ledger = ResearchLedger(store.path("evidence"))
+    ledger_root = store.path("evidence")
+    ledger = ResearchLedger(ledger_root)
 
     async def research_lead(state: GraphState) -> dict[str, Any]:
         branches = await run_research_lead(
@@ -227,6 +228,8 @@ def build_graph(
                 state["coordinator_messages"],
                 study_id=package.study_id,
                 revision=state["plan_revision"],
+                # The SAME folder the parallel investigators wrote through the shared ledger above.
+                evidence=ledger_root,
             )
         except PlanningFailed as exc:
             raise StudyFailed("planning_failed", str(exc), exc.errors) from exc

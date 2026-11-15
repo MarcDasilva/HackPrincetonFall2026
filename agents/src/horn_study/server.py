@@ -11,10 +11,13 @@ background; its events.jsonl is what GET /lead/{id}/events serves to the researc
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import os
+import random
 import re
 import shutil
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -123,6 +126,10 @@ def status(s: dict[str, Any], evs: list[dict[str, Any]] | None = None) -> str:
 
 def view(s: dict[str, Any]) -> dict[str, Any]:
     line = next((m["text"] for m in reversed(s["messages"]) if m["role"] == "lead"), "")
+    # A study that fails AFTER the launch reply went out (guarded() in launch) left "Four agents are researching" on screen
+    # with the boxes stuck on "Waiting to start". The failure replaces that line.
+    if s.get("error") and s["stage"] == "launched":
+        line = f"Research could not start: {s['error']}"
     return {
         "run_id": s["run_id"],
         # "new" = the run is still processing (or its ear cards have not cleared): the lead has not spoken yet.
@@ -162,10 +169,32 @@ def _audiograms(job: dict[str, Any]) -> dict[str, dict[str, float]]:
     return {e: r[e]["audiogram_db_hl"] for e in ("left", "right") if (r.get(e) or {}).get("audiogram_db_hl")}
 
 
+# The real evaluator's HASPI v2 needs these six; the in-app hearing test measures 500-4000 Hz only.
+HASPI_HZ = (250.0, 500.0, 1000.0, 2000.0, 4000.0, 6000.0)
+
+
+def _extend_flat(ag: dict[str, float]) -> tuple[dict[str, float], list[float]]:
+    """Fills HASPI frequencies BELOW and ABOVE the measured range with the nearest measured threshold — the SAME flat rule
+    hornsim's scoring.hearing_level applies — and returns which were filled. Gaps INSIDE the range are left for intake to
+    reject: those are a test that skipped a frequency, not one that never covered it."""
+    got = {float(k): float(v) for k, v in ag.items()}
+    lo, hi = min(got), max(got)
+    filled = [f for f in HASPI_HZ if f not in got and (f < lo or f > hi)]
+    for f in filled:
+        got[f] = got[lo] if f < lo else got[hi]
+    return {f"{k:g}": v for k, v in got.items()}, filled
+
+
 def study_request(run_id: str, study_id: str, job: dict[str, Any], notes: list[str]) -> dict[str, Any]:
     ags = _audiograms(job)
     if not ags:
         raise ValueError("this patient has no audiogram numbers to study")
+    # Without this, a patient from the in-app test is rejected at intake ("Missing ... at 250 Hz") and research never starts.
+    filled = {}
+    for ear in list(ags):
+        ags[ear], f = _extend_flat(ags[ear])
+        if f:
+            filled[ear] = f
     # Two ears: the study targets the one with the worse average threshold — it needs the aid most.
     target = max(ags, key=lambda e: sum(ags[e].values()) / len(ags[e]))
     example = job.get("request", {}).get("audiogram_is_example", False)
@@ -185,7 +214,11 @@ def study_request(run_id: str, study_id: str, job: dict[str, Any], notes: list[s
                 for ear, ag in ags.items()
                 for hz, db in sorted(ag.items(), key=lambda kv: float(kv[0]))
             ],
-            "user_notes": "Example audiogram, not the patient's own test." if example else "",
+            "user_notes": " ".join(
+                (["Example audiogram, not the patient's own test."] if example else [])
+                + [f"{ear.capitalize()} ear thresholds at {', '.join(f'{f:g} Hz' for f in fs)} were not measured; "
+                   "they repeat the nearest measured value." for ear, fs in filled.items()]
+            ),
         },
         "needs_profile": {"free_text": "\n".join(notes)},
     }
@@ -213,15 +246,84 @@ def _evaluator(raw: dict[str, Any]) -> Any:
     return CallableEvaluator(hornsim.get_evaluator_capabilities, hornsim.evaluate_experiment)
 
 
-async def run(raw: dict[str, Any]) -> None:
+_warmed: set[str] = set()
+# What prewarm built for each run: the evaluator and its capabilities (the hornsim describe, ~50 s on a busy machine).
+# launch REUSES them: built again there, they sat between the patient's "yes" and the first research event, with the
+# synchronous capability call blocking the whole server meanwhile.
+_ready: dict[str, concurrent.futures.Future[tuple[Any, dict[str, Any]]]] = {}
+MESH_WAIT_S = 600   # the ear mesh lands seconds after upload; a run that never makes one gives up here
+
+
+def prewarm(run_id: str) -> None:
+    """Does launch's slow first steps from the moment the run is created, so research starts on "yes": the model imports
+    (~10 s cold) at once, then — as soon as the backend has written the target ear's mesh — that ear's earpiece limits (two
+    probe builds, ~30 s on a busy machine, then cached on disk by the hornsim bridge). ONCE per run. Fire and forget: a
+    failure here is reported by launch, where it matters."""
+    if run_id in _warmed:
+        return
+    _warmed.add(run_id)
+    ready: concurrent.futures.Future[tuple[Any, dict[str, Any]]] = concurrent.futures.Future()
+    _ready[run_id] = ready
+
+    def warm() -> None:
+        try:
+            from horn_study.llm import load_model
+
+            for role in ("research", "coordinator", "interpreter"):
+                load_model(role)
+            # The job and its audiogram exist at create time; the mesh does NOT yet. Building the evaluator without it
+            # falls back to .env's HORNSIM_EAR_MESH — someone else's ear, warmed for nothing.
+            raw = study_request(run_id, f"{run_id}-warm", _patient(run_id), [])
+            mesh = patients_dir() / run_id / raw["hearing_profile"]["target_ear"] / "ear" / "ear.ply"
+            deadline = time.time() + MESH_WAIT_S
+            while not mesh.is_file():
+                if time.time() > deadline or _patient(run_id).get("status") == "error":
+                    raise TimeoutError("no ear mesh for this run")
+                time.sleep(0.5)
+            evaluator = _evaluator(raw)
+            ready.set_result((evaluator, evaluator.get_evaluator_capabilities()))
+        except Exception as error:  # noqa: BLE001 — launch builds its own and reports a failure to the patient
+            ready.set_exception(error)
+
+    threading.Thread(target=warm, name=f"prewarm-{run_id}", daemon=True).start()
+
+
+class _Known:
+    """An evaluator whose capabilities are already in hand: run_study asks for them synchronously, on the event loop."""
+
+    def __init__(self, inner: Any, capabilities: dict[str, Any]) -> None:
+        self._inner, self._capabilities = inner, capabilities
+
+    def get_evaluator_capabilities(self) -> dict[str, Any]:
+        return self._capabilities
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+async def _ready_evaluator(raw: dict[str, Any], run_id: str | None) -> Any:
+    """prewarm's evaluator when it built one (waiting for it WITHOUT blocking the loop if it is still building),
+    otherwise a fresh one whose capability check runs in a thread."""
+    ready = _ready.get(run_id or "")
+    if ready is not None:
+        try:
+            return _Known(*await asyncio.wrap_future(ready))
+        except Exception:  # noqa: BLE001 — the warm-up failed: build it here, where a failure reaches the patient
+            pass
+    evaluator = _evaluator(raw)
+    return _Known(evaluator, await asyncio.to_thread(evaluator.get_evaluator_capabilities))
+
+
+async def run(raw: dict[str, Any], run_id: str | None = None) -> None:
     """The study, as cli.py's run command builds it. Events land in <studies>/<study_id>/events.jsonl."""
     from horn_study.llm import load_model
     from horn_study.sources import HttpReader, default_search, make_http_client
     from horn_study.workflow import StudyDependencies, run_study
 
+    evaluator = await _ready_evaluator(raw, run_id)
     async with make_http_client() as client:
         deps = StudyDependencies(
-            evaluator=_evaluator(raw),
+            evaluator=evaluator,
             research_model=load_model("research"),
             coordinator_model=load_model("coordinator"),
             interpreter_model=load_model("interpreter"),
@@ -247,7 +349,7 @@ def launch(s: dict[str, Any]) -> None:
 
     async def guarded() -> None:
         try:
-            await run(raw)
+            await run(raw, run_id)
         except Exception as error:
             # run_study records failures inside the study; this catches what happens before it starts (models, input).
             later = load(run_id)
@@ -271,6 +373,39 @@ def patient_line(s: dict[str, Any]) -> str:
     )
 
 
+def report_facts(s: dict[str, Any]) -> str:
+    """EVERYTHING the session measured, for the final report: session_line's summary plus every scene's numbers, every
+    option's per-band gain and the picked earpiece's measured gain."""
+    out = [session_line(s)]
+    res = (s.get("sims") or {}).get("results") or []
+    aided = (s.get("validation") or {}).get("aided") or []
+    by = {x["id"]: x for x in s.get("scenes") or []}
+    pct = lambda v: f"{round(100 * v)}%" if isinstance(v, (int, float)) else "n/a"  # noqa: E731
+    if res:
+        out.append("Every scene (speech or target sound audible: normal hearing / this ear / with the picked aid):")
+        for i, r in enumerate(res):
+            sc = by.get(r["id"], {})
+            src = "; ".join(f"{x['role']} '{x.get('sound', 'speech')}' at {x['az']}° {x['level_db']} dB" + (f" touching the ear ({x['dist_mm']} mm)" if x.get("dist_mm") else "") for x in sc.get("sources", []))
+            out.append(f"- {r['name']} (weight {r['weight']}; {src}): {pct(r['sii_healthy'])} / {pct(r['sii_unaided'])} / {pct(aided[i] if i < len(aided) else None)}")
+    hz = (160, 200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000)
+    band = lambda g: ", ".join(f"{f} Hz {v:+.1f}" for f, v in zip(hz, g))  # noqa: E731
+    for i, o in enumerate(s.get("options") or [], 1):
+        if o.get("gain_mean_db"):
+            out.append(f"option {i} ({o['id']}) mean gain dB: {band(o['gain_mean_db'])}")
+    if (s.get("validation") or {}).get("gain_db"):
+        out.append(f"picked earpiece, 3D wave simulation gain over the open ear, dB: {band(s['validation']['gain_db'])}")
+    return "\n".join(out)
+
+
+_KEY_BANDS = re.compile(r"(:\s*)?\b[Mm]eets \d+ of \d+ key bands,?\s*")
+
+
+def no_key_bands(text: str) -> str:
+    """An option's reason without "meets N of M key bands": sessions saved before scene_design stopped writing it still
+    carry it, and the patient never sees that jargon (frontend components/AidOptions.tsx strips it the SAME way)."""
+    return _KEY_BANDS.sub(lambda m: ", " if m.group(1) else "", text)
+
+
 def session_line(s: dict[str, Any]) -> str:
     """The simulation half so far, in a few lines, for the model's answers and the report."""
     out = [f"stage {s['stage']}"]
@@ -281,9 +416,10 @@ def session_line(s: dict[str, Any]) -> str:
     if s.get("sims"):
         out.append(f"unaided simulations: {s['sims'].get('summary', '')}")
     for i, o in enumerate(s.get("options") or [], 1):
-        out.append(f"option {i} ({o.get('id')}): {o.get('reason', '')}")
+        out.append(f"option {i} ({o.get('id')}): {no_key_bands(o.get('reason', ''))}")
     if s.get("picked"):
-        out.append(f"patient picked {s['picked']}")
+        o = next((o for o in s.get("options") or [] if o.get("id") == s["picked"]), {})
+        out.append(f"patient picked {s['picked']}: {no_key_bands(o.get('reason', ''))}")
     if s.get("validation"):
         out.append(f"validation: {s['validation'].get('summary', '')}")
     return "\n".join(out)
@@ -348,10 +484,11 @@ def start_picking(s: dict[str, Any], n: int) -> None:
     out = _scenes_path(s["run_id"])
     out.unlink(missing_ok=True)
     patient, notes, found = patient_line(s), list(s["notes"]), findings(s)
+    picker = lead.pick_scenes
 
     async def pick() -> None:
         try:
-            scenes = await lead.pick_scenes(
+            scenes = await picker(
                 load_model("coordinator"), n, patient=patient, notes=notes, findings=found
             )
             out.write_text(json.dumps({"scenes": scenes}))
@@ -450,12 +587,24 @@ def create_session(run_id: str) -> dict[str, Any]:
     if s is None:
         s = fresh(run_id)
         save(s)
+    # The run was JUST created: start launch's slow setup now, minutes before the patient says yes.
+    prewarm(run_id)
     return view(s)
+
+
+REPLY_DELAY_S = (1.0, 3.0)
+
+
+async def _hold(since: float) -> None:
+    """Holds a model's reply until a random 1-3 s have passed since `since`, so the "…" always shows: a fast error line would
+    otherwise land instantly. Only the time its own call has not already taken."""
+    await asyncio.sleep(max(0.0, random.uniform(*REPLY_DELAY_S) - (time.monotonic() - since)))
 
 
 @app.post("/lead/{run_id}")
 async def post_lead(run_id: str, body: Message) -> dict[str, Any]:
     s = load(run_id) or fresh(run_id)
+    t0 = time.monotonic()
     advance(s)
     if body.event:
         s["messages"].append({"role": "lead", "text": on_event(s, body.event, body.data)})
@@ -468,8 +617,12 @@ async def post_lead(run_id: str, body: Message) -> dict[str, Any]:
         return view(s)
     if text:
         s["messages"].append({"role": "patient", "text": text})
+    model = False   # True once a model writes the reply (reply_after_launch, final_report)
     if s["stage"] in ("new", "opening", "begin"):
+        was = s["stage"]
         reply, s["stage"], note = lead.step(s["stage"], text)
+        if was == "new":
+            prewarm(s["run_id"])
         if note:
             s["notes"].append(note)
         if s["stage"] == "launched":
@@ -488,9 +641,13 @@ async def post_lead(run_id: str, body: Message) -> dict[str, Any]:
             start_picking(s, lead.count(text) or 1)
         if s["stage"] == "done":
             fixed = await final_report(s)
+            model = True
         reply = fixed or await reply_after_launch(s)
+        model = model or not fixed
         if fixed is None and ask:
             reply = f"{reply} {ask}"
+    if model:
+        await _hold(t0)
     s["messages"].append({"role": "lead", "text": reply})
     save(s)
     return view(s)
@@ -505,7 +662,7 @@ async def final_report(s: dict[str, Any]) -> str:
             patient=patient_line(s),
             notes=s["notes"],
             findings=findings(s),
-            session=session_line(s),
+            session=report_facts(s),
         )
         return lead.DONE
     except Exception as error:

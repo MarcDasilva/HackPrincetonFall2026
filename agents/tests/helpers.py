@@ -287,6 +287,21 @@ def valid_draft(needs: bool = True) -> dict[str, Any]:
     }
 
 
+REVIEW_TEXT = "Evidence review: the cited findings hold up for the comparisons the evaluator can run."
+
+
+def reviews_first(plan: Responder) -> Responder:
+    """The coordinator's evidence review (planner.review_evidence) runs before the plan call and binds no PlanDraft:
+    answer it with a fixed review, unless the responder scripts the review itself (`reviews = True`)."""
+
+    def respond(messages: list[BaseMessage], bound: list[str]) -> AIMessage:
+        if "PlanDraft" not in bound and not getattr(plan, "reviews", False):
+            return AIMessage(content=REVIEW_TEXT)
+        return plan(messages, bound)
+
+    return respond
+
+
 def coordinator_responder(*drafts: dict[str, Any]) -> Responder:
     """Return each draft in turn, one per planning round."""
 
@@ -408,7 +423,7 @@ class Harness:
     ) -> None:
         self.research_model = ScriptedChatModel(responder=research)
         self.coordinator_model = ScriptedChatModel(
-            responder=coordinator or coordinator_responder(valid_draft())
+            responder=reviews_first(coordinator or coordinator_responder(valid_draft()))
         )
         self.interpreter_model = ScriptedChatModel(responder=interpreter or interpreter_responder())
         self.evaluator = evaluator or CountingEvaluator()
