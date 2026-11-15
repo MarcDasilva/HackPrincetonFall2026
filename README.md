@@ -20,13 +20,11 @@ A deep agent can search the literature, open full papers, find the exact sentenc
 | Agent | Built as | What it does | Code |
 | --- | --- | --- | --- |
 | Research lead | Deep Agent | Spawns the four investigators as its subagents, all at once. Code scripts this dispatch so every investigator receives the same package. | `agents/src/horn_study/research.py` |
-| Hearing investigator | Deep Agent, subagent of the lead | Given the user's test results and the evaluator's model, what should the study investigate? | `agents/src/horn_study/research.py` |
-| Use-context investigator | Deep Agent, subagent of the lead | What scenarios and tradeoffs follow from this user's activities and priorities? | `agents/src/horn_study/research.py` |
-| Acoustic-design investigator | Deep Agent, subagent of the lead | Which supported geometries and parameter variations are worth investigating? | `agents/src/horn_study/research.py` |
-| Ear-fit investigator | Deep Agent, subagent of the lead | Given this user's ear and activities, what shell shape, retention, and venting will fit, stay in place, and stay comfortable? | `agents/src/horn_study/research.py` |
-| Lead | Deep Agent with a read-only evidence file system | Talks with the user, answers questions from the evidence files, and walks the session through simulation, design, validation, and the report. | `agents/src/horn_study/lead.py` |
-| Coordinator | LangChain agent, no tools | Drafts the experiment plan in a full command-line study. Code validates and freezes it. | `agents/src/horn_study/planner.py` |
-| Interpreter | LangChain agent, no tools | Explains results that code has already computed. | `agents/src/horn_study/reporting.py` |
+| Hearing investigator | subagent of the lead | Given the user's test results and the evaluator's model, what should the study investigate? | `agents/src/horn_study/research.py` |
+| Use-context investigator | subagent of the lead | What scenarios and tradeoffs follow from this user's activities and priorities? | `agents/src/horn_study/research.py` |
+| Acoustic-design investigator | subagent of the lead | Which supported geometries and parameter variations are worth investigating? | `agents/src/horn_study/research.py` |
+| Ear-fit investigator | subagent of the lead | Given this user's ear and activities, what shell shape, retention, and venting will fit, stay in place, and stay comfortable? | `agents/src/horn_study/research.py` |
+| Lead | Deep Agent | Talks with the user, answers questions from the evidence files, and walks the session through simulation, design, validation, and the report. | `agents/src/horn_study/lead.py` |
 
 What Deep Agents gives us:
 
