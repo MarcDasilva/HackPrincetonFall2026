@@ -47,9 +47,9 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(earrecon, "reconstruct", er, raising=False)
     monkeypatch.setattr(jobs, "write_skin", lambda d: _touch(os.path.join(d, "ear_skin.glb")))
 
-    def build_context(cfg, out, log):
+    def build_context(cfg, out, log, stop_when_ready=False):
         ear = _ear_of(out + os.sep)
-        calls.append(("context", ear))
+        calls.append(("context_quick" if stop_when_ready else "context", ear))
         assert cfg["patient"]["side"] == ear
         if ear in fail_context:
             raise RuntimeError("context blew up")
@@ -117,9 +117,14 @@ def test_two_photos_build_both_ears_meshes_first(api):
         assert {"context", "waves", "aid", "acoustics", "score"} <= set(res)
         assert "acoustic" not in res["aid"]
 
-    assert api.calls == [("ear", "left"), ("ear", "right"),
-                         ("context", "left"), ("waves", "left"), ("aid", "left"),
-                         ("context", "right"), ("waves", "right"), ("aid", "right")]
+    # three passes over the ears (jobs._rest): EVERY ear's quick context first — what the sims need — then the waves,
+    # then the references and the aid. Ear by ear, the second ear's sims waited behind the first ear's waves. An ear's
+    # references and aid run in a thread beside the next ear's waves, so ONLY the order within each lane is fixed.
+    c = api.calls
+    assert c[:5] == [("ear", "left"), ("ear", "right"), ("context_quick", "left"), ("context_quick", "right"), ("waves", "left")]
+    assert sorted(c[5:]) == sorted([("waves", "right"), ("context", "left"), ("aid", "left"), ("context", "right"), ("aid", "right")])
+    for ear in ("left", "right"):
+        assert c.index(("waves", ear)) < c.index(("context", ear)) < c.index(("aid", ear))
 
 
 def test_flat_audiogram_and_blank_audiogram_cover_both_ears(api):
@@ -247,3 +252,15 @@ def test_restart_fails_runs_it_cut_off(tmp_path, monkeypatch):
     jobs.recover()
     assert [jobs.read_job(p)["status"] for p in ("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc")] == ["error", "error", "done"]
     assert "restarted" in jobs.read_job("bbbbbbbbbbbb")["error"]
+
+
+def test_importing_the_app_never_touches_live_runs(tmp_path, monkeypatch):
+    """Catches recover() at import time: a test run (or any script) importing app.main marked the RUNNING server's live
+    jobs "server restarted" and killed a real end-to-end run mid-validation. Only a starting server may do that."""
+    import importlib
+    from app import main
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path))
+    os.makedirs(tmp_path / "patients" / "dddddddddddd")
+    jobs.write_job("dddddddddddd", {"id": "dddddddddddd", "status": "running", "step": "left:waves"})
+    importlib.reload(main)
+    assert jobs.read_job("dddddddddddd")["status"] == "running"

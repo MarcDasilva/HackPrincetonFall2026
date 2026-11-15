@@ -36,11 +36,13 @@ from .settings import settings
 app = FastAPI(title="Horn aid API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_methods=["*"], allow_headers=["*"])
 app.include_router(sim_api.router)
-jobs.recover()
 
 
 @app.on_event("startup")
 def _warm():
+    # recover() ONLY when a server actually starts. At import time it ran in every process that imported this module —
+    # a pytest run (before its fixtures point DATA_DIR at a temp dir) failed every LIVE job of the running server.
+    jobs.recover()
     jobs.warm()
 
 log = logging.getLogger(__name__)

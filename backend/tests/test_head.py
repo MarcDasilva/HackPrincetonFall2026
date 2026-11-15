@@ -188,7 +188,8 @@ def test_pipeline_runs_head_after_both_ears(api, monkeypatch):
     # The stubbed reconstruct writes no ear.ply, and the head stage attaches ONLY ears that have one.
     monkeypatch.setattr(jobs, "write_skin", lambda d: (_touch(os.path.join(d, "ear_skin.glb")), _touch(os.path.join(d, "ear.ply"))))
     _post(api)
-    assert api.calls[:4] == [("ear", "left"), ("ear", "right"), ("head", ["left", "right"]), ("context", "left")]
+    # the head right after both meshes, BEFORE the slow lane — which opens with every ear's quick context (jobs._rest)
+    assert api.calls[:4] == [("ear", "left"), ("ear", "right"), ("head", ["left", "right"]), ("context_quick", "left")]
     assert steps == ["head"]
 
 
