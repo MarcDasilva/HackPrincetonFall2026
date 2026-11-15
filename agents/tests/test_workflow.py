@@ -39,6 +39,7 @@ from horn_study.workflow import (
     NODE_FREEZE,
     NODE_INTERPRET,
     NODE_PLAN,
+    NODE_RESEARCH,
     NODE_SYNTHESIZE,
     RESEARCH_NODES,
     IllegalTransition,
@@ -63,7 +64,12 @@ def load(outcome, name: str) -> Any:
 
 
 def digest(directory: Path) -> dict[str, str]:
-    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(directory.iterdir())}
+    # Recursive: the evidence/ tree is part of the record that must never be overwritten.
+    return {
+        str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(directory.rglob("*"))
+        if p.is_file()
+    }
 
 
 # --------------------------------------------------------------------------
@@ -1169,7 +1175,7 @@ async def test_nothing_leads_from_results_back_to_planning_or_evaluation(tmp_pat
     assert reachable(NODE_EVALUATE) == {NODE_INTERPRET, "__end__"}
     assert reachable(NODE_INTERPRET) == {"__end__"}
     assert (NODE_FREEZE, NODE_PLAN) in edges
-    assert all((name, NODE_SYNTHESIZE) in edges for name in RESEARCH_NODES)
+    assert (NODE_RESEARCH, NODE_SYNTHESIZE) in edges
 
 
 async def test_the_trace_exposes_branches_planning_evaluation_and_report(tmp_path):
@@ -1187,7 +1193,7 @@ async def test_the_trace_exposes_branches_planning_evaluation_and_report(tmp_pat
     assert str(root.id) == outcome.events.history[0].trace.run_id
     children = {child.name: child for child in root.child_runs}
     assert set(children) >= {
-        *RESEARCH_NODES,
+        NODE_RESEARCH,
         NODE_SYNTHESIZE,
         NODE_PLAN,
         NODE_FREEZE,
@@ -1201,8 +1207,10 @@ async def test_the_trace_exposes_branches_planning_evaluation_and_report(tmp_pat
             found |= names(child)
         return found
 
-    assert "hearing_research_agent" in names(children["hearing_research"])
-    assert "search_literature" in names(children["hearing_research"])
+    # The investigators are the lead's subagents, so their runs nest under it.
+    assert set(RESEARCH_NODES) <= names(children[NODE_RESEARCH])
+    assert "hearing_research_agent" in names(children[NODE_RESEARCH])
+    assert "search_literature" in names(children[NODE_RESEARCH])
     assert "study_coordinator" in names(children[NODE_PLAN])
     assert "results_interpreter" in names(children[NODE_INTERPRET])
 
@@ -1245,3 +1253,12 @@ async def test_cancelling_a_study_records_the_cancellation(tmp_path):
     document = json.loads((tmp_path / "study_test_001" / "results.json").read_text())
     assert document["state"] == "CANCELLED"
     assert harness.evaluator.calls == []
+
+
+async def test_the_research_lead_runs_every_investigator_at_once(tmp_path):
+    # Catches the lead dispatching investigators one after another: research would take four times as long.
+    outcome = await run_study(make_request(), Harness(tmp_path).deps)
+
+    research = [e.type for e in outcome.events.history if e.type.startswith("research.agent_")]
+    first_done = research.index("research.agent_completed")
+    assert research[:first_done].count("research.agent_started") == len(RESEARCH_NODES)

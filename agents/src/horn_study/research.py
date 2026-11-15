@@ -1,6 +1,7 @@
-"""The four parallel research investigators.
+"""The research lead and its four parallel investigators.
 
-Each investigator is a Deep Agent with evidence tools only. It can search,
+The lead is a Deep Agent whose subagents are the investigators (run_research_lead). Each investigator is
+a Deep Agent with evidence tools only. It can search,
 read sources, and record findings whose quoted passage is verified against the
 text it actually read. It has no way to run the evaluator.
 """
@@ -12,9 +13,10 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated, Any
 
-from deepagents import FilesystemMiddleware, create_deep_agent
+from deepagents import CompiledSubAgent, FilesystemMiddleware, create_deep_agent
 from deepagents.backends.utils import create_file_data
 from langchain.agents.middleware import (
     AgentMiddleware,
@@ -24,6 +26,7 @@ from langchain.agents.middleware import (
 )
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, InjectedToolCallId, tool
 from langgraph.types import Command
 
@@ -239,14 +242,27 @@ class ToolAllowlistMiddleware(AgentMiddleware[Any, Any, Any]):
 
 
 class ResearchLedger:
-    """Sources actually read and findings accepted, shared by all branches."""
+    """Sources actually read and findings accepted, shared by all branches.
 
-    def __init__(self) -> None:
+    With a root, every source, finding and board post is ALSO written there as it lands, sorted for
+    the lead's file system (lead.answer): sources/S1.md, findings/<investigator>/<id>.md,
+    board/<investigator>/<post_id>.md. The in-memory lists stay the record research.json is built from.
+    """
+
+    def __init__(self, root: Path | None = None) -> None:
+        self._root = root
         self._records: list[SourceRecord] = []
         self._text: dict[str, str] = {}
         self._by_url: dict[str, str] = {}
         self._findings: list[ResearchFinding] = []
         self._board: list[dict[str, Any]] = []
+
+    def _write(self, rel: str, text: str) -> None:
+        if self._root is None:
+            return
+        target = self._root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
 
     @property
     def sources(self) -> tuple[SourceRecord, ...]:
@@ -287,10 +303,22 @@ class ResearchLedger:
         self._text[record.source_id] = fetched.text
         self._by_url[fetched.url.rstrip("/")] = record.source_id
         self._by_url[fetched.final_url.rstrip("/")] = record.source_id
+        self._write(
+            f"sources/{record.source_id}.md",
+            f"# {record.title}\n\nurl: {record.url}\ntier: {record.tier}\ntype: {record.content_type}\n"
+            f"first read by: {investigator}\n\n{fetched.text}\n",
+        )
         return record
 
     def add_finding(self, finding: ResearchFinding) -> None:
         self._findings.append(finding)
+        f = finding
+        self._write(
+            f"findings/{f.investigator}/{f.finding_id}.md",
+            f"# {f.finding_id}: {f.claim}\n\nsource: {f.source_id} {f.source_title} ({f.source_url}), {f.source_tier}\n"
+            f'question: {f.question}\n\nevidence: "{f.evidence_passage}"\n\napplicability: {f.applicability}\n'
+            f"limitations: {f.limitations}\nuser goal: {f.related_user_goal}\nmotivates: {f.motivates}\n",
+        )
 
     @property
     def board(self) -> tuple[dict[str, Any], ...]:
@@ -299,6 +327,11 @@ class ResearchLedger:
 
     def post(self, entry: dict[str, Any]) -> None:
         self._board.append(entry)
+        source = entry.get("source_id") or entry.get("source") or "none"
+        self._write(
+            f"board/{entry['investigator']}/{entry['post_id']}.md",
+            f"# {entry['headline']}\n\n{entry['detail']}\n\nsource: {source}\nposted: {entry['posted_at']}\n",
+        )
 
     def findings_by(self, investigator: InvestigatorName) -> tuple[ResearchFinding, ...]:
         return tuple(f for f in self._findings if f.investigator == investigator)
@@ -795,3 +828,66 @@ async def run_investigator(
         research_tool_calls=session.calls_used,
         rejected_findings=session.rejected_findings,
     )
+
+
+class _Dispatch(AgentMiddleware[Any, Any, Any]):
+    """The lead's two turns, scripted: ONE turn that sends every investigator the SAME package at once,
+    then a closing line. Its model is NEVER called — a model choosing the dispatch could skip, reword or
+    serialize investigators, and synthesize_evidence assumes all of them ran on the identical package."""
+
+    def __init__(self, brief: str) -> None:
+        self._brief = brief
+
+    def _turn(self, request: ModelRequest[Any]) -> AIMessage:
+        done = [m for m in request.messages if isinstance(m, ToolMessage)]
+        if done:
+            return AIMessage(f"All {_WORDS[len(done)]} investigators reported.")
+        calls = [
+            {"name": "task", "args": {"description": self._brief, "subagent_type": spec.name}, "id": f"dispatch_{spec.name}"}
+            for spec in INVESTIGATORS
+        ]
+        return AIMessage("", tool_calls=calls)
+
+    def wrap_model_call(self, request: ModelRequest[Any], handler: Callable[..., Any]) -> Any:
+        return self._turn(request)
+
+    async def awrap_model_call(self, request: ModelRequest[Any], handler: Callable[..., Awaitable[Any]]) -> Any:
+        return self._turn(request)
+
+
+async def run_research_lead(
+    package: StartingPackage,
+    *,
+    model: BaseChatModel,
+    search: Search,
+    reader: Reader,
+    ledger: ResearchLedger,
+    events: EventBus,
+) -> list[BranchResult]:
+    """The lead runs every investigator as its subagent, in parallel; results in INVESTIGATORS order."""
+    results: dict[str, BranchResult] = {}
+
+    def subagent(spec: InvestigatorSpec) -> CompiledSubAgent:
+        async def run(_: dict[str, Any]) -> dict[str, Any]:
+            # The package comes from here, not the task text, so EVERY investigator reads the same one.
+            branch = await run_investigator(
+                spec, package, model=model, search=search, reader=reader, ledger=ledger, events=events
+            )
+            results[spec.name] = branch
+            summary = branch.output.summary if branch.output else branch.error or branch.status
+            return {"messages": [AIMessage(f"{spec.title}: {branch.status}. {summary}")]}
+
+        return {"name": spec.name, "description": spec.question, "runnable": RunnableLambda(run, name=spec.name)}
+
+    lead = create_deep_agent(
+        model=model,
+        subagents=[subagent(spec) for spec in INVESTIGATORS],
+        middleware=[_Dispatch(render_package(package))],
+        name="research_lead",
+    )
+    await lead.ainvoke(
+        {"messages": [{"role": "user", "content": "Run the study's research."}]},
+        config={"run_name": "research_lead", "tags": ["research"], "metadata": {"study_id": package.study_id}},
+    )
+    # A missing investigator here is a lead bug, never a research outcome — fail loudly, not with less evidence.
+    return [results[spec.name] for spec in INVESTIGATORS]

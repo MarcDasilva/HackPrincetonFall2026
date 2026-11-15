@@ -1,6 +1,6 @@
 """The bounded study workflow.
 
-    create study -> four research branches in parallel -> synthesize evidence
+    create study -> research lead runs four investigators in parallel -> synthesize evidence
     -> plan -> validate and freeze -> evaluate the fixed batch -> interpret -> done
 
 The only cycle is between planning and validation, and it closes before the
@@ -64,11 +64,12 @@ from horn_study.reporting import (
     summarize_candidates,
     write_narrative,
 )
-from horn_study.research import INVESTIGATORS, InvestigatorSpec, ResearchLedger, run_investigator
+from horn_study.research import INVESTIGATORS, ResearchLedger, run_research_lead
 from horn_study.runner import EvaluateFn, EvaluationCache, execute_experiment
 from horn_study.sources import Reader, Search
 
 RESEARCH_NODES = tuple(spec.name for spec in INVESTIGATORS)
+NODE_RESEARCH = "research_lead"
 NODE_SYNTHESIZE = "synthesize_evidence"
 NODE_PLAN = "plan_experiments"
 NODE_FREEZE = "validate_and_freeze_plan"
@@ -178,22 +179,13 @@ def build_graph(
     `evaluate`. The interpretation node gets a model with no tools at all.
     """
     capabilities: EvaluatorCapabilities = package.capabilities
-    ledger = ResearchLedger()
+    ledger = ResearchLedger(store.path("evidence"))
 
-    def research_node(spec: InvestigatorSpec) -> Any:
-        async def node(state: GraphState) -> dict[str, Any]:
-            result = await run_investigator(
-                spec,
-                package,
-                model=research_model,
-                search=search,
-                reader=reader,
-                ledger=ledger,
-                events=events,
-            )
-            return {"branches": [result]}
-
-        return node
+    async def research_lead(state: GraphState) -> dict[str, Any]:
+        branches = await run_research_lead(
+            package, model=research_model, search=search, reader=reader, ledger=ledger, events=events
+        )
+        return {"branches": branches}
 
     async def synthesize_evidence(state: GraphState) -> dict[str, Any]:
         order = {name: index for index, name in enumerate(RESEARCH_NODES)}
@@ -365,15 +357,14 @@ def build_graph(
         return {"report": report}
 
     builder: StateGraph[GraphState, Any, Any, Any] = StateGraph(GraphState)
-    for spec in INVESTIGATORS:
-        builder.add_node(spec.name, research_node(spec))
-        builder.add_edge(START, spec.name)
+    builder.add_node(NODE_RESEARCH, research_lead)
+    builder.add_edge(START, NODE_RESEARCH)
     builder.add_node(NODE_SYNTHESIZE, synthesize_evidence)
     builder.add_node(NODE_PLAN, plan_experiments)
     builder.add_node(NODE_FREEZE, validate_and_freeze_plan)
     builder.add_node(NODE_EVALUATE, evaluate_batch)
     builder.add_node(NODE_INTERPRET, interpret_results)
-    builder.add_edge(list(RESEARCH_NODES), NODE_SYNTHESIZE)
+    builder.add_edge(NODE_RESEARCH, NODE_SYNTHESIZE)
     if research_only:
         builder.add_edge(NODE_SYNTHESIZE, END)
         return builder.compile(name="study")

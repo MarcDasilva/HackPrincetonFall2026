@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -288,6 +289,30 @@ def session_line(s: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+PHOTOS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def evidence_dir(s: dict[str, Any]) -> Path | None:
+    """The study's evidence tree for the lead, with the patient's photos copied into photos/ (once each).
+
+    ABSENT until research writes its first file: ArtifactStore.create refuses a study folder that already exists.
+    """
+    if not s.get("study_id"):
+        return None
+    root = studies_dir() / s["study_id"] / "evidence"
+    if not root.is_dir():
+        return None
+    patient = patients_dir() / s["run_id"]
+    for src in patient.rglob("*"):
+        # waves/ holds hundreds of simulation frames, not evidence — NEVER copied.
+        if src.suffix.lower() in PHOTOS and "waves" not in src.parts and src.is_file():
+            dst = root / "photos" / src.relative_to(patient)
+            if not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+    return root
+
+
 async def reply_after_launch(s: dict[str, Any]) -> str:
     from horn_study.llm import load_model
 
@@ -305,6 +330,7 @@ async def reply_after_launch(s: dict[str, Any]) -> str:
             events=[{"component": e["component"], "summary": e["summary"]} for e in evs],
             board=board(evs),
             session=session_line(s),
+            evidence=evidence_dir(s),
         )
     except Exception as error:
         return f"I can't answer right now ({type(error).__name__}). The study is {st}."

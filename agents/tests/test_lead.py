@@ -85,3 +85,35 @@ def test_deep_agent_lead_sends_exactly_the_plain_call() -> None:
     ]
     assert model.log.calls == 1
     assert all(tools == [] for tools in model.log.bound_tool_sets)
+
+
+def test_lead_reads_the_evidence_tree_and_nothing_else(tmp_path) -> None:
+    """Catches the lead losing its file tools (it could only see board headlines), gaining write tools over the
+    research record, or tool results being dropped between calls so a read never reaches the answer."""
+    import asyncio
+
+    from helpers import ScriptedChatModel, call
+    from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+
+    from horn_study.lead import READ_TOOLS, answer
+
+    (tmp_path / "board" / "hearing").mkdir(parents=True)
+    (tmp_path / "board" / "hearing" / "hearing-B1.md").write_text("# Gain peaks near 3 kHz\n")
+
+    def respond(messages: list[BaseMessage], bound: list[str]) -> AIMessage:
+        read = [m for m in messages if isinstance(m, ToolMessage)]
+        if not read:
+            return call("read_file", {"file_path": "/board/hearing/hearing-B1.md"})
+        return AIMessage(
+            "Board says gain peaks near 3 kHz." if "3 kHz" in str(read[-1].content) else "missing"
+        )
+
+    model = ScriptedChatModel(responder=respond)
+    history = [{"role": "patient", "text": "What did hearing find?"}]
+    context: dict = dict(patient="right ear", notes=[], status="running", events=[])
+
+    assert (
+        asyncio.run(answer(model, history, evidence=tmp_path, **context))
+        == "Board says gain peaks near 3 kHz."
+    )
+    assert all(set(tools) <= READ_TOOLS for tools in model.log.bound_tool_sets)

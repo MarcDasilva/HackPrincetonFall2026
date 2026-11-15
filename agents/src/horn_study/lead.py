@@ -28,9 +28,11 @@ from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable, Iterable, Sequence
+from pathlib import Path
 from typing import Any, Literal
 
 from deepagents import create_deep_agent
+from deepagents.backends import FilesystemBackend
 from langchain.agents.middleware import AgentMiddleware, ModelRequest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
@@ -245,24 +247,35 @@ Research status: {status}
 Session so far: {session}
 Info board: what the research agents flagged as important, oldest first. Lean on it most:
 {board}
+{files}
 Study progress, oldest first:
 {progress}"""
 
 
+# Read-only: the evidence tree is the research record, so the lead NEVER gets write_file or edit_file.
+READ_TOOLS = frozenset({"ls", "read_file", "glob", "grep"})
+_FILES = """Evidence files, sorted, readable with ls, read_file, glob and grep. Open them when the question needs more
+than the board: /board/<agent>/ every info-board post, /findings/<agent>/ each sourced finding with its verbatim
+passage, /sources/ the full text of every paper read, /photos/ the patient's ear and head photos."""
+
+
 class _Verbatim(AgentMiddleware[Any, Any, Any]):
-    """Sends the model EXACTLY the messages answer() built, with NO tools.
+    """Sends the model EXACTLY answer()'s system prompt, with ONLY the read-only file tools.
 
     create_deep_agent adds its base prompt, file system and subagent instructions, and their tools;
-    without this the lead's replies drift from the 40-word orb copy. Loosen it here to give the lead tools.
+    without this the lead's replies drift from the 40-word orb copy. The messages are left alone so
+    tool results reach the next call.
     """
 
-    def __init__(self, messages: list[AnyMessage]) -> None:
-        self._messages = messages
+    def __init__(self, system: SystemMessage, tools: frozenset[str]) -> None:
+        self._system = system
+        self._tools = tools
 
     def _exact(self, request: ModelRequest[Any]) -> ModelRequest[Any]:
-        system, *rest = self._messages
-        assert isinstance(system, SystemMessage)
-        return request.override(system_message=system, messages=rest, tools=[])
+        tools = [
+            t for t in request.tools if (t.get("name") if isinstance(t, dict) else t.name) in self._tools
+        ]
+        return request.override(system_message=self._system, tools=tools)
 
     def wrap_model_call(self, request: ModelRequest[Any], handler: Callable[..., Any]) -> Any:
         return handler(self._exact(request))
@@ -293,6 +306,7 @@ def _messages(
     events: list[dict[str, Any]],
     board: Sequence[dict[str, Any]] = (),
     session: str = "research only",
+    files: bool = False,
 ) -> list[AnyMessage]:
     """The system prompt with the study's live progress, then the session's messages."""
     # ponytail: the last 60 event summaries, not the artifacts; read research.json if answers need the findings in full.
@@ -307,6 +321,7 @@ def _messages(
         board=posts or "- nothing posted yet",
         progress=progress,
         session=session,
+        files=_FILES if files else "",
     )
     turns: list[AnyMessage] = [
         HumanMessage(m["text"]) if m["role"] == "patient" else AIMessage(m["text"]) for m in history
@@ -314,14 +329,24 @@ def _messages(
     return [SystemMessage(system), *turns]
 
 
-async def answer(model: BaseChatModel, history: Iterable[dict[str, str]], **context: Any) -> str:
-    """One reply after launch, from the lead Deep Agent. history is the session's messages, the question last."""
-    messages = _messages(history, **context)
+async def answer(
+    model: BaseChatModel, history: Iterable[dict[str, str]], *, evidence: Path | None = None, **context: Any
+) -> str:
+    """One reply after launch, from the lead Deep Agent. history is the session's messages, the question last.
+
+    evidence is the study's sorted evidence tree (server.evidence_dir); ABSENT or not yet
+    written, the lead answers from the prompt alone with no tools.
+    """
+    has_files = evidence is not None
+    system, *turns = _messages(history, files=has_files, **context)
+    assert isinstance(system, SystemMessage)
     agent = create_deep_agent(
         model=model,
-        system_prompt=str(messages[0].content),
-        middleware=[_Verbatim(messages), _KeepRefusals()],
+        system_prompt=str(system.content),
+        middleware=[_Verbatim(system, READ_TOOLS if has_files else frozenset()), _KeepRefusals()],
+        backend=FilesystemBackend(root_dir=evidence, virtual_mode=True) if has_files else None,
         name="lead",
     )
-    result = await agent.ainvoke({"messages": messages[1:]})  # pyright: ignore[reportArgumentType]
+    # ponytail: 12 model calls is plenty of file reads for a 40-word answer; raise if answers run out mid-read.
+    result = await agent.ainvoke({"messages": turns}, config={"recursion_limit": 25})  # pyright: ignore[reportArgumentType]
     return str(result["messages"][-1].text).strip()

@@ -363,3 +363,27 @@ async def test_two_unposted_research_calls_block_the_third_until_a_post():
     s.submit_finding("Headline", "Detail.")
     assert (await s.search_literature("c")).startswith("Results for")
     assert s.calls_used == 3
+
+
+async def test_the_ledger_writes_a_sorted_evidence_tree(tmp_path):
+    """Catches board posts, findings or source texts missing from the lead's file system (lead.answer)."""
+    s = ResearchSession(
+        INVESTIGATORS[0],
+        max_tool_calls=6,
+        search=FakeSearch(),
+        reader=FakeReader(),
+        ledger=ResearchLedger(tmp_path),
+        events=EventBus("s"),
+        post_every=None,
+    )
+    await s.read_source(URL, "horn")
+    s.record_finding(source="S1", evidence_passage=PASSAGES["acoustic_design_research"], **FINDING)
+    s.submit_finding("Horn length shifts the peak", "Matters for 2-4 kHz loss.", "S1")
+    files = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*.md"))
+    assert files == [
+        "board/hearing_research/hearing-B1.md",
+        "findings/hearing_research/hearing-F1.md",
+        "sources/S1.md",
+    ]
+    assert PASSAGES["acoustic_design_research"] in (tmp_path / "sources/S1.md").read_text()
+    assert "source: S1" in (tmp_path / "board/hearing_research/hearing-B1.md").read_text()

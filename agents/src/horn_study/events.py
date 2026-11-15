@@ -52,6 +52,8 @@ ARTIFACT_NAMES = (
     "experiment_results.json",
     "results.json",
     "board.json",
+    # A directory: the sorted evidence tree ResearchLedger writes for the lead.
+    "evidence",
 )
 
 
